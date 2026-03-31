@@ -30,9 +30,21 @@ class FeedbackMessage(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     content = models.TextField()
     gpt_used = models.CharField(max_length=100)
+    gpt_id = models.IntegerField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.student_id} used {self.gpt_used}"
+
+
+class Course(models.Model):
+    course_id = models.SlugField(max_length=50, unique=True)
+    course_name = models.CharField(max_length=200)
+    instructor_name = models.CharField(max_length=100)
+    password = models.CharField(max_length=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.course_name} ({self.course_id})"
 
 
 class FeedbackGPT(models.Model):
@@ -42,6 +54,9 @@ class FeedbackGPT(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     instructions = models.TextField()
     updated_at = models.DateTimeField(auto_now=True)
+    course = models.ForeignKey(Course, on_delete=models.SET_NULL, null=True, blank=True, related_name='surveys')
+    week_number = models.IntegerField(null=True, blank=True)
+    survey_label = models.CharField(max_length=200, blank=True, default='')
 
     def __str__(self):
         return self.name
@@ -59,7 +74,7 @@ class CustomGPT(models.Model):
 
     def __str__(self):
         return self.name
-    
+
 
 class FireData(models.Model):
     data = models.JSONField()
@@ -70,13 +85,12 @@ class Image(models.Model):
     title = models.CharField(max_length=200, blank=True)
     description = models.TextField(blank=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
-    
+
     def __str__(self):
         return self.title or f"Image {self.id}"
-    
+
     @property
     def image_url(self):
-        """Return the URL to access the image"""
         if self.image:
             return self.image.url
         return None

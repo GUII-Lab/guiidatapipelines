@@ -19,4 +19,11 @@ urlpatterns = [
     path('api/image/<int:image_id>/', get_image, name='get_image'),
     path('api/images/', list_images, name='list_images'),
     path('api/openai-chat/', openai_chat, name='openai_chat'),
+    # LEAI course management
+    path('api/create_course/', create_course, name='create_course'),
+    path('api/verify_course_password/', verify_course_password, name='verify_course_password'),
+    path('api/create_feedback_gpt/', create_feedback_gpt, name='create_feedback_gpt'),
+    path('api/feedback_gpts_by_course/', feedback_gpts_by_course, name='feedback_gpts_by_course'),
+    path('api/feedback_messages_by_gpt/', feedback_messages_by_gpt, name='feedback_messages_by_gpt'),
+    path('api/feedback_messages_by_course/', feedback_messages_by_course, name='feedback_messages_by_course'),
 ]

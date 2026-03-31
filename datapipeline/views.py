@@ -43,28 +43,21 @@ def message_create(request):
             return JsonResponse({'status': 'error', 'message': str(e)})
 
 
-@csrf_exempt  # Bypass CSRF token for simplicity, use only for testing
+@csrf_exempt
 def feedback_message_api(request):
     if request.method == 'POST':
         try:
             data = json.loads(request.body)
-            session_id = data.get('session_id')
-            student_id = data.get('student_id')
-            sent_by = data.get('sent_by')
-            content = data.get('content')
-            gpt_used = data.get('gpt_used')
- 
             feedback_message = FeedbackMessage(
-                session_id=session_id,
-                student_id=student_id,
-                sent_by=sent_by,
-                content=content,
-                gpt_used=gpt_used,
+                session_id=data.get('session_id'),
+                student_id=data.get('student_id'),
+                sent_by=data.get('sent_by'),
+                content=data.get('content'),
+                gpt_used=data.get('gpt_used'),
+                gpt_id=data.get('gpt_id'),
             )
             feedback_message.save()
-
             return JsonResponse({'status': 'success', 'message': 'Feedback message saved successfully'})
-
         except Exception as e:
             return JsonResponse({'status': 'error', 'message': str(e)})
 
@@ -101,10 +94,158 @@ def list_custom_gpts(request):
 @csrf_exempt
 def list_feedback_gpts(request):
     if request.method == 'GET':
-        gpts = FeedbackGPT.objects.all().values('id', 'name', 'instructions')
+        gpts = FeedbackGPT.objects.all().values(
+            'id', 'name', 'instructions', 'week_number', 'survey_label',
+            'course__course_id', 'course__course_name'
+        )
         return JsonResponse(list(gpts), safe=False)
     else:
         return HttpResponse(status=405, content="Method not allowed")
+
+
+@csrf_exempt
+def create_course(request):
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            course_id = data.get('course_id', '').strip()
+            if not course_id:
+                return JsonResponse({'error': 'course_id is required'}, status=400)
+            if Course.objects.filter(course_id=course_id).exists():
+                return JsonResponse({'error': 'A course with this ID already exists'}, status=409)
+            course = Course.objects.create(
+                course_id=course_id,
+                course_name=data.get('course_name', ''),
+                instructor_name=data.get('instructor_name', ''),
+                password=data.get('password', ''),
+            )
+            return JsonResponse({'status': 'success', 'id': course.id, 'course_id': course.course_id})
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def verify_course_password(request):
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            course_id = data.get('course_id', '')
+            password = data.get('password', '')
+            try:
+                course = Course.objects.get(course_id=course_id)
+            except Course.DoesNotExist:
+                return JsonResponse({'valid': False, 'error': 'Course not found'}, status=404)
+            if course.password == password:
+                return JsonResponse({
+                    'valid': True,
+                    'course_name': course.course_name,
+                    'instructor_name': course.instructor_name,
+                })
+            return JsonResponse({'valid': False, 'error': 'Incorrect password'}, status=401)
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def create_feedback_gpt(request):
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            course_id = data.get('course_id')
+            course = None
+            if course_id:
+                try:
+                    course = Course.objects.get(course_id=course_id)
+                except Course.DoesNotExist:
+                    return JsonResponse({'error': 'Course not found'}, status=404)
+            gpt = FeedbackGPT.objects.create(
+                name=data.get('name', ''),
+                instructions=data.get('instructions', ''),
+                created_by=data.get('instructor_name', ''),
+                course=course,
+                week_number=data.get('week_number'),
+                survey_label=data.get('survey_label', ''),
+            )
+            return JsonResponse({'status': 'success', 'id': gpt.id, 'name': gpt.name})
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def feedback_gpts_by_course(request):
+    if request.method == 'GET':
+        course_id = request.GET.get('course_id')
+        if not course_id:
+            return JsonResponse({'error': 'course_id parameter is required'}, status=400)
+        try:
+            course = Course.objects.get(course_id=course_id)
+        except Course.DoesNotExist:
+            return JsonResponse({'error': 'Course not found'}, status=404)
+        gpts = FeedbackGPT.objects.filter(course=course).order_by('week_number', 'created_at').values(
+            'id', 'name', 'week_number', 'survey_label', 'instructions', 'created_at'
+        )
+        return JsonResponse(list(gpts), safe=False)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def feedback_messages_by_gpt(request):
+    if request.method == 'GET':
+        gpt_id = request.GET.get('gpt_id')
+        if not gpt_id:
+            return JsonResponse({'error': 'gpt_id parameter is required'}, status=400)
+        messages = FeedbackMessage.objects.filter(gpt_id=gpt_id).order_by('created_at')
+        sessions = defaultdict(list)
+        for m in messages:
+            sessions[m.session_id].append({
+                'id': m.id,
+                'session_id': m.session_id,
+                'sent_by': m.sent_by,
+                'content': m.content,
+                'created_at': m.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+            })
+        return JsonResponse({
+            'sessions': dict(sessions),
+            'session_count': len(sessions),
+            'message_count': messages.count(),
+        })
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def feedback_messages_by_course(request):
+    if request.method == 'GET':
+        course_id = request.GET.get('course_id')
+        if not course_id:
+            return JsonResponse({'error': 'course_id parameter is required'}, status=400)
+        try:
+            course = Course.objects.get(course_id=course_id)
+        except Course.DoesNotExist:
+            return JsonResponse({'error': 'Course not found'}, status=404)
+        gpts = FeedbackGPT.objects.filter(course=course).order_by('week_number', 'created_at')
+        result = []
+        for gpt in gpts:
+            messages = FeedbackMessage.objects.filter(gpt_id=gpt.id).order_by('created_at')
+            sessions = defaultdict(list)
+            for m in messages:
+                sessions[m.session_id].append({
+                    'sent_by': m.sent_by,
+                    'content': m.content,
+                    'created_at': m.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                })
+            result.append({
+                'gpt_id': gpt.id,
+                'name': gpt.name,
+                'week_number': gpt.week_number,
+                'survey_label': gpt.survey_label,
+                'sessions': dict(sessions),
+                'session_count': len(sessions),
+            })
+        return JsonResponse(result, safe=False)
+    return HttpResponse(status=405)
     
 
 @csrf_exempt
