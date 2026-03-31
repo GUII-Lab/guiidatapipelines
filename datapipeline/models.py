@@ -49,6 +49,7 @@ class Course(models.Model):
 
 class FeedbackGPT(models.Model):
     id = models.AutoField(primary_key=True)
+    public_id = models.CharField(max_length=16, unique=True, blank=True, default='')
     name = models.CharField(max_length=100)
     created_by = models.CharField(max_length=100, null=True)
     created_at = models.DateTimeField(auto_now_add=True)

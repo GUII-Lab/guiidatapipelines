@@ -13,3 +13,4 @@ typing_extensions==4.8.0
 wheel==0.41.2
 whitenoise==6.6.0
 requests==2.31.0
+python-dotenv

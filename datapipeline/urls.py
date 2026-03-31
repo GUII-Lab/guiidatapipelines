@@ -24,6 +24,7 @@ urlpatterns = [
     path('api/verify_course_password/', verify_course_password, name='verify_course_password'),
     path('api/create_feedback_gpt/', create_feedback_gpt, name='create_feedback_gpt'),
     path('api/feedback_gpts_by_course/', feedback_gpts_by_course, name='feedback_gpts_by_course'),
+    path('api/get_feedback_gpt_by_public_id/', get_feedback_gpt_by_public_id, name='get_feedback_gpt_by_public_id'),
     path('api/feedback_messages_by_gpt/', feedback_messages_by_gpt, name='feedback_messages_by_gpt'),
     path('api/feedback_messages_by_course/', feedback_messages_by_course, name='feedback_messages_by_course'),
 ]

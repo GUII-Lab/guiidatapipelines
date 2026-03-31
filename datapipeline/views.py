@@ -4,11 +4,23 @@ from django.utils.dateparse import parse_datetime
 from .models import *  # Ensure this is your custom User model
 import json
 import os
+import secrets
+import string
 from collections import defaultdict
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from django.conf import settings
 import requests
+
+
+def _generate_public_id(length=12):
+    """Generate a unique random alphanumeric public_id for FeedbackGPT."""
+    alphabet = string.ascii_letters + string.digits
+    for _ in range(10):  # retry up to 10 times on collision
+        candidate = ''.join(secrets.choice(alphabet) for _ in range(length))
+        if not FeedbackGPT.objects.filter(public_id=candidate).exists():
+            return candidate
+    raise RuntimeError('Could not generate a unique public_id after 10 attempts')
 
 
 
@@ -95,7 +107,7 @@ def list_custom_gpts(request):
 def list_feedback_gpts(request):
     if request.method == 'GET':
         gpts = FeedbackGPT.objects.all().values(
-            'id', 'name', 'instructions', 'week_number', 'survey_label',
+            'id', 'public_id', 'name', 'instructions', 'week_number', 'survey_label',
             'course__course_id', 'course__course_name'
         )
         return JsonResponse(list(gpts), safe=False)
@@ -167,8 +179,9 @@ def create_feedback_gpt(request):
                 course=course,
                 week_number=data.get('week_number'),
                 survey_label=data.get('survey_label', ''),
+                public_id=_generate_public_id(),
             )
-            return JsonResponse({'status': 'success', 'id': gpt.id, 'name': gpt.name})
+            return JsonResponse({'status': 'success', 'id': gpt.id, 'public_id': gpt.public_id, 'name': gpt.name})
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=400)
     return HttpResponse(status=405)
@@ -185,9 +198,30 @@ def feedback_gpts_by_course(request):
         except Course.DoesNotExist:
             return JsonResponse({'error': 'Course not found'}, status=404)
         gpts = FeedbackGPT.objects.filter(course=course).order_by('week_number', 'created_at').values(
-            'id', 'name', 'week_number', 'survey_label', 'instructions', 'created_at'
+            'id', 'public_id', 'name', 'week_number', 'survey_label', 'instructions', 'created_at'
         )
         return JsonResponse(list(gpts), safe=False)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def get_feedback_gpt_by_public_id(request):
+    if request.method == 'GET':
+        public_id = request.GET.get('public_id')
+        if not public_id:
+            return JsonResponse({'error': 'public_id parameter is required'}, status=400)
+        try:
+            gpt = FeedbackGPT.objects.get(public_id=public_id)
+        except FeedbackGPT.DoesNotExist:
+            return JsonResponse({'error': 'Survey not found'}, status=404)
+        return JsonResponse({
+            'id': gpt.id,
+            'public_id': gpt.public_id,
+            'name': gpt.name,
+            'instructions': gpt.instructions,
+            'week_number': gpt.week_number,
+            'survey_label': gpt.survey_label,
+        })
     return HttpResponse(status=405)
 
 
