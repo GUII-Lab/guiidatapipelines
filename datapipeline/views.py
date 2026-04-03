@@ -343,13 +343,20 @@ def feedback_messages_by_course(request):
                     'content': m.content,
                     'created_at': m.created_at.strftime('%Y-%m-%d %H:%M:%S'),
                 })
+            session_count = len(sessions)
+            msg_count = messages.count()
+            avg_turns = round(msg_count / session_count) if session_count else 0
             result.append({
                 'gpt_id': gpt.id,
                 'name': gpt.name,
                 'week_number': gpt.week_number,
                 'survey_label': gpt.survey_label,
                 'sessions': dict(sessions),
-                'session_count': len(sessions),
+                'session_count': session_count,
+                'avg_turns': avg_turns,
+                'is_closed': gpt.is_closed,
+                'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
+                'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
             })
         return JsonResponse(result, safe=False)
     return HttpResponse(status=405)
