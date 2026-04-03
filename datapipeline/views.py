@@ -1,12 +1,16 @@
-from django.http import JsonResponse, HttpResponseBadRequest,HttpResponse
+from django.http import JsonResponse, HttpResponseBadRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.dateparse import parse_datetime
+from django.utils import timezone
 from .models import *  # Ensure this is your custom User model
 import json
 import os
 import secrets
 import string
+import csv
+import io
 from collections import defaultdict
+from datetime import timedelta
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from django.conf import settings
@@ -172,6 +176,17 @@ def create_feedback_gpt(request):
                     course = Course.objects.get(course_id=course_id)
                 except Course.DoesNotExist:
                     return JsonResponse({'error': 'Course not found'}, status=404)
+
+            # Default expiry: 14 days from now
+            raw_expires = data.get('expires_at')
+            if raw_expires:
+                expires_at = parse_datetime(raw_expires)
+            else:
+                expires_at = timezone.now() + timedelta(days=14)
+
+            raw_opens = data.get('opens_at')
+            opens_at = parse_datetime(raw_opens) if raw_opens else None
+
             gpt = FeedbackGPT.objects.create(
                 name=data.get('name', ''),
                 instructions=data.get('instructions', ''),
@@ -180,8 +195,22 @@ def create_feedback_gpt(request):
                 week_number=data.get('week_number'),
                 survey_label=data.get('survey_label', ''),
                 public_id=_generate_public_id(),
+                expires_at=expires_at,
+                opens_at=opens_at,
+                is_closed=False,
+                themes=data.get('themes', []),
+                timing_category=data.get('timing_category', ''),
+                anonymity_mode=data.get('anonymity_mode', 'anonymous'),
+                reporting_structure=data.get('reporting_structure', ''),
+                survey_type=data.get('survey_type', 'individual'),
             )
-            return JsonResponse({'status': 'success', 'id': gpt.id, 'public_id': gpt.public_id, 'name': gpt.name})
+            return JsonResponse({
+                'status': 'success',
+                'id': gpt.id,
+                'public_id': gpt.public_id,
+                'name': gpt.name,
+                'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
+            })
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=400)
     return HttpResponse(status=405)
@@ -197,10 +226,33 @@ def feedback_gpts_by_course(request):
             course = Course.objects.get(course_id=course_id)
         except Course.DoesNotExist:
             return JsonResponse({'error': 'Course not found'}, status=404)
-        gpts = FeedbackGPT.objects.filter(course=course).order_by('week_number', 'created_at').values(
-            'id', 'public_id', 'name', 'week_number', 'survey_label', 'instructions', 'created_at'
-        )
-        return JsonResponse(list(gpts), safe=False)
+        gpts = FeedbackGPT.objects.filter(course=course).order_by('week_number', 'created_at')
+        result = []
+        for gpt in gpts:
+            session_ids = FeedbackMessage.objects.filter(gpt_id=gpt.id).values_list('session_id', flat=True).distinct()
+            session_count = session_ids.count()
+            msg_count = FeedbackMessage.objects.filter(gpt_id=gpt.id).count()
+            avg_turns = round(msg_count / session_count) if session_count else 0
+            result.append({
+                'id': gpt.id,
+                'public_id': gpt.public_id,
+                'name': gpt.name,
+                'week_number': gpt.week_number,
+                'survey_label': gpt.survey_label,
+                'instructions': gpt.instructions,
+                'created_at': gpt.created_at.isoformat(),
+                'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
+                'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
+                'is_closed': gpt.is_closed,
+                'themes': gpt.themes,
+                'timing_category': gpt.timing_category,
+                'anonymity_mode': gpt.anonymity_mode,
+                'reporting_structure': gpt.reporting_structure,
+                'survey_type': gpt.survey_type,
+                'session_count': session_count,
+                'avg_turns': avg_turns,
+            })
+        return JsonResponse(result, safe=False)
     return HttpResponse(status=405)
 
 
@@ -214,6 +266,21 @@ def get_feedback_gpt_by_public_id(request):
             gpt = FeedbackGPT.objects.get(public_id=public_id)
         except FeedbackGPT.DoesNotExist:
             return JsonResponse({'error': 'Survey not found'}, status=404)
+
+        # Server-side lifecycle check
+        now = timezone.now()
+        is_active = True
+        reason = None
+        if gpt.is_closed:
+            is_active = False
+            reason = 'closed'
+        elif gpt.opens_at and gpt.opens_at > now:
+            is_active = False
+            reason = 'not_yet_open'
+        elif gpt.expires_at and gpt.expires_at < now:
+            is_active = False
+            reason = 'expired'
+
         return JsonResponse({
             'id': gpt.id,
             'public_id': gpt.public_id,
@@ -221,6 +288,12 @@ def get_feedback_gpt_by_public_id(request):
             'instructions': gpt.instructions,
             'week_number': gpt.week_number,
             'survey_label': gpt.survey_label,
+            'is_active': is_active,
+            'reason': reason,
+            'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
+            'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
+            'anonymity_mode': gpt.anonymity_mode,
+            'survey_type': gpt.survey_type,
         })
     return HttpResponse(status=405)
 
@@ -281,6 +354,155 @@ def feedback_messages_by_course(request):
         return JsonResponse(result, safe=False)
     return HttpResponse(status=405)
     
+
+@csrf_exempt
+def set_survey_status(request):
+    """Close or reopen a survey. Reopening resets expires_at to now+14d."""
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            survey_id = data.get('survey_id')
+            action = data.get('action')  # 'close' or 'reopen'
+            if not survey_id or action not in ('close', 'reopen'):
+                return JsonResponse({'error': 'survey_id and action (close|reopen) required'}, status=400)
+            try:
+                gpt = FeedbackGPT.objects.get(id=survey_id)
+            except FeedbackGPT.DoesNotExist:
+                return JsonResponse({'error': 'Survey not found'}, status=404)
+            if action == 'close':
+                gpt.is_closed = True
+            else:
+                gpt.is_closed = False
+                gpt.expires_at = timezone.now() + timedelta(days=14)
+            gpt.save()
+            return JsonResponse({
+                'status': 'success',
+                'is_closed': gpt.is_closed,
+                'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
+            })
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def update_survey(request):
+    """Update editable fields on an existing survey."""
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            survey_id = data.get('survey_id')
+            if not survey_id:
+                return JsonResponse({'error': 'survey_id required'}, status=400)
+            try:
+                gpt = FeedbackGPT.objects.get(id=survey_id)
+            except FeedbackGPT.DoesNotExist:
+                return JsonResponse({'error': 'Survey not found'}, status=404)
+
+            updatable = ['name', 'survey_label', 'week_number', 'instructions',
+                         'themes', 'timing_category', 'anonymity_mode',
+                         'reporting_structure', 'survey_type']
+            for field in updatable:
+                if field in data:
+                    setattr(gpt, field, data[field])
+
+            if 'expires_at' in data:
+                gpt.expires_at = parse_datetime(data['expires_at']) if data['expires_at'] else None
+            if 'opens_at' in data:
+                gpt.opens_at = parse_datetime(data['opens_at']) if data['opens_at'] else None
+
+            gpt.save()
+            return JsonResponse({'status': 'success', 'id': gpt.id})
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def clone_survey(request):
+    """Duplicate a survey, resetting lifecycle and generating a new public_id."""
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            survey_id = data.get('survey_id')
+            if not survey_id:
+                return JsonResponse({'error': 'survey_id required'}, status=400)
+            try:
+                src = FeedbackGPT.objects.get(id=survey_id)
+            except FeedbackGPT.DoesNotExist:
+                return JsonResponse({'error': 'Survey not found'}, status=404)
+
+            clone = FeedbackGPT.objects.create(
+                name='Copy of ' + src.name,
+                instructions=src.instructions,
+                created_by=src.created_by,
+                course=src.course,
+                week_number=src.week_number,
+                survey_label=src.survey_label,
+                public_id=_generate_public_id(),
+                expires_at=timezone.now() + timedelta(days=14),
+                opens_at=None,
+                is_closed=False,
+                themes=src.themes,
+                timing_category=src.timing_category,
+                anonymity_mode=src.anonymity_mode,
+                reporting_structure=src.reporting_structure,
+                survey_type=src.survey_type,
+            )
+            return JsonResponse({
+                'status': 'success',
+                'id': clone.id,
+                'public_id': clone.public_id,
+                'name': clone.name,
+            })
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def export_survey_responses(request):
+    """Return CSV of all responses for a survey."""
+    if request.method == 'GET':
+        survey_id = request.GET.get('survey_id')
+        if not survey_id:
+            return JsonResponse({'error': 'survey_id required'}, status=400)
+        try:
+            gpt = FeedbackGPT.objects.get(id=survey_id)
+        except FeedbackGPT.DoesNotExist:
+            return JsonResponse({'error': 'Survey not found'}, status=404)
+
+        messages = FeedbackMessage.objects.filter(gpt_id=gpt.id).order_by('session_id', 'created_at')
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(['session_id', 'sent_by', 'content', 'created_at'])
+        for m in messages:
+            writer.writerow([m.session_id, m.sent_by, m.content, m.created_at.strftime('%Y-%m-%d %H:%M:%S')])
+
+        filename = f'survey_{gpt.id}_responses.csv'
+        response = HttpResponse(buf.getvalue(), content_type='text/csv')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
+def get_group_session(request):
+    """
+    Return or create a canonical session_id for a group code.
+    Group sessions share a session_id so all members see the same conversation.
+    GET ?group_code=<code>&survey_id=<id> → { session_id }
+    """
+    if request.method == 'GET':
+        group_code = request.GET.get('group_code', '').strip().upper()
+        survey_id = request.GET.get('survey_id')
+        if not group_code or not survey_id:
+            return JsonResponse({'error': 'group_code and survey_id required'}, status=400)
+        # Use a deterministic session_id: "group_<survey_id>_<group_code>"
+        session_id = f'group_{survey_id}_{group_code}'
+        return JsonResponse({'session_id': session_id})
+    return HttpResponse(status=405)
+
 
 @csrf_exempt
 def sendFireData(request):

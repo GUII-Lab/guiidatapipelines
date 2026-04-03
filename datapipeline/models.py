@@ -48,6 +48,16 @@ class Course(models.Model):
 
 
 class FeedbackGPT(models.Model):
+    ANONYMITY_CHOICES = [
+        ('anonymous', 'Anonymous'),
+        ('pseudonymous', 'Pseudonymous'),
+        ('identified', 'Identified'),
+    ]
+    SURVEY_TYPE_CHOICES = [
+        ('individual', 'Individual'),
+        ('group', 'Group'),
+    ]
+
     id = models.AutoField(primary_key=True)
     public_id = models.CharField(max_length=16, unique=True, blank=True, default='')
     name = models.CharField(max_length=100)
@@ -58,6 +68,18 @@ class FeedbackGPT(models.Model):
     course = models.ForeignKey(Course, on_delete=models.SET_NULL, null=True, blank=True, related_name='surveys')
     week_number = models.IntegerField(null=True, blank=True)
     survey_label = models.CharField(max_length=200, blank=True, default='')
+
+    # Lifecycle fields
+    expires_at = models.DateTimeField(null=True, blank=True)
+    opens_at = models.DateTimeField(null=True, blank=True)
+    is_closed = models.BooleanField(default=False)
+
+    # Metadata fields
+    themes = models.JSONField(default=list, blank=True)
+    timing_category = models.CharField(max_length=100, blank=True, default='')
+    anonymity_mode = models.CharField(max_length=20, choices=ANONYMITY_CHOICES, default='anonymous')
+    reporting_structure = models.CharField(max_length=100, blank=True, default='')
+    survey_type = models.CharField(max_length=20, choices=SURVEY_TYPE_CHOICES, default='individual')
 
     def __str__(self):
         return self.name

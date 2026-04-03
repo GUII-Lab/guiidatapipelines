@@ -27,4 +27,10 @@ urlpatterns = [
     path('api/get_feedback_gpt_by_public_id/', get_feedback_gpt_by_public_id, name='get_feedback_gpt_by_public_id'),
     path('api/feedback_messages_by_gpt/', feedback_messages_by_gpt, name='feedback_messages_by_gpt'),
     path('api/feedback_messages_by_course/', feedback_messages_by_course, name='feedback_messages_by_course'),
+    # LEAI survey lifecycle & management
+    path('api/set_survey_status/', set_survey_status, name='set_survey_status'),
+    path('api/update_survey/', update_survey, name='update_survey'),
+    path('api/clone_survey/', clone_survey, name='clone_survey'),
+    path('api/export_survey_responses/', export_survey_responses, name='export_survey_responses'),
+    path('api/get_group_session/', get_group_session, name='get_group_session'),
 ]
