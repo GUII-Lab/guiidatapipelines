@@ -467,6 +467,35 @@ def clone_survey(request):
     return HttpResponse(status=405)
 
 
+def _session_to_code(session_id):
+    """Mirror the client-side JS hash to produce a completion code from a session ID.
+
+    JS original:
+        var hash = 0;
+        for (var i = 0; i < sid.length; i++) {
+            hash = ((hash << 5) - hash) + sid.charCodeAt(i);
+            hash |= 0;  // 32-bit signed int
+        }
+        Math.abs(hash).toString(36).toUpperCase().padStart(6,'0').slice(0,6)
+    """
+    h = 0
+    for ch in session_id:
+        h = ((h << 5) - h) + ord(ch)
+        # Emulate JS `|= 0` — clamp to signed 32-bit
+        h &= 0xFFFFFFFF
+        if h >= 0x80000000:
+            h -= 0x100000000
+    n = abs(h)
+    if n == 0:
+        return '000000'
+    digits = '0123456789abcdefghijklmnopqrstuvwxyz'
+    result = ''
+    while n:
+        result = digits[n % 36] + result
+        n //= 36
+    return result.upper().zfill(6)[:6]
+
+
 @csrf_exempt
 def export_survey_responses(request):
     """Return CSV of all responses for a survey."""
@@ -482,9 +511,9 @@ def export_survey_responses(request):
         messages = FeedbackMessage.objects.filter(gpt_id=gpt.id).order_by('session_id', 'created_at')
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(['session_id', 'sent_by', 'content', 'created_at'])
+        writer.writerow(['completion_code', 'session_id', 'sent_by', 'content', 'created_at'])
         for m in messages:
-            writer.writerow([m.session_id, m.sent_by, m.content, m.created_at.strftime('%Y-%m-%d %H:%M:%S')])
+            writer.writerow([_session_to_code(m.session_id), m.session_id, m.sent_by, m.content, m.created_at.strftime('%Y-%m-%d %H:%M:%S')])
 
         filename = f'survey_{gpt.id}_responses.csv'
         response = HttpResponse(buf.getvalue(), content_type='text/csv')
