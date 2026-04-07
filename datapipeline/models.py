@@ -75,11 +75,10 @@ class FeedbackGPT(models.Model):
     is_closed = models.BooleanField(default=False)
 
     # Metadata fields
-    themes = models.JSONField(default=list, blank=True)
-    timing_category = models.CharField(max_length=100, blank=True, default='')
     anonymity_mode = models.CharField(max_length=20, choices=ANONYMITY_CHOICES, default='anonymous')
     reporting_structure = models.CharField(max_length=100, blank=True, default='')
     survey_type = models.CharField(max_length=20, choices=SURVEY_TYPE_CHOICES, default='individual')
+    canvas_integration = models.BooleanField(default=False)
 
     def __str__(self):
         return self.name

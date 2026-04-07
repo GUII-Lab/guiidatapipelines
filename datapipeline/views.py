@@ -198,11 +198,10 @@ def create_feedback_gpt(request):
                 expires_at=expires_at,
                 opens_at=opens_at,
                 is_closed=False,
-                themes=data.get('themes', []),
-                timing_category=data.get('timing_category', ''),
                 anonymity_mode=data.get('anonymity_mode', 'anonymous'),
                 reporting_structure=data.get('reporting_structure', ''),
                 survey_type=data.get('survey_type', 'individual'),
+                canvas_integration=data.get('canvas_integration', False),
             )
             return JsonResponse({
                 'status': 'success',
@@ -244,8 +243,6 @@ def feedback_gpts_by_course(request):
                 'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
                 'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
                 'is_closed': gpt.is_closed,
-                'themes': gpt.themes,
-                'timing_category': gpt.timing_category,
                 'anonymity_mode': gpt.anonymity_mode,
                 'reporting_structure': gpt.reporting_structure,
                 'survey_type': gpt.survey_type,
@@ -294,6 +291,7 @@ def get_feedback_gpt_by_public_id(request):
             'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
             'anonymity_mode': gpt.anonymity_mode,
             'survey_type': gpt.survey_type,
+            'canvas_integration': gpt.canvas_integration,
         })
     return HttpResponse(status=405)
 
@@ -357,6 +355,7 @@ def feedback_messages_by_course(request):
                 'is_closed': gpt.is_closed,
                 'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
                 'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
+                'canvas_integration': gpt.canvas_integration,
             })
         return JsonResponse(result, safe=False)
     return HttpResponse(status=405)
@@ -407,8 +406,7 @@ def update_survey(request):
                 return JsonResponse({'error': 'Survey not found'}, status=404)
 
             updatable = ['name', 'survey_label', 'week_number', 'instructions',
-                         'themes', 'timing_category', 'anonymity_mode',
-                         'reporting_structure', 'survey_type']
+                         'anonymity_mode', 'reporting_structure', 'survey_type', 'canvas_integration']
             for field in updatable:
                 if field in data:
                     setattr(gpt, field, data[field])
@@ -450,8 +448,6 @@ def clone_survey(request):
                 expires_at=timezone.now() + timedelta(days=14),
                 opens_at=None,
                 is_closed=False,
-                themes=src.themes,
-                timing_category=src.timing_category,
                 anonymity_mode=src.anonymity_mode,
                 reporting_structure=src.reporting_structure,
                 survey_type=src.survey_type,
