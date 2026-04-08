@@ -31,6 +31,11 @@ class FeedbackMessage(models.Model):
     content = models.TextField()
     gpt_used = models.CharField(max_length=100)
     gpt_id = models.IntegerField(null=True, blank=True)
+    # Per-message research consent flag. The student opts in/out via the
+    # consent modal in feedback.html; the frontend sends this with each
+    # message. When False, the message must NOT be used for any GUII Lab
+    # research analysis (Privacy Policy §5).
+    research_consent = models.BooleanField(default=False)
 
     def __str__(self):
         return f"{self.student_id} used {self.gpt_used}"
@@ -53,10 +58,6 @@ class FeedbackGPT(models.Model):
         ('pseudonymous', 'Pseudonymous'),
         ('identified', 'Identified'),
     ]
-    SURVEY_TYPE_CHOICES = [
-        ('individual', 'Individual'),
-        ('group', 'Group'),
-    ]
 
     id = models.AutoField(primary_key=True)
     public_id = models.CharField(max_length=16, unique=True, blank=True, default='')
@@ -77,7 +78,6 @@ class FeedbackGPT(models.Model):
     # Metadata fields
     anonymity_mode = models.CharField(max_length=20, choices=ANONYMITY_CHOICES, default='anonymous')
     reporting_structure = models.CharField(max_length=100, blank=True, default='')
-    survey_type = models.CharField(max_length=20, choices=SURVEY_TYPE_CHOICES, default='individual')
     canvas_integration = models.BooleanField(default=False)
 
     def __str__(self):

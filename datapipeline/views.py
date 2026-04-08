@@ -2,6 +2,7 @@ from django.http import JsonResponse, HttpResponseBadRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.dateparse import parse_datetime
 from django.utils import timezone
+from django.contrib.auth.hashers import make_password, check_password
 from .models import *  # Ensure this is your custom User model
 import json
 import os
@@ -71,6 +72,7 @@ def feedback_message_api(request):
                 content=data.get('content'),
                 gpt_used=data.get('gpt_used'),
                 gpt_id=data.get('gpt_id'),
+                research_consent=bool(data.get('research_consent', False)),
             )
             feedback_message.save()
             return JsonResponse({'status': 'success', 'message': 'Feedback message saved successfully'})
@@ -133,7 +135,7 @@ def create_course(request):
                 course_id=course_id,
                 course_name=data.get('course_name', ''),
                 instructor_name=data.get('instructor_name', ''),
-                password=data.get('password', ''),
+                password=make_password(data.get('password', '')),
             )
             return JsonResponse({'status': 'success', 'id': course.id, 'course_id': course.course_id})
         except Exception as e:
@@ -152,7 +154,7 @@ def verify_course_password(request):
                 course = Course.objects.get(course_id=course_id)
             except Course.DoesNotExist:
                 return JsonResponse({'valid': False, 'error': 'Course not found'}, status=404)
-            if course.password == password:
+            if check_password(password, course.password):
                 return JsonResponse({
                     'valid': True,
                     'course_name': course.course_name,
@@ -200,7 +202,6 @@ def create_feedback_gpt(request):
                 is_closed=False,
                 anonymity_mode=data.get('anonymity_mode', 'anonymous'),
                 reporting_structure=data.get('reporting_structure', ''),
-                survey_type=data.get('survey_type', 'individual'),
                 canvas_integration=data.get('canvas_integration', False),
             )
             return JsonResponse({
@@ -245,7 +246,6 @@ def feedback_gpts_by_course(request):
                 'is_closed': gpt.is_closed,
                 'anonymity_mode': gpt.anonymity_mode,
                 'reporting_structure': gpt.reporting_structure,
-                'survey_type': gpt.survey_type,
                 'session_count': session_count,
                 'avg_turns': avg_turns,
             })
@@ -290,7 +290,6 @@ def get_feedback_gpt_by_public_id(request):
             'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
             'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
             'anonymity_mode': gpt.anonymity_mode,
-            'survey_type': gpt.survey_type,
             'canvas_integration': gpt.canvas_integration,
         })
     return HttpResponse(status=405)
@@ -406,7 +405,7 @@ def update_survey(request):
                 return JsonResponse({'error': 'Survey not found'}, status=404)
 
             updatable = ['name', 'survey_label', 'week_number', 'instructions',
-                         'anonymity_mode', 'reporting_structure', 'survey_type', 'canvas_integration']
+                         'anonymity_mode', 'reporting_structure', 'canvas_integration']
             for field in updatable:
                 if field in data:
                     setattr(gpt, field, data[field])
@@ -450,7 +449,6 @@ def clone_survey(request):
                 is_closed=False,
                 anonymity_mode=src.anonymity_mode,
                 reporting_structure=src.reporting_structure,
-                survey_type=src.survey_type,
             )
             return JsonResponse({
                 'status': 'success',
@@ -515,24 +513,6 @@ def export_survey_responses(request):
         response = HttpResponse(buf.getvalue(), content_type='text/csv')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
         return response
-    return HttpResponse(status=405)
-
-
-@csrf_exempt
-def get_group_session(request):
-    """
-    Return or create a canonical session_id for a group code.
-    Group sessions share a session_id so all members see the same conversation.
-    GET ?group_code=<code>&survey_id=<id> → { session_id }
-    """
-    if request.method == 'GET':
-        group_code = request.GET.get('group_code', '').strip().upper()
-        survey_id = request.GET.get('survey_id')
-        if not group_code or not survey_id:
-            return JsonResponse({'error': 'group_code and survey_id required'}, status=400)
-        # Use a deterministic session_id: "group_<survey_id>_<group_code>"
-        session_id = f'group_{survey_id}_{group_code}'
-        return JsonResponse({'session_id': session_id})
     return HttpResponse(status=405)
 
 

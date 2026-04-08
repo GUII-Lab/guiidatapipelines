@@ -32,5 +32,4 @@ urlpatterns = [
     path('api/update_survey/', update_survey, name='update_survey'),
     path('api/clone_survey/', clone_survey, name='clone_survey'),
     path('api/export_survey_responses/', export_survey_responses, name='export_survey_responses'),
-    path('api/get_group_session/', get_group_session, name='get_group_session'),
 ]
