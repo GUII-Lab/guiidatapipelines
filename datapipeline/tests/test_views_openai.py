@@ -47,6 +47,7 @@ class TestOpenAIChatView(TestCase):
             chat_history=[],
             user_text="hi",
             model=None,
+            temperature=None,
         )
 
     @mock.patch("datapipeline.views.openai_client.run_chat")

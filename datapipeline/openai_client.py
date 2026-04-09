@@ -201,6 +201,7 @@ def run_chat(
     chat_history: Optional[list],
     user_text: str,
     model: Optional[str] = None,
+    temperature: Optional[float] = None,
 ) -> dict:
     """Execute a plain chat turn via the Responses API.
 
@@ -217,6 +218,8 @@ def run_chat(
     }
     if instructions:
         kwargs["instructions"] = instructions
+    if temperature is not None:
+        kwargs["temperature"] = temperature
 
     response = _call_responses(**kwargs)
 
@@ -233,6 +236,7 @@ def run_structured(
     json_schema: dict,
     schema_name: str = "structured_response",
     model: Optional[str] = None,
+    temperature: Optional[float] = None,
 ) -> dict:
     """Execute a structured turn via the Responses API using a strict
     JSON schema.
@@ -267,6 +271,8 @@ def run_structured(
     }
     if instructions:
         kwargs["instructions"] = instructions
+    if temperature is not None:
+        kwargs["temperature"] = temperature
 
     response = _call_responses(**kwargs)
     output_text = response.output_text

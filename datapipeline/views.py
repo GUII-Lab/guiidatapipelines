@@ -720,6 +720,7 @@ def openai_chat(request):
             chat_history=data.get('chat_history', []),
             user_text=user_text,
             model=data.get('model'),
+            temperature=data.get('temperature'),
         )
     except openai_client.OpenAIClientError as e:
         return JsonResponse({'error': e.detail}, status=e.status_code)
@@ -769,6 +770,7 @@ def openai_structured(request):
             json_schema=json_schema,
             schema_name=data.get('schema_name', 'structured_response'),
             model=data.get('model'),
+            temperature=data.get('temperature'),
         )
     except openai_client.OpenAIRefusalError as e:
         return JsonResponse(

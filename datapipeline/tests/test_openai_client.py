@@ -6,6 +6,7 @@ no real network calls, no real API key needed.
 import os
 import unittest
 from unittest import mock
+from unittest.mock import MagicMock, patch
 
 import openai  # for error-class references in tests
 
@@ -399,6 +400,34 @@ class TestRunChat(unittest.TestCase):
                 {"role": "user", "content": "latest"},
             ],
         )
+
+    def test_run_chat_passes_temperature_when_provided(self):
+        """run_chat should forward temperature to _call_responses."""
+        with patch('datapipeline.openai_client._call_responses') as mock_call:
+            mock_call.return_value = MagicMock(
+                output_text="reply",
+                usage=MagicMock(input_tokens=10, output_tokens=5, total_tokens=15),
+                model="gpt-5.1",
+            )
+            result = openai_client.run_chat(
+                chat_history=[],
+                user_text="hello",
+                temperature=0,
+            )
+            call_kwargs = mock_call.call_args[1]
+            self.assertEqual(call_kwargs['temperature'], 0)
+
+    def test_run_chat_omits_temperature_when_none(self):
+        """run_chat should NOT include temperature key if not provided."""
+        with patch('datapipeline.openai_client._call_responses') as mock_call:
+            mock_call.return_value = MagicMock(
+                output_text="reply",
+                usage=MagicMock(input_tokens=10, output_tokens=5, total_tokens=15),
+                model="gpt-5.1",
+            )
+            openai_client.run_chat(chat_history=[], user_text="hello")
+            call_kwargs = mock_call.call_args[1]
+            self.assertNotIn('temperature', call_kwargs)
 
     def test_rate_limit_error_mapped_to_429(self):
         rate_limit = openai.RateLimitError(
