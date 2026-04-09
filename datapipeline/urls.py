@@ -33,4 +33,10 @@ urlpatterns = [
     path('api/update_survey/', update_survey, name='update_survey'),
     path('api/clone_survey/', clone_survey, name='clone_survey'),
     path('api/export_survey_responses/', export_survey_responses, name='export_survey_responses'),
+    # LEAI chat sessions & quick take
+    path('api/leai_chat_sessions/', views.leai_chat_sessions_list, name='leai_chat_sessions_list'),
+    path('api/leai_chat_sessions/<uuid:session_id>/', views.leai_chat_session_detail, name='leai_chat_session_detail'),
+    path('api/leai_chat_sessions/<uuid:session_id>/turn/', views.leai_chat_session_turn, name='leai_chat_session_turn'),
+    path('api/leai_quicktake/generate/', views.leai_quicktake_generate, name='leai_quicktake_generate'),
+    path('api/leai_quicktake/', views.leai_quicktake_fetch_or_delete, name='leai_quicktake'),
 ]

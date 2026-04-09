@@ -788,3 +788,312 @@ def openai_structured(request):
     })
 
 
+# ---------------------------------------------------------------------------
+# LEAI Chat Session helpers
+# ---------------------------------------------------------------------------
+
+def _session_detail_response(session, status=200):
+    """Serialize a LEAIChatSession (with messages) to a JsonResponse."""
+    messages = list(
+        session.messages.order_by('created_at').values(
+            'id', 'role', 'text', 'cited', 'created_at'
+        )
+    )
+    for m in messages:
+        m['created_at'] = m['created_at'].isoformat()
+
+    return JsonResponse({
+        'id': str(session.pk),
+        'course_id': session.course.course_id,
+        'title': session.title,
+        'scope': {
+            'kind': session.scope_kind,
+            'week_number': session.scope_week_number,
+            'survey_ids': session.scope_survey_ids,
+            'session_ids': session.scope_session_ids,
+        },
+        'system_prompt_override': session.system_prompt_override,
+        'created_at': session.created_at.isoformat(),
+        'updated_at': session.updated_at.isoformat(),
+        'messages': messages,
+    }, status=status)
+
+
+def _quicktake_to_dict(qt):
+    """Serialize a LEAIQuickTake instance to a plain dict."""
+    return {
+        'id': qt.pk,
+        'course_id': qt.course.course_id,
+        'scope_key': qt.scope_key,
+        'bullets': qt.bullets,
+        'verification': qt.verification,
+        'system_prompt': qt.system_prompt,
+        'user_text': qt.user_text,
+        'model_name': qt.model_name,
+        'created_at': qt.created_at.isoformat(),
+        'updated_at': qt.updated_at.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# LEAI Chat Sessions — list + create
+# ---------------------------------------------------------------------------
+
+@csrf_exempt
+def leai_chat_sessions_list(request):
+    """GET /api/leai_chat_sessions/  — list sessions for a course.
+    POST /api/leai_chat_sessions/    — create a new session.
+    """
+    if request.method == 'GET':
+        course_id = request.GET.get('course_id')
+        if not course_id:
+            return JsonResponse({'error': 'course_id is required'}, status=400)
+        try:
+            course = Course.objects.get(course_id=course_id)
+        except Course.DoesNotExist:
+            return JsonResponse({'error': 'Course not found'}, status=404)
+
+        sessions = LEAIChatSession.objects.filter(course=course).order_by('-updated_at')
+        session_list = []
+        for s in sessions:
+            session_list.append({
+                'id': str(s.pk),
+                'title': s.title,
+                'scope': {
+                    'kind': s.scope_kind,
+                    'week_number': s.scope_week_number,
+                    'survey_ids': s.scope_survey_ids,
+                    'session_ids': s.scope_session_ids,
+                },
+                'message_count': s.messages.count(),
+                'created_at': s.created_at.isoformat(),
+                'updated_at': s.updated_at.isoformat(),
+            })
+        return JsonResponse({'sessions': session_list})
+
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+        course_id = data.get('course_id')
+        if not course_id:
+            return JsonResponse({'error': 'course_id is required'}, status=400)
+        try:
+            course = Course.objects.get(course_id=course_id)
+        except Course.DoesNotExist:
+            return JsonResponse({'error': 'Course not found'}, status=404)
+
+        scope = data.get('scope', {})
+        session = LEAIChatSession.objects.create(
+            course=course,
+            title=data.get('title', 'New chat'),
+            scope_kind=scope.get('kind', 'course'),
+            scope_week_number=scope.get('week_number'),
+            scope_survey_ids=scope.get('survey_ids') or [],
+            scope_session_ids=scope.get('session_ids') or [],
+            system_prompt_override=data.get('system_prompt_override'),
+        )
+
+        seed = data.get('seed_system_message')
+        if seed:
+            LEAIChatMessage.objects.create(
+                session=session,
+                role='system',
+                text=seed,
+                cited=[],
+            )
+
+        return _session_detail_response(session, status=201)
+
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# LEAI Chat Session — detail, patch, delete
+# ---------------------------------------------------------------------------
+
+@csrf_exempt
+def leai_chat_session_detail(request, session_id):
+    """GET/PATCH/DELETE /api/leai_chat_sessions/<uuid>/"""
+    try:
+        session = LEAIChatSession.objects.get(pk=session_id)
+    except LEAIChatSession.DoesNotExist:
+        return JsonResponse({'error': 'Session not found'}, status=404)
+
+    if request.method == 'GET':
+        return _session_detail_response(session)
+
+    if request.method == 'PATCH':
+        try:
+            data = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+        if 'title' in data:
+            session.title = data['title']
+        if 'system_prompt_override' in data:
+            session.system_prompt_override = data['system_prompt_override']
+        if 'scope' in data:
+            scope = data['scope']
+            if 'kind' in scope:
+                session.scope_kind = scope['kind']
+            if 'week_number' in scope:
+                session.scope_week_number = scope['week_number']
+            if 'survey_ids' in scope:
+                session.scope_survey_ids = scope['survey_ids']
+            if 'session_ids' in scope:
+                session.scope_session_ids = scope['session_ids']
+        session.save()
+
+        return JsonResponse({
+            'id': str(session.pk),
+            'course_id': session.course.course_id,
+            'title': session.title,
+            'scope': {
+                'kind': session.scope_kind,
+                'week_number': session.scope_week_number,
+                'survey_ids': session.scope_survey_ids,
+                'session_ids': session.scope_session_ids,
+            },
+            'system_prompt_override': session.system_prompt_override,
+            'created_at': session.created_at.isoformat(),
+            'updated_at': session.updated_at.isoformat(),
+        })
+
+    if request.method == 'DELETE':
+        session.delete()
+        return HttpResponse(status=204)
+
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# LEAI Chat Session — turn
+# ---------------------------------------------------------------------------
+
+@csrf_exempt
+def leai_chat_session_turn(request, session_id):
+    """POST /api/leai_chat_sessions/<uuid>/turn/"""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+    try:
+        session = LEAIChatSession.objects.get(pk=session_id)
+    except LEAIChatSession.DoesNotExist:
+        return JsonResponse({'error': 'Session not found'}, status=404)
+
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+    user_text = data.get('user_text', '').strip()
+    if not user_text:
+        return JsonResponse({'error': 'user_text is required'}, status=400)
+
+    from . import leai_analysis
+    try:
+        assistant_msg = leai_analysis.run_chat_turn(session, user_text)
+    except ValueError as e:
+        return JsonResponse({'error': str(e)}, status=400)
+    except openai_client.OpenAIRefusalError as e:
+        return JsonResponse({'error': e.detail}, status=422)
+    except openai_client.OpenAIClientError as e:
+        return JsonResponse({'error': e.detail}, status=e.status_code)
+
+    session.refresh_from_db()
+    return JsonResponse({
+        'message': {
+            'id': assistant_msg.pk,
+            'role': assistant_msg.role,
+            'text': assistant_msg.text,
+            'cited': assistant_msg.cited,
+            'created_at': assistant_msg.created_at.isoformat(),
+        },
+        'session_updated_at': session.updated_at.isoformat(),
+    })
+
+
+# ---------------------------------------------------------------------------
+# LEAI Quick Take — fetch or delete
+# ---------------------------------------------------------------------------
+
+@csrf_exempt
+def leai_quicktake_fetch_or_delete(request):
+    """GET/DELETE /api/leai_quicktake/?course_id=<id>&scope_key=<key>"""
+    course_id = request.GET.get('course_id')
+    scope_key = request.GET.get('scope_key')
+
+    if not course_id or not scope_key:
+        return JsonResponse({'error': 'course_id and scope_key are required'}, status=400)
+
+    try:
+        course = Course.objects.get(course_id=course_id)
+    except Course.DoesNotExist:
+        return JsonResponse({'error': 'Course not found'}, status=404)
+
+    try:
+        qt = LEAIQuickTake.objects.get(course=course, scope_key=scope_key)
+    except LEAIQuickTake.DoesNotExist:
+        return JsonResponse({'error': 'QuickTake not found'}, status=404)
+
+    if request.method == 'GET':
+        return JsonResponse(_quicktake_to_dict(qt))
+
+    if request.method == 'DELETE':
+        qt.delete()
+        return HttpResponse(status=204)
+
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+
+# ---------------------------------------------------------------------------
+# LEAI Quick Take — generate
+# ---------------------------------------------------------------------------
+
+@csrf_exempt
+def leai_quicktake_generate(request):
+    """POST /api/leai_quicktake/generate/"""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+    course_id = data.get('course_id')
+    scope_key = data.get('scope_key')
+    scope = data.get('scope')
+
+    if not course_id or not scope_key or not scope:
+        return JsonResponse(
+            {'error': 'course_id, scope_key, and scope are required'}, status=400
+        )
+
+    try:
+        course = Course.objects.get(course_id=course_id)
+    except Course.DoesNotExist:
+        return JsonResponse({'error': 'Course not found'}, status=404)
+
+    from . import leai_analysis
+    try:
+        qt = leai_analysis.generate_quicktake(
+            course=course,
+            scope_key=scope_key,
+            scope_kind=scope.get('kind', 'course'),
+            scope_week_number=scope.get('week_number'),
+            scope_survey_ids=scope.get('survey_ids'),
+            scope_session_ids=scope.get('session_ids'),
+        )
+    except ValueError as e:
+        return JsonResponse({'error': str(e)}, status=400)
+    except openai_client.OpenAIRefusalError as e:
+        return JsonResponse({'error': e.detail}, status=422)
+    except openai_client.OpenAIClientError as e:
+        return JsonResponse({'error': e.detail}, status=e.status_code)
+
+    return JsonResponse(_quicktake_to_dict(qt))
+
