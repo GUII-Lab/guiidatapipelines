@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from typing import Any, Callable
 
 import requests
@@ -153,6 +154,16 @@ def main() -> int:
         required=True,
         help="Base URL including /datapipeline/api (no trailing slash).",
     )
+    parser.add_argument(
+        "--confirm-real-api",
+        action="store_true",
+        required=True,
+        help=(
+            "Required acknowledgment that this script makes real OpenAI API "
+            "calls against the live backend and will cost real money on the "
+            "configured OpenAI key. Pass this flag explicitly every time."
+        ),
+    )
     args = parser.parse_args()
 
     print(f"Running dry-run checks against: {args.base_url}")
@@ -169,8 +180,9 @@ def main() -> int:
     for check in checks:
         try:
             results.append(check(args.base_url))
-        except Exception as e:  # pragma: no cover
-            print(f"  [FAIL] {check.__name__} raised: {e}")
+        except Exception:
+            print(f"  [FAIL] {check.__name__} raised an exception:")
+            traceback.print_exc()
             results.append(False)
 
     passed = sum(1 for r in results if r)
