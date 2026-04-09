@@ -452,3 +452,48 @@ class TestRunChat(unittest.TestCase):
             with self.assertRaises(OpenAIClientError) as ctx:
                 openai_client.run_chat(chat_history=[], user_text="Hi")
         self.assertEqual(ctx.exception.status_code, 504)
+
+    def test_connection_error_mapped_to_504(self):
+        conn_err = openai.APIConnectionError(request=mock.MagicMock())
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            create_side_effect=conn_err
+        )
+        with env_patch, ctor_patch:
+            with self.assertRaises(OpenAIClientError) as ctx:
+                openai_client.run_chat(chat_history=[], user_text="Hi")
+        self.assertEqual(ctx.exception.status_code, 504)
+
+    def test_unknown_exception_wrapped_as_client_error_500(self):
+        # Bare `except Exception` catch-all: a non-OpenAI exception from
+        # client.responses.create() must become OpenAIClientError(500),
+        # not propagate unwrapped.
+        surprise = RuntimeError("surprise")
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            create_side_effect=surprise
+        )
+        with env_patch, ctor_patch:
+            with self.assertRaises(OpenAIClientError) as ctx:
+                openai_client.run_chat(chat_history=[], user_text="Hi")
+        self.assertEqual(ctx.exception.status_code, 500)
+        # Original cause is preserved via `from e` chaining.
+        self.assertIs(ctx.exception.__cause__, surprise)
+
+    def test_generic_api_status_error_passes_through_status_code(self):
+        # A less-specific APIStatusError subclass that isn't individually
+        # caught (e.g. InternalServerError → 500) should fall through to
+        # the bare `except openai.APIStatusError` branch and preserve the
+        # upstream status_code.
+        internal = openai.InternalServerError(
+            message="upstream boom",
+            response=mock.MagicMock(status_code=500),
+            body=None,
+        )
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            create_side_effect=internal
+        )
+        with env_patch, ctor_patch:
+            with self.assertRaises(OpenAIClientError) as ctx:
+                openai_client.run_chat(chat_history=[], user_text="Hi")
+        self.assertEqual(ctx.exception.status_code, 500)
+        # Must not be reclassified as OpenAIConfigError (that's for auth).
+        self.assertNotIsInstance(ctx.exception, OpenAIConfigError)
