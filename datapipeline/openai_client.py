@@ -225,3 +225,62 @@ def run_chat(
         "usage": translate_usage(response.usage),
         "model": response.model,
     }
+
+
+def run_structured(
+    chat_history: Optional[list],
+    user_text: str,
+    json_schema: dict,
+    schema_name: str = "structured_response",
+    model: Optional[str] = None,
+) -> dict:
+    """Execute a structured turn via the Responses API using a strict
+    JSON schema.
+
+    Args:
+        chat_history: same shape as run_chat.
+        user_text: final user turn.
+        json_schema: a JSON Schema object. Must describe a valid schema.
+        schema_name: identifier OpenAI logs alongside the schema.
+        model: optional override; falls back to DEFAULT_MODEL.
+
+    Returns:
+        {"response": raw_json_str, "parsed": obj_or_list, "usage": dict,
+         "model": str}
+
+    Raises:
+        OpenAIRefusalError: model refused or returned unparseable JSON.
+        OpenAIClientError: any other SDK failure."""
+    instructions, input_messages = build_responses_input(chat_history, user_text)
+
+    kwargs: dict[str, Any] = {
+        "model": model or DEFAULT_MODEL,
+        "input": input_messages,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "schema": json_schema,
+                "strict": True,
+            }
+        },
+    }
+    if instructions:
+        kwargs["instructions"] = instructions
+
+    response = _call_responses(**kwargs)
+    output_text = response.output_text
+
+    try:
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError as e:
+        raise OpenAIRefusalError(
+            f"Model output was not valid JSON under strict schema: {e}",
+        ) from e
+
+    return {
+        "response": output_text,
+        "parsed": parsed,
+        "usage": translate_usage(response.usage),
+        "model": response.model,
+    }

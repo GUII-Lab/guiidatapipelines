@@ -497,3 +497,171 @@ class TestRunChat(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 500)
         # Must not be reclassified as OpenAIConfigError (that's for auth).
         self.assertNotIsInstance(ctx.exception, OpenAIConfigError)
+
+
+class TestRunStructured(unittest.TestCase):
+    """run_structured calls client.responses.create with a JSON-schema
+    text format and json.loads() the output."""
+
+    def setUp(self):
+        openai_client._reset_client_for_tests()
+
+    def tearDown(self):
+        openai_client._reset_client_for_tests()
+
+    def _make_client_mock(self, output_text='{}'):
+        fake_client = mock.MagicMock()
+        fake_client.responses.create.return_value = _FakeResponse(
+            output_text=output_text,
+            usage=_FakeUsage(input_tokens=1, output_tokens=2, total_tokens=3),
+            model="gpt-5.1",
+        )
+        env_patch = mock.patch.dict(os.environ, {"oaiKey": "sk-test"}, clear=True)
+        ctor_patch = mock.patch(
+            "datapipeline.openai_client.OpenAI",
+            return_value=fake_client,
+        )
+        return fake_client, env_patch, ctor_patch
+
+    def test_happy_path_parses_object_output(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text='{"theme": "pace", "confidence": 0.9}'
+        )
+        with env_patch, ctor_patch:
+            result = openai_client.run_structured(
+                chat_history=[],
+                user_text="analyze this",
+                json_schema={"type": "object"},
+            )
+        self.assertEqual(
+            result["parsed"],
+            {"theme": "pace", "confidence": 0.9},
+        )
+        self.assertEqual(result["response"], '{"theme": "pace", "confidence": 0.9}')
+        self.assertEqual(result["model"], "gpt-5.1")
+
+    def test_happy_path_parses_array_output(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text='[1, 2, 3]'
+        )
+        with env_patch, ctor_patch:
+            result = openai_client.run_structured(
+                chat_history=[],
+                user_text="list ints",
+                json_schema={"type": "array"},
+            )
+        self.assertEqual(result["parsed"], [1, 2, 3])
+
+    def test_strict_mode_always_set(self):
+        schema = {
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"],
+            "additionalProperties": False,
+        }
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text='{"x": "y"}'
+        )
+        with env_patch, ctor_patch:
+            openai_client.run_structured(
+                chat_history=[],
+                user_text="do it",
+                json_schema=schema,
+                schema_name="my_schema",
+            )
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(
+            kwargs["text"],
+            {
+                "format": {
+                    "type": "json_schema",
+                    "name": "my_schema",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+        )
+
+    def test_default_schema_name(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text='{}'
+        )
+        with env_patch, ctor_patch:
+            openai_client.run_structured(
+                chat_history=[],
+                user_text="do it",
+                json_schema={"type": "object"},
+            )
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(
+            kwargs["text"]["format"]["name"],
+            "structured_response",
+        )
+
+    def test_unparseable_output_raises_refusal_error(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text="I cannot help with that request."
+        )
+        with env_patch, ctor_patch:
+            with self.assertRaises(OpenAIRefusalError) as ctx:
+                openai_client.run_structured(
+                    chat_history=[],
+                    user_text="harmful ask",
+                    json_schema={"type": "object"},
+                )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_default_model_used(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text='{}'
+        )
+        with env_patch, ctor_patch:
+            openai_client.run_structured(
+                chat_history=[],
+                user_text="do it",
+                json_schema={"type": "object"},
+            )
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(kwargs["model"], DEFAULT_MODEL)
+
+    def test_custom_model_passes_through(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text='{}'
+        )
+        with env_patch, ctor_patch:
+            openai_client.run_structured(
+                chat_history=[],
+                user_text="do it",
+                json_schema={"type": "object"},
+                model="gpt-4o",
+            )
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(kwargs["model"], "gpt-4o")
+
+    def test_usage_translated(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text='{}'
+        )
+        with env_patch, ctor_patch:
+            result = openai_client.run_structured(
+                chat_history=[],
+                user_text="do it",
+                json_schema={"type": "object"},
+            )
+        self.assertEqual(
+            result["usage"],
+            {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        )
+
+    def test_instructions_routed_from_system_messages(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            output_text='{}'
+        )
+        with env_patch, ctor_patch:
+            openai_client.run_structured(
+                chat_history=[{"role": "system", "content": "Output strict JSON."}],
+                user_text="do it",
+                json_schema={"type": "object"},
+            )
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(kwargs["instructions"], "Output strict JSON.")
