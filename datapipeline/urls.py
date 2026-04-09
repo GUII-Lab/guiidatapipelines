@@ -19,6 +19,7 @@ urlpatterns = [
     path('api/image/<int:image_id>/', get_image, name='get_image'),
     path('api/images/', list_images, name='list_images'),
     path('api/openai-chat/', openai_chat, name='openai_chat'),
+    path('api/openai-structured/', openai_structured, name='openai_structured'),
     # LEAI course management
     path('api/create_course/', create_course, name='create_course'),
     path('api/verify_course_password/', verify_course_password, name='verify_course_password'),

@@ -96,3 +96,106 @@ class TestOpenAIChatView(TestCase):
         )
         response = self._post({"chat_history": [], "user_text": "hi"})
         self.assertEqual(response.status_code, 500)
+
+
+class TestOpenAIStructuredView(TestCase):
+    url = "/datapipeline/api/openai-structured/"
+
+    def setUp(self):
+        self.client = Client()
+
+    def _post(self, body: dict):
+        return self.client.post(
+            self.url,
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+
+    @mock.patch("datapipeline.views.openai_client.run_structured")
+    def test_happy_path_returns_parsed_payload(self, mock_run_structured):
+        mock_run_structured.return_value = {
+            "response": '{"sentiment": "positive"}',
+            "parsed": {"sentiment": "positive"},
+            "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
+            "model": "gpt-5.1",
+        }
+        response = self._post({
+            "chat_history": [],
+            "user_text": "The course was great.",
+            "json_schema": {
+                "type": "object",
+                "properties": {"sentiment": {"type": "string"}},
+                "required": ["sentiment"],
+                "additionalProperties": False,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["response"], '{"sentiment": "positive"}')
+        self.assertEqual(body["parsed"], {"sentiment": "positive"})
+        self.assertEqual(
+            body["usage"],
+            {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
+        )
+
+    @mock.patch("datapipeline.views.openai_client.run_structured")
+    def test_schema_name_passed_through(self, mock_run_structured):
+        mock_run_structured.return_value = {
+            "response": "{}", "parsed": {}, "usage": {}, "model": "gpt-5.1",
+        }
+        self._post({
+            "user_text": "hi",
+            "json_schema": {"type": "object"},
+            "schema_name": "custom_name",
+        })
+        _, kwargs = mock_run_structured.call_args
+        self.assertEqual(kwargs["schema_name"], "custom_name")
+
+    def test_missing_user_text_returns_400(self):
+        response = self._post({
+            "json_schema": {"type": "object"},
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("user_text", response.json()["error"])
+
+    def test_missing_json_schema_returns_400(self):
+        response = self._post({"user_text": "hi"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("json_schema", response.json()["error"])
+
+    def test_non_dict_json_schema_returns_400(self):
+        response = self._post({
+            "user_text": "hi",
+            "json_schema": "not-a-dict",
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_non_post_returns_405(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 405)
+
+    @mock.patch("datapipeline.views.openai_client.run_structured")
+    def test_refusal_mapped_to_422_with_reason(self, mock_run_structured):
+        mock_run_structured.side_effect = openai_client.OpenAIRefusalError(
+            "unparseable",
+        )
+        response = self._post({
+            "user_text": "bad",
+            "json_schema": {"type": "object"},
+        })
+        self.assertEqual(response.status_code, 422)
+        body = response.json()
+        self.assertEqual(body["reason"], "refusal_or_unparseable")
+        self.assertIn("unparseable", body["error"])
+
+    @mock.patch("datapipeline.views.openai_client.run_structured")
+    def test_generic_client_error_mapped_to_status_code(self, mock_run_structured):
+        mock_run_structured.side_effect = openai_client.OpenAIClientError(
+            "rate", status_code=429,
+        )
+        response = self._post({
+            "user_text": "hi",
+            "json_schema": {"type": "object"},
+        })
+        self.assertEqual(response.status_code, 429)

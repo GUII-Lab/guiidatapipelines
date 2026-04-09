@@ -731,3 +731,58 @@ def openai_chat(request):
     })
 
 
+@csrf_exempt
+def openai_structured(request):
+    """Proxy endpoint for schema-enforced structured output via Responses API.
+
+    POST body: {
+        chat_history?: [...],
+        user_text: str,
+        json_schema: dict,       # full JSON Schema object
+        schema_name?: str,       # optional; default "structured_response"
+        model?: str              # optional; default OPENAI_DEFAULT_MODEL
+    }
+    200 body: {status, response (raw JSON str), parsed (dict|list), usage}
+    422 body: {error, reason: "refusal_or_unparseable"}  on refusal/bad JSON
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Only POST method allowed'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+    user_text = data.get('user_text')
+    json_schema = data.get('json_schema')
+    if not user_text:
+        return JsonResponse({'error': 'user_text is required'}, status=400)
+    if not isinstance(json_schema, dict):
+        return JsonResponse(
+            {'error': 'json_schema (object) is required'}, status=400,
+        )
+
+    try:
+        result = openai_client.run_structured(
+            chat_history=data.get('chat_history', []),
+            user_text=user_text,
+            json_schema=json_schema,
+            schema_name=data.get('schema_name', 'structured_response'),
+            model=data.get('model'),
+        )
+    except openai_client.OpenAIRefusalError as e:
+        return JsonResponse(
+            {'error': e.detail, 'reason': 'refusal_or_unparseable'},
+            status=422,
+        )
+    except openai_client.OpenAIClientError as e:
+        return JsonResponse({'error': e.detail}, status=e.status_code)
+
+    return JsonResponse({
+        'status': 'success',
+        'response': result['response'],
+        'parsed': result['parsed'],
+        'usage': result['usage'],
+    })
+
+
