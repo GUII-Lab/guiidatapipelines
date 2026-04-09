@@ -1,3 +1,5 @@
+import uuid
+
 from django.db import models
 from django.utils import timezone
 
@@ -116,3 +118,83 @@ class Image(models.Model):
         if self.image:
             return self.image.url
         return None
+
+
+class LEAIChatSession(models.Model):
+    """Persisted Feedback Chat session, scoped to a Course."""
+
+    SCOPE_CHOICES = [
+        ('course', 'course'),
+        ('week', 'week'),
+        ('custom', 'custom'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    course = models.ForeignKey(
+        Course, on_delete=models.CASCADE, related_name='leai_chat_sessions',
+    )
+    title = models.CharField(max_length=120, default='New chat')
+    scope_kind = models.CharField(
+        max_length=16, choices=SCOPE_CHOICES, default='course',
+    )
+    scope_week_number = models.IntegerField(null=True, blank=True)
+    scope_survey_ids = models.JSONField(default=list, blank=True)
+    scope_session_ids = models.JSONField(default=list, blank=True)
+    system_prompt_override = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+        indexes = [models.Index(fields=['course', '-updated_at'])]
+
+    def __str__(self):
+        return f'{self.title} ({self.course.course_id})'
+
+
+class LEAIChatMessage(models.Model):
+    """One turn in a Feedback Chat session."""
+
+    ROLE_CHOICES = [
+        ('user', 'user'),
+        ('assistant', 'assistant'),
+        ('system', 'system'),
+    ]
+
+    session = models.ForeignKey(
+        LEAIChatSession, on_delete=models.CASCADE, related_name='messages',
+    )
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES)
+    text = models.TextField()
+    cited = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [models.Index(fields=['session', 'created_at'])]
+
+    def __str__(self):
+        return f'{self.role}: {self.text[:60]}'
+
+
+class LEAIQuickTake(models.Model):
+    """Persisted AI Quick Take, cached per (course, scope_key)."""
+
+    course = models.ForeignKey(
+        Course, on_delete=models.CASCADE, related_name='leai_quicktakes',
+    )
+    scope_key = models.CharField(max_length=64)
+    bullets = models.JSONField(default=list)
+    verification = models.JSONField(default=list)
+    system_prompt = models.TextField()
+    user_text = models.TextField()
+    model_name = models.CharField(max_length=64, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('course', 'scope_key')]
+        indexes = [models.Index(fields=['course', 'scope_key'])]
+
+    def __str__(self):
+        return f'QuickTake {self.scope_key} ({self.course.course_id})'
