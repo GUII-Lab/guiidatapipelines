@@ -52,3 +52,54 @@ class OpenAIConfigError(OpenAIClientError):
 #   translate_usage()
 #   run_chat()
 #   run_structured()
+
+
+def build_responses_input(
+    chat_history: Optional[list],
+    user_text: str,
+) -> tuple[Optional[str], list[dict]]:
+    """Split chat_history into (instructions, input_messages) suitable for
+    client.responses.create(instructions=..., input=...).
+
+    - `role: "system"` (or legacy sent_by='system') messages are pulled out
+      and newline-joined into a single `instructions` string.
+    - Remaining user/assistant messages map to {'role', 'content'} dicts.
+    - user_text is appended as the final {'role': 'user'} turn.
+    - Legacy normalization: sent_by 'student' → user, 'gpt'/'ai' → assistant.
+    - Legacy content fallback: msg['text'] is used when msg['content'] absent.
+    - Malformed entries (non-dict, missing content, empty content) are
+      dropped silently to match current view behavior.
+
+    Returns (instructions_or_none, input_messages_list). instructions is None
+    when no system messages were present."""
+    instructions_parts: list[str] = []
+    input_messages: list[dict] = []
+
+    for msg in (chat_history or []):
+        if not isinstance(msg, dict):
+            continue
+
+        role = msg.get("role", "user")
+        sent_by_raw = msg.get("sent_by")
+        if sent_by_raw:
+            sent_by = str(sent_by_raw).lower()
+            if sent_by in ("user", "student"):
+                role = "user"
+            elif sent_by in ("assistant", "gpt", "ai"):
+                role = "assistant"
+            elif sent_by == "system":
+                role = "system"
+
+        content = msg.get("content") or msg.get("text") or ""
+        if not content:
+            continue
+
+        if role == "system":
+            instructions_parts.append(content)
+        else:
+            input_messages.append({"role": role, "content": content})
+
+    input_messages.append({"role": "user", "content": user_text})
+
+    instructions = "\n\n".join(instructions_parts) if instructions_parts else None
+    return instructions, input_messages
