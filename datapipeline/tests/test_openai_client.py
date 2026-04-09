@@ -3,7 +3,9 @@
 These tests are pure-function or use unittest.mock to stub the OpenAI SDK —
 no real network calls, no real API key needed.
 """
+import os
 import unittest
+from unittest import mock
 
 from datapipeline import openai_client
 from datapipeline.openai_client import (
@@ -226,3 +228,51 @@ class TestTranslateUsage(unittest.TestCase):
             result,
             {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         )
+
+
+class TestGetClient(unittest.TestCase):
+    """get_client() is a lazy singleton. It reads oaiKey from os.environ
+    (matching the env var name the existing view uses) and raises
+    OpenAIConfigError when missing."""
+
+    def setUp(self):
+        # Reset the module-level cache between tests so we don't leak
+        # state across test cases.
+        openai_client._reset_client_for_tests()
+
+    def tearDown(self):
+        openai_client._reset_client_for_tests()
+
+    def test_missing_env_var_raises_config_error(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(OpenAIConfigError) as ctx:
+                openai_client.get_client()
+            self.assertEqual(ctx.exception.status_code, 500)
+            self.assertIn("oaiKey", ctx.exception.detail)
+
+    def test_client_constructed_with_timeout_and_retries(self):
+        fake_client_instance = mock.MagicMock()
+        with mock.patch.dict(os.environ, {"oaiKey": "sk-test"}, clear=True):
+            with mock.patch(
+                "datapipeline.openai_client.OpenAI",
+                return_value=fake_client_instance,
+            ) as fake_ctor:
+                result = openai_client.get_client()
+                fake_ctor.assert_called_once_with(
+                    api_key="sk-test",
+                    timeout=60.0,
+                    max_retries=2,
+                )
+                self.assertIs(result, fake_client_instance)
+
+    def test_client_cached_across_calls(self):
+        fake_client_instance = mock.MagicMock()
+        with mock.patch.dict(os.environ, {"oaiKey": "sk-test"}, clear=True):
+            with mock.patch(
+                "datapipeline.openai_client.OpenAI",
+                return_value=fake_client_instance,
+            ) as fake_ctor:
+                a = openai_client.get_client()
+                b = openai_client.get_client()
+                self.assertIs(a, b)
+                fake_ctor.assert_called_once()  # constructed only once

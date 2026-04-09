@@ -125,3 +125,33 @@ def translate_usage(usage: Any) -> dict:
         "completion_tokens": getattr(usage, "output_tokens", 0),
         "total_tokens": getattr(usage, "total_tokens", 0),
     }
+
+
+# Lazily-constructed singleton. Reset in tests via _reset_client_for_tests().
+_client: Optional[OpenAI] = None
+
+
+def get_client() -> OpenAI:
+    """Return the lazily-constructed OpenAI client singleton.
+
+    Reads the API key from the `oaiKey` env var (matching the name the
+    existing view uses). Raises OpenAIConfigError if unset."""
+    global _client
+    if _client is None:
+        api_key = os.environ.get("oaiKey")
+        if not api_key:
+            raise OpenAIConfigError(
+                "oaiKey environment variable is not set",
+            )
+        _client = OpenAI(
+            api_key=api_key,
+            timeout=60.0,
+            max_retries=2,
+        )
+    return _client
+
+
+def _reset_client_for_tests() -> None:
+    """Clear the cached client. For unit-test use only."""
+    global _client
+    _client = None
