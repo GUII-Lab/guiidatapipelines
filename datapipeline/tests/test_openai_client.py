@@ -186,3 +186,43 @@ class TestBuildResponsesInput(unittest.TestCase):
                 {"role": "user", "content": "end"},
             ],
         )
+
+
+class _FakeUsage:
+    """Mimic the OpenAI Responses API usage object for tests."""
+    def __init__(self, input_tokens=0, output_tokens=0, total_tokens=0):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.total_tokens = total_tokens
+
+
+class TestTranslateUsage(unittest.TestCase):
+    """translate_usage maps Responses API native usage → Chat Completions
+    shape so the frontend contract is preserved byte-for-byte."""
+
+    def test_pydantic_style_usage_object(self):
+        usage = _FakeUsage(input_tokens=10, output_tokens=20, total_tokens=30)
+        result = openai_client.translate_usage(usage)
+        self.assertEqual(
+            result,
+            {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        )
+
+    def test_dict_style_usage_payload(self):
+        usage = {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+        result = openai_client.translate_usage(usage)
+        self.assertEqual(
+            result,
+            {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
+        )
+
+    def test_none_usage_returns_empty_dict(self):
+        self.assertEqual(openai_client.translate_usage(None), {})
+
+    def test_missing_fields_default_to_zero(self):
+        usage = _FakeUsage()  # all zeros
+        result = openai_client.translate_usage(usage)
+        self.assertEqual(
+            result,
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )

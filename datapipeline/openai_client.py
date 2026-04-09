@@ -103,3 +103,25 @@ def build_responses_input(
 
     instructions = "\n\n".join(instructions_parts) if instructions_parts else None
     return instructions, input_messages
+
+
+def translate_usage(usage: Any) -> dict:
+    """Map Responses API usage (input_tokens/output_tokens/total_tokens) to
+    the Chat Completions shape (prompt_tokens/completion_tokens/total_tokens)
+    so the /api/openai-chat/ frontend contract stays byte-identical.
+
+    Accepts either a pydantic-style object with attributes OR a plain dict.
+    Returns {} if usage is None."""
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        return {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+    return {
+        "prompt_tokens": getattr(usage, "input_tokens", 0),
+        "completion_tokens": getattr(usage, "output_tokens", 0),
+        "total_tokens": getattr(usage, "total_tokens", 0),
+    }
