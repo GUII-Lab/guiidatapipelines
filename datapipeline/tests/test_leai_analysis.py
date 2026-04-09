@@ -359,7 +359,13 @@ class RunChatTurnTest(TestCase):
         # Citations should have been parsed ([R1] → [1])
         self.assertNotIn("[R1]", messages[1].text)
         self.assertIn("[1]", messages[1].text)
-        self.assertIn("R1", messages[1].cited)
+        # cited should be a list of dicts with rid and verdict keys
+        self.assertIsInstance(messages[1].cited, list)
+        self.assertEqual(len(messages[1].cited), 1)
+        self.assertIsInstance(messages[1].cited[0], dict)
+        self.assertEqual(messages[1].cited[0]['rid'], 'R1')
+        self.assertIn('verdict', messages[1].cited[0])
+        self.assertIn('pill_index', messages[1].cited[0])
 
     def test_run_chat_turn_rolls_back_on_llm_error(self):
         from datapipeline.openai_client import OpenAIClientError

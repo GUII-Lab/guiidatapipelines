@@ -474,22 +474,34 @@ def run_chat_turn(
         raw_response = result["response"]
 
         # Parse citations
-        cleaned_text, cited_list = parse_inline_citations(raw_response)
+        cleaned_text, cited_rids = parse_inline_citations(raw_response)
+
+        # Build full cited array with pill indices
+        cited = []
+        for i, rid in enumerate(cited_rids, 1):
+            cited.append({
+                'rid': rid,
+                'pill_index': i,
+                'verdict': None,
+            })
 
         # Verify citations (graceful — never raises)
-        if cited_list:
-            # Build a pseudo-bullet representing all cited sources for verification
-            pseudo_bullets = [{"text": cleaned_text, "cited_ids": cited_list}]
-            verification = verify_claims(corpus=corpus, bullets=pseudo_bullets)
-        else:
-            verification = []
+        if cited:
+            pseudo_bullets = [{"text": cleaned_text, "cited_ids": cited_rids}]
+            try:
+                verification = verify_claims(corpus=corpus, bullets=pseudo_bullets)
+                verdict_map = {v['source_id']: v['verdict'] for v in verification}
+                for c in cited:
+                    c['verdict'] = verdict_map.get(c['rid'])
+            except Exception:
+                pass  # leave verdicts as None
 
         # Save assistant message
         assistant_msg = LEAIChatMessage.objects.create(
             session=session,
             role="assistant",
             text=cleaned_text,
-            cited=cited_list,
+            cited=cited,
         )
 
     return assistant_msg
