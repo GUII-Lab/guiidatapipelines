@@ -164,6 +164,23 @@ class ParseInlineCitationsTest(TestCase):
         # cited list de-duplicates: R17 listed once
         self.assertEqual(cited, ["R17"])
 
+    def test_comma_separated_citations(self):
+        text = "Students struggled [R5, R25, R35] with the project."
+        cleaned, cited = parse_inline_citations(text)
+        self.assertIn("[1]", cleaned)
+        self.assertIn("[2]", cleaned)
+        self.assertIn("[3]", cleaned)
+        self.assertNotIn("[R", cleaned)
+        self.assertEqual(cited, ["R5", "R25", "R35"])
+
+    def test_bold_markdown_citations(self):
+        text = "Response **R18** mentions rubric issues and **R36** mentions grading."
+        cleaned, cited = parse_inline_citations(text)
+        self.assertIn("[1]", cleaned)
+        self.assertIn("[2]", cleaned)
+        self.assertNotIn("**R", cleaned)
+        self.assertEqual(cited, ["R18", "R36"])
+
 
 # ---------------------------------------------------------------------------
 # PromptsAndSchemasTest

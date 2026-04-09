@@ -55,8 +55,10 @@ def default_chat_system_prompt() -> str:
         "assistant that helps instructors explore and understand anonymous "
         "student feedback. "
         "You have access to a corpus of student responses shown below. "
-        "When making claims, cite response IDs inline using [R<number>] notation "
-        "(e.g. [R17]) so instructors can trace statements back to source data. "
+        "When making claims, cite response IDs inline using square-bracket "
+        "notation like [R17] or [R3]. Always use this exact format — each "
+        "citation must be a separate [R<number>] tag, never bold, never "
+        "comma-separated inside brackets. "
         "Be thoughtful, evidence-based, and pedagogically sensitive. "
         "Do not reveal individual student identities — all responses are "
         "anonymous."
@@ -238,6 +240,26 @@ def build_chat_corpus_block(corpus: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 _CITATION_RE = re.compile(r"\[R(\d+)\]")
+_COMMA_CITATION_RE = re.compile(r"\[(R\d+(?:\s*,\s*R\d+)+)\]")
+_BOLD_CITATION_RE = re.compile(r"\*\*(R\d+)\*\*")
+
+
+def _normalize_citations(text: str) -> str:
+    """Normalize variant citation formats into standard [R<n>] form.
+
+    Handles:
+      - Comma-separated: [R5, R25, R35] → [R5][R25][R35]
+      - Markdown bold:   **R18**         → [R18]
+    """
+    # Expand comma-separated lists first
+    def expand_comma(match: re.Match) -> str:
+        ids = [rid.strip() for rid in match.group(1).split(",")]
+        return "".join(f"[{rid}]" for rid in ids)
+    text = _COMMA_CITATION_RE.sub(expand_comma, text)
+
+    # Convert bold R-ids to bracketed form
+    text = _BOLD_CITATION_RE.sub(r"[\1]", text)
+    return text
 
 
 def parse_inline_citations(text: str) -> tuple[str, list[str]]:
@@ -250,9 +272,15 @@ def parse_inline_citations(text: str) -> tuple[str, list[str]]:
     index.  The same R-id appearing multiple times gets separate sequential
     pill indices (i.e. duplicate R-ids are NOT collapsed).
 
+    Also handles comma-separated citations like [R5, R25, R35] by first
+    expanding them into individual [R5][R25][R35] format.
+
     cited_list contains the original R-ids in the order they first appear in
     the text (de-duplicated for the list, but pills are still sequential).
     """
+    # Normalize variant citation formats first
+    text = _normalize_citations(text)
+
     cited_order: list[str] = []  # ordered unique R-ids
     seen: set[str] = set()
     pill_counter = 0
