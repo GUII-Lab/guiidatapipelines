@@ -7,6 +7,8 @@ import os
 import unittest
 from unittest import mock
 
+import openai  # for error-class references in tests
+
 from datapipeline import openai_client
 from datapipeline.openai_client import (
     DEFAULT_MODEL,
@@ -276,3 +278,177 @@ class TestGetClient(unittest.TestCase):
                 b = openai_client.get_client()
                 self.assertIs(a, b)
                 fake_ctor.assert_called_once()  # constructed only once
+
+
+class _FakeResponse:
+    """Mimic the object client.responses.create() returns."""
+    def __init__(self, output_text="", usage=None, model="gpt-5.1"):
+        self.output_text = output_text
+        self.usage = usage
+        self.model = model
+
+
+def _fake_response(text="hi", model="gpt-5.1"):
+    return _FakeResponse(
+        output_text=text,
+        usage=_FakeUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+        model=model,
+    )
+
+
+class TestRunChat(unittest.TestCase):
+    """run_chat wraps client.responses.create with error handling and
+    usage translation. The SDK is mocked — no real network calls."""
+
+    def setUp(self):
+        openai_client._reset_client_for_tests()
+
+    def tearDown(self):
+        openai_client._reset_client_for_tests()
+
+    def _make_client_mock(self, create_return_value=None, create_side_effect=None):
+        """Return a patched OpenAI() constructor whose .responses.create is
+        configurable."""
+        fake_client = mock.MagicMock()
+        if create_side_effect is not None:
+            fake_client.responses.create.side_effect = create_side_effect
+        else:
+            fake_client.responses.create.return_value = (
+                create_return_value if create_return_value is not None else _fake_response()
+            )
+        env_patch = mock.patch.dict(os.environ, {"oaiKey": "sk-test"}, clear=True)
+        ctor_patch = mock.patch(
+            "datapipeline.openai_client.OpenAI",
+            return_value=fake_client,
+        )
+        return fake_client, env_patch, ctor_patch
+
+    def test_happy_path_returns_expected_dict_shape(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            create_return_value=_fake_response(text="Hello, student.")
+        )
+        with env_patch, ctor_patch:
+            result = openai_client.run_chat(
+                chat_history=[],
+                user_text="Hi",
+            )
+        self.assertEqual(
+            result,
+            {
+                "response": "Hello, student.",
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                },
+                "model": "gpt-5.1",
+            },
+        )
+
+    def test_default_model_used_when_caller_omits_model(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock()
+        with env_patch, ctor_patch:
+            openai_client.run_chat(chat_history=[], user_text="Hi")
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(kwargs["model"], DEFAULT_MODEL)
+
+    def test_custom_model_passes_through(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock()
+        with env_patch, ctor_patch:
+            openai_client.run_chat(
+                chat_history=[],
+                user_text="Hi",
+                model="gpt-4o",
+            )
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(kwargs["model"], "gpt-4o")
+
+    def test_instructions_omitted_when_no_system_message(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock()
+        with env_patch, ctor_patch:
+            openai_client.run_chat(chat_history=[], user_text="Hi")
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertNotIn("instructions", kwargs)
+
+    def test_instructions_passed_when_system_message_present(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock()
+        with env_patch, ctor_patch:
+            openai_client.run_chat(
+                chat_history=[{"role": "system", "content": "Be terse."}],
+                user_text="Hi",
+            )
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(kwargs["instructions"], "Be terse.")
+
+    def test_input_messages_built_from_history_plus_user_text(self):
+        fake_client, env_patch, ctor_patch = self._make_client_mock()
+        with env_patch, ctor_patch:
+            openai_client.run_chat(
+                chat_history=[
+                    {"role": "user", "content": "earlier q"},
+                    {"role": "assistant", "content": "earlier a"},
+                ],
+                user_text="latest",
+            )
+        _, kwargs = fake_client.responses.create.call_args
+        self.assertEqual(
+            kwargs["input"],
+            [
+                {"role": "user", "content": "earlier q"},
+                {"role": "assistant", "content": "earlier a"},
+                {"role": "user", "content": "latest"},
+            ],
+        )
+
+    def test_rate_limit_error_mapped_to_429(self):
+        rate_limit = openai.RateLimitError(
+            message="slow down",
+            response=mock.MagicMock(status_code=429),
+            body=None,
+        )
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            create_side_effect=rate_limit
+        )
+        with env_patch, ctor_patch:
+            with self.assertRaises(OpenAIClientError) as ctx:
+                openai_client.run_chat(chat_history=[], user_text="Hi")
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertNotIsInstance(ctx.exception, OpenAIConfigError)
+
+    def test_authentication_error_mapped_to_config_error_500(self):
+        auth_err = openai.AuthenticationError(
+            message="bad key",
+            response=mock.MagicMock(status_code=401),
+            body=None,
+        )
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            create_side_effect=auth_err
+        )
+        with env_patch, ctor_patch:
+            with self.assertRaises(OpenAIConfigError) as ctx:
+                openai_client.run_chat(chat_history=[], user_text="Hi")
+        self.assertEqual(ctx.exception.status_code, 500)
+
+    def test_bad_request_error_mapped_to_400(self):
+        bad_req = openai.BadRequestError(
+            message="bad schema",
+            response=mock.MagicMock(status_code=400),
+            body=None,
+        )
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            create_side_effect=bad_req
+        )
+        with env_patch, ctor_patch:
+            with self.assertRaises(OpenAIClientError) as ctx:
+                openai_client.run_chat(chat_history=[], user_text="Hi")
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_timeout_error_mapped_to_504(self):
+        timeout = openai.APITimeoutError(request=mock.MagicMock())
+        fake_client, env_patch, ctor_patch = self._make_client_mock(
+            create_side_effect=timeout
+        )
+        with env_patch, ctor_patch:
+            with self.assertRaises(OpenAIClientError) as ctx:
+                openai_client.run_chat(chat_history=[], user_text="Hi")
+        self.assertEqual(ctx.exception.status_code, 504)

@@ -155,3 +155,73 @@ def _reset_client_for_tests() -> None:
     """Clear the cached client. For unit-test use only."""
     global _client
     _client = None
+
+
+def _call_responses(**kwargs):
+    """Internal: call client.responses.create() with typed error handling.
+
+    Catches every SDK exception we expect and re-raises as a typed
+    OpenAIClientError subclass with a status_code hint the view layer
+    can convert to JsonResponse(status=...)."""
+    try:
+        client = get_client()
+        return client.responses.create(**kwargs)
+    except OpenAIClientError:
+        raise
+    except openai.AuthenticationError as e:
+        raise OpenAIConfigError(f"OpenAI authentication failed: {e}") from e
+    except openai.RateLimitError as e:
+        raise OpenAIClientError(
+            f"OpenAI rate limit: {e}", status_code=429,
+        ) from e
+    except openai.BadRequestError as e:
+        raise OpenAIClientError(
+            f"OpenAI bad request: {e}", status_code=400,
+        ) from e
+    except openai.APITimeoutError as e:
+        raise OpenAIClientError(
+            f"OpenAI timeout: {e}", status_code=504,
+        ) from e
+    except openai.APIConnectionError as e:
+        raise OpenAIClientError(
+            f"OpenAI connection error: {e}", status_code=504,
+        ) from e
+    except openai.APIStatusError as e:
+        raise OpenAIClientError(
+            f"OpenAI API error: {e}",
+            status_code=getattr(e, "status_code", 502),
+        ) from e
+    except Exception as e:
+        raise OpenAIClientError(
+            f"Unexpected OpenAI error: {e}", status_code=500,
+        ) from e
+
+
+def run_chat(
+    chat_history: Optional[list],
+    user_text: str,
+    model: Optional[str] = None,
+) -> dict:
+    """Execute a plain chat turn via the Responses API.
+
+    Returns:
+        {"response": str, "usage": dict, "model": str}
+
+    Raises:
+        OpenAIClientError (and subclasses) on SDK failures."""
+    instructions, input_messages = build_responses_input(chat_history, user_text)
+
+    kwargs: dict[str, Any] = {
+        "model": model or DEFAULT_MODEL,
+        "input": input_messages,
+    }
+    if instructions:
+        kwargs["instructions"] = instructions
+
+    response = _call_responses(**kwargs)
+
+    return {
+        "response": response.output_text,
+        "usage": translate_usage(response.usage),
+        "model": response.model,
+    }
