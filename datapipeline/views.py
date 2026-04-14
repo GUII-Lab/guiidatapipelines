@@ -424,6 +424,36 @@ def update_survey(request):
 
 
 @csrf_exempt
+def delete_survey(request):
+    """Permanently delete a survey and all its student responses.
+
+    Destructive — removes the FeedbackGPT row plus every FeedbackMessage
+    whose gpt_id points at it (FeedbackMessage has no FK, so we clean up
+    manually to avoid orphaned response rows).
+    """
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            survey_id = data.get('survey_id')
+            if not survey_id:
+                return JsonResponse({'error': 'survey_id required'}, status=400)
+            try:
+                gpt = FeedbackGPT.objects.get(id=survey_id)
+            except FeedbackGPT.DoesNotExist:
+                return JsonResponse({'error': 'Survey not found'}, status=404)
+            messages_deleted, _ = FeedbackMessage.objects.filter(gpt_id=gpt.id).delete()
+            gpt.delete()
+            return JsonResponse({
+                'status': 'success',
+                'survey_id': survey_id,
+                'messages_deleted': messages_deleted,
+            })
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return HttpResponse(status=405)
+
+
+@csrf_exempt
 def clone_survey(request):
     """Duplicate a survey, resetting lifecycle and generating a new public_id."""
     if request.method == 'POST':
