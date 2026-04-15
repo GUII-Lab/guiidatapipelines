@@ -13,9 +13,16 @@ Functions are grouped into:
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from django.db import transaction
+
+# Character budget per chunk when the corpus is too large to summarise in a
+# single LLM call. ~40k chars ≈ ~10k tokens — leaves headroom under the
+# Heroku 30s request window when chunks run in parallel.
+QUICKTAKE_CHUNK_CHAR_LIMIT = 40_000
+QUICKTAKE_CHUNK_MAX_WORKERS = 5
 
 from datapipeline import openai_client
 from datapipeline.models import (
@@ -403,21 +410,36 @@ def generate_quicktake(
         scope_label = f"Full course ({course.course_name})"
 
     system_prompt = default_quicktake_system_prompt()
-    user_text = build_quicktake_user_text(
-        course_name=course.course_name,
-        corpus=corpus,
-        scope_label=scope_label,
-    )
+    chunks = _split_corpus_for_quicktake(corpus, QUICKTAKE_CHUNK_CHAR_LIMIT)
 
-    result = openai_client.run_structured(
-        chat_history=[{"role": "system", "content": system_prompt}],
-        user_text=user_text,
-        json_schema=QUICKTAKE_SCHEMA,
-        schema_name="quicktake",
-        temperature=0,
-    )
+    if len(chunks) == 1:
+        user_text = build_quicktake_user_text(
+            course_name=course.course_name,
+            corpus=corpus,
+            scope_label=scope_label,
+        )
+        result = openai_client.run_structured(
+            chat_history=[{"role": "system", "content": system_prompt}],
+            user_text=user_text,
+            json_schema=QUICKTAKE_SCHEMA,
+            schema_name="quicktake",
+            temperature=0,
+        )
+        bullets = result["parsed"].get("bullets", [])
+        model_name = result.get("model", "")
+    else:
+        bullets, model_name = _run_chunked_quicktake(
+            course_name=course.course_name,
+            scope_label=scope_label,
+            system_prompt=system_prompt,
+            chunks=chunks,
+        )
+        # Record a compact representation of the chunked prompt for provenance.
+        user_text = (
+            f"[chunked: {len(chunks)} chunks, {len(corpus)} total responses] "
+            f"Course: {course.course_name} | Scope: {scope_label}"
+        )
 
-    bullets = result["parsed"].get("bullets", [])
     verification = verify_claims(corpus=corpus, bullets=bullets)
 
     quicktake, _ = LEAIQuickTake.objects.update_or_create(
@@ -428,10 +450,122 @@ def generate_quicktake(
             "verification": verification,
             "system_prompt": system_prompt,
             "user_text": user_text,
-            "model_name": result.get("model", ""),
+            "model_name": model_name,
         },
     )
     return quicktake
+
+
+def _split_corpus_for_quicktake(
+    corpus: list[dict],
+    char_limit: int,
+) -> list[list[dict]]:
+    """Greedy-pack the corpus into chunks under `char_limit` characters.
+
+    R-ids stay globally unique across chunks because they were assigned once
+    in build_response_corpus, so citations remain coherent after merging.
+    A single response larger than the limit gets its own chunk.
+    """
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_chars = 0
+    for entry in corpus:
+        entry_chars = len(entry.get("text", "")) + len(entry.get("rid", "")) + 4
+        if current and current_chars + entry_chars > char_limit:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(entry)
+        current_chars += entry_chars
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _run_chunked_quicktake(
+    course_name: str,
+    scope_label: str,
+    system_prompt: str,
+    chunks: list[list[dict]],
+) -> tuple[list[dict], str]:
+    """Map-reduce: summarise each chunk, then merge bullets via a reducer call.
+
+    Chunks run in parallel to stay under Heroku's 30s request window. The
+    reducer is a structured call that dedupes/consolidates bullets while
+    preserving the original global R-id citations.
+    """
+    total_chunks = len(chunks)
+
+    def summarise_chunk(idx_chunk: tuple[int, list[dict]]) -> dict:
+        idx, chunk = idx_chunk
+        chunk_label = f"{scope_label} — part {idx + 1} of {total_chunks}"
+        user_text = build_quicktake_user_text(
+            course_name=course_name,
+            corpus=chunk,
+            scope_label=chunk_label,
+        )
+        return openai_client.run_structured(
+            chat_history=[{"role": "system", "content": system_prompt}],
+            user_text=user_text,
+            json_schema=QUICKTAKE_SCHEMA,
+            schema_name="quicktake",
+            temperature=0,
+        )
+
+    max_workers = min(QUICKTAKE_CHUNK_MAX_WORKERS, total_chunks)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        chunk_results = list(pool.map(summarise_chunk, list(enumerate(chunks))))
+
+    partial_bullets: list[dict] = []
+    for res in chunk_results:
+        partial_bullets.extend(res["parsed"].get("bullets", []))
+    model_name = chunk_results[0].get("model", "") if chunk_results else ""
+
+    if not partial_bullets:
+        return [], model_name
+
+    # Reduce step: ask the model to consolidate overlapping bullets while
+    # preserving R-id citations. If reduction fails, fall back to concatenation.
+    reducer_system = (
+        "You are merging bullet-point summaries produced from different chunks "
+        "of the same student-feedback corpus into a single concise set of "
+        "bullets. Preserve the exact [R<n>] citation IDs from the input — do "
+        "not invent new ones. Merge overlapping themes, drop duplicates, and "
+        "keep the bullets objective and specific."
+    )
+    lines = [
+        f"Course: {course_name}",
+        f"Scope: {scope_label}",
+        f"Total chunks: {total_chunks}",
+        "",
+        "--- Partial bullets ---",
+    ]
+    for b in partial_bullets:
+        cited = "".join(f"[{rid}]" for rid in b.get("cited_ids", []))
+        lines.append(f"- {b.get('text', '')} {cited}".rstrip())
+    lines.append("")
+    lines.append(
+        "Produce a merged set of bullets. Each bullet must cite the supporting "
+        "response IDs inline using [R<n>] notation drawn only from the IDs above."
+    )
+    reducer_user = "\n".join(lines)
+
+    try:
+        reduced = openai_client.run_structured(
+            chat_history=[{"role": "system", "content": reducer_system}],
+            user_text=reducer_user,
+            json_schema=QUICKTAKE_SCHEMA,
+            schema_name="quicktake",
+            temperature=0,
+        )
+        bullets = reduced["parsed"].get("bullets", [])
+        model_name = reduced.get("model", model_name)
+        if bullets:
+            return bullets, model_name
+    except Exception:
+        pass
+
+    return partial_bullets, model_name
 
 
 # ---------------------------------------------------------------------------
