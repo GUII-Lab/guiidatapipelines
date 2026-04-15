@@ -11,6 +11,7 @@ urlpatterns = [
     path('api/getOAI/', getOAI, name='getOAI'),
     path('api/list_feedback_gpts/', list_feedback_gpts, name='list_feedback_gpts'),
     path('api/feedback_message_api/', feedback_message_api, name='feedback_message_api'),
+    path('api/feedback_messages_bulk_api/', feedback_messages_bulk_api, name='feedback_messages_bulk_api'),
     path('api/feedbackList/', feedbackList, name='feedbackList'),
     path('api/scList/', scList, name='scList'),
     path('api/messages/', get_messages_by_gpt, name='get_messages_by_gpt'),

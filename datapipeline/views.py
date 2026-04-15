@@ -16,6 +16,7 @@ from datetime import timedelta
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from django.conf import settings
+from django.db import transaction
 import requests
 
 
@@ -79,6 +80,59 @@ def feedback_message_api(request):
             return JsonResponse({'status': 'success', 'message': 'Feedback message saved successfully'})
         except Exception as e:
             return JsonResponse({'status': 'error', 'message': str(e)})
+
+
+@csrf_exempt
+def feedback_messages_bulk_api(request):
+    """Atomically save a batch of feedback messages.
+
+    Request body: {"messages": [ { session_id, student_id, sent_by, content,
+    gpt_used, gpt_id, research_consent }, ... ]}
+    Response: {"status": "success", "saved": N} or
+             {"status": "error", "message": "...", "index": i}
+    """
+    if request.method != 'POST':
+        return HttpResponse(status=405, content='Method not allowed')
+    try:
+        data = json.loads(request.body)
+    except ValueError as e:
+        return JsonResponse({'status': 'error', 'message': 'Invalid JSON: ' + str(e)}, status=400)
+
+    messages = data.get('messages')
+    if not isinstance(messages, list):
+        return JsonResponse({'status': 'error', 'message': 'messages must be a list'}, status=400)
+    if not messages:
+        return JsonResponse({'status': 'error', 'message': 'messages list is empty'}, status=400)
+
+    required = ('session_id', 'student_id', 'sent_by', 'content')
+    objs = []
+    for idx, m in enumerate(messages):
+        if not isinstance(m, dict):
+            return JsonResponse({'status': 'error', 'message': 'message must be an object', 'index': idx}, status=400)
+        missing = [k for k in required if not m.get(k)]
+        if missing:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'missing fields: ' + ', '.join(missing),
+                'index': idx,
+            }, status=400)
+        objs.append(FeedbackMessage(
+            session_id=m.get('session_id'),
+            student_id=m.get('student_id'),
+            sent_by=m.get('sent_by'),
+            content=m.get('content'),
+            gpt_used=m.get('gpt_used') or '',
+            gpt_id=m.get('gpt_id'),
+            research_consent=bool(m.get('research_consent', False)),
+        ))
+
+    try:
+        with transaction.atomic():
+            FeedbackMessage.objects.bulk_create(objs)
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+    return JsonResponse({'status': 'success', 'saved': len(objs)})
 
 
 @csrf_exempt  # For simplicity, but handle CSRF properly in production
