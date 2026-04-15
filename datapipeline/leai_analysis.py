@@ -382,7 +382,8 @@ def generate_quicktake(
     """Generate (or regenerate) a Quick Take for a course scope.
 
     Raises:
-        ValueError: if fewer than 20 student responses exist in scope.
+        ValueError: if fewer than 5 student responses exist in scope.
+            (20+ is the recommended threshold for reliable themes.)
 
     Returns:
         LEAIQuickTake instance (upserted via update_or_create).
@@ -395,9 +396,10 @@ def generate_quicktake(
         scope_session_ids=scope_session_ids,
     )
 
-    if len(corpus) < 20:
+    if len(corpus) < 5:
         raise ValueError(
-            f"Insufficient data: need at least 20 responses, "
+            f"Insufficient data: need at least 5 responses "
+            f"(20+ recommended for reliable themes), "
             f"found {len(corpus)} for scope '{scope_key}'."
         )
 
