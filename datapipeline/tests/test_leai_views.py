@@ -318,8 +318,9 @@ class QuickTakeTest(TestCase):
         resp = self.client.get(self.fetch_url, {"course_id": self.course.course_id})
         self.assertEqual(resp.status_code, 400)
 
-    def test_generate_calls_leai_analysis(self):
-        # Create survey + messages so corpus has >= 20 entries
+    def test_generate_enqueues_job_and_returns_202(self):
+        # Generate is async: POST enqueues a worker thread and returns 202
+        # with the initial pending row. Clients poll GET for completion.
         survey = _make_survey(self.course, week_number=1)
         for i in range(20):
             _make_msg(survey, session_id=f"gen-{i}", content=f"Response {i}")
@@ -329,28 +330,34 @@ class QuickTakeTest(TestCase):
         mock_qt = LEAIQuickTake(
             course=self.course,
             scope_key="course:all",
-            bullets=[{"text": "Theme A.", "cited_ids": ["R1"]}],
+            bullets=[],
             verification=[],
-            system_prompt="sys",
-            user_text="user",
-            model_name="gpt-4o",
+            system_prompt="",
+            user_text="",
+            model_name="",
+            status=LEAIQuickTake.STATUS_PENDING,
+            error="",
+            job_started_at=now,
         )
         mock_qt.pk = 999
         mock_qt.created_at = now
         mock_qt.updated_at = now
 
         from datapipeline import leai_analysis
-        with patch.object(leai_analysis, "generate_quicktake", return_value=mock_qt) as m_gen:
+        with patch.object(
+            leai_analysis, "start_quicktake_job", return_value=(mock_qt, True)
+        ) as m_start:
             resp = _post(self.client, self.generate_url, {
                 "course_id": self.course.course_id,
                 "scope_key": "course:all",
                 "scope": {"kind": "course"},
             })
 
-        self.assertEqual(resp.status_code, 200)
-        m_gen.assert_called_once()
+        self.assertEqual(resp.status_code, 202)
+        m_start.assert_called_once()
         data = resp.json()
         self.assertEqual(data["scope_key"], "course:all")
+        self.assertEqual(data["status"], LEAIQuickTake.STATUS_PENDING)
 
     def test_generate_missing_params_returns_400(self):
         resp = _post(self.client, self.generate_url, {"course_id": self.course.course_id})

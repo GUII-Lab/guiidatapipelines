@@ -914,6 +914,9 @@ def _quicktake_to_dict(qt):
         'system_prompt': qt.system_prompt,
         'user_text': qt.user_text,
         'model_name': qt.model_name,
+        'status': qt.status,
+        'error': qt.error,
+        'job_started_at': qt.job_started_at.isoformat() if qt.job_started_at else None,
         'created_at': qt.created_at.isoformat(),
         'updated_at': qt.updated_at.isoformat(),
     }
@@ -1124,6 +1127,15 @@ def leai_quicktake_fetch_or_delete(request):
         return JsonResponse({'error': 'QuickTake not found'}, status=404)
 
     if request.method == 'GET':
+        from . import leai_analysis
+        # Recover from dyno-cycle zombies: a row stuck in pending/running
+        # past the stale window is reported as failed so the UI can retry.
+        if leai_analysis._is_job_stale(qt):
+            LEAIQuickTake.objects.filter(pk=qt.pk).update(
+                status=LEAIQuickTake.STATUS_FAILED,
+                error='Generation did not complete in time. Please retry.',
+            )
+            qt.refresh_from_db()
         return JsonResponse(_quicktake_to_dict(qt))
 
     if request.method == 'DELETE':
@@ -1139,7 +1151,12 @@ def leai_quicktake_fetch_or_delete(request):
 
 @csrf_exempt
 def leai_quicktake_generate(request):
-    """POST /api/leai_quicktake/generate/"""
+    """POST /api/leai_quicktake/generate/
+
+    Enqueues a quicktake job in a background thread and returns 202 with
+    the current row (status=pending or running). Clients poll GET
+    /api/leai_quicktake/ until status is ready or failed.
+    """
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
@@ -1164,7 +1181,7 @@ def leai_quicktake_generate(request):
 
     from . import leai_analysis
     try:
-        qt = leai_analysis.generate_quicktake(
+        qt, _started = leai_analysis.start_quicktake_job(
             course=course,
             scope_key=scope_key,
             scope_kind=scope.get('kind', 'course'),
@@ -1174,10 +1191,6 @@ def leai_quicktake_generate(request):
         )
     except ValueError as e:
         return JsonResponse({'error': str(e)}, status=400)
-    except openai_client.OpenAIRefusalError as e:
-        return JsonResponse({'error': e.detail}, status=422)
-    except openai_client.OpenAIClientError as e:
-        return JsonResponse({'error': e.detail}, status=e.status_code)
 
-    return JsonResponse(_quicktake_to_dict(qt))
+    return JsonResponse(_quicktake_to_dict(qt), status=202)
 

@@ -12,17 +12,32 @@ Functions are grouped into:
 """
 from __future__ import annotations
 
+import logging
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from django.db import transaction
+from django.db import connection, transaction
+from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 # Character budget per chunk when the corpus is too large to summarise in a
-# single LLM call. ~40k chars ≈ ~10k tokens — leaves headroom under the
-# Heroku 30s request window when chunks run in parallel.
+# single LLM call. ~40k chars ≈ ~10k tokens.
 QUICKTAKE_CHUNK_CHAR_LIMIT = 40_000
 QUICKTAKE_CHUNK_MAX_WORKERS = 5
+
+# Latency-optimised model for Quick Take calls. The quicktake path runs
+# summariser + reducer + verifier — a reasoning model (gpt-5.1) blows the
+# Heroku 30s budget even for modest corpora, and the Quick Take job is now
+# async anyway, so we trade reasoning depth for throughput.
+QUICKTAKE_MODEL = "gpt-4.1-mini"
+
+# If a quicktake row stays in pending/running past this many seconds past
+# job_started_at, the web tier treats it as a zombie (dyno cycled mid-job)
+# and lets a fresh generate call replace it.
+QUICKTAKE_JOB_STALE_SECONDS = 600
 
 from datapipeline import openai_client
 from datapipeline.models import (
@@ -312,6 +327,7 @@ def parse_inline_citations(text: str) -> tuple[str, list[str]]:
 def verify_claims(
     corpus: list[dict],
     bullets: list[dict],
+    model: Optional[str] = None,
 ) -> list[dict]:
     """Verify that bullet citations are supported by the corpus.
 
@@ -359,6 +375,7 @@ def verify_claims(
             user_text=user_text,
             json_schema=VERIFIER_SCHEMA,
             schema_name="verification_result",
+            model=model,
             temperature=0,
         )
         return result["parsed"].get("results", [])
@@ -425,6 +442,7 @@ def generate_quicktake(
             user_text=user_text,
             json_schema=QUICKTAKE_SCHEMA,
             schema_name="quicktake",
+            model=QUICKTAKE_MODEL,
             temperature=0,
         )
         bullets = result["parsed"].get("bullets", [])
@@ -442,7 +460,7 @@ def generate_quicktake(
             f"Course: {course.course_name} | Scope: {scope_label}"
         )
 
-    verification = verify_claims(corpus=corpus, bullets=bullets)
+    verification = verify_claims(corpus=corpus, bullets=bullets, model=QUICKTAKE_MODEL)
 
     quicktake, _ = LEAIQuickTake.objects.update_or_create(
         course=course,
@@ -453,9 +471,137 @@ def generate_quicktake(
             "system_prompt": system_prompt,
             "user_text": user_text,
             "model_name": model_name,
+            "status": LEAIQuickTake.STATUS_READY,
+            "error": "",
+            "job_started_at": None,
         },
     )
     return quicktake
+
+
+def _is_job_stale(qt: LEAIQuickTake) -> bool:
+    """True if a pending/running row has outlived the stale threshold.
+
+    Used to recover from dyno cycles mid-job: the status sits at running
+    forever, so on the next generate call we treat it as failed and allow
+    a fresh thread to take over.
+    """
+    if qt.status not in (LEAIQuickTake.STATUS_PENDING, LEAIQuickTake.STATUS_RUNNING):
+        return False
+    started = qt.job_started_at or qt.updated_at
+    if started is None:
+        return True
+    return (timezone.now() - started).total_seconds() > QUICKTAKE_JOB_STALE_SECONDS
+
+
+def start_quicktake_job(
+    course: Course,
+    scope_key: str,
+    scope_kind: str,
+    scope_week_number: Optional[int] = None,
+    scope_survey_ids: Optional[list] = None,
+    scope_session_ids: Optional[list] = None,
+) -> tuple[LEAIQuickTake, bool]:
+    """Mark the row pending and spawn a daemon thread to run generate_quicktake.
+
+    Returns (quicktake, started) where `started` is True if this call kicked
+    off a new worker, False if a fresh pending/running job is already in
+    flight for the scope (idempotent re-click).
+
+    Raises ValueError if corpus-level preconditions fail (< 5 responses).
+    Those errors are surfaced synchronously so the caller can return 400.
+    """
+    corpus = build_response_corpus(
+        course=course,
+        scope_kind=scope_kind,
+        scope_week_number=scope_week_number,
+        scope_survey_ids=scope_survey_ids,
+        scope_session_ids=scope_session_ids,
+    )
+    if len(corpus) < 5:
+        raise ValueError(
+            f"Insufficient data: need at least 5 responses "
+            f"(20+ recommended for reliable themes), "
+            f"found {len(corpus)} for scope '{scope_key}'."
+        )
+
+    now = timezone.now()
+    with transaction.atomic():
+        qt, created = LEAIQuickTake.objects.select_for_update().get_or_create(
+            course=course,
+            scope_key=scope_key,
+            defaults={
+                "bullets": [],
+                "verification": [],
+                "system_prompt": "",
+                "user_text": "",
+                "model_name": "",
+                "status": LEAIQuickTake.STATUS_PENDING,
+                "error": "",
+                "job_started_at": now,
+            },
+        )
+        if not created:
+            # Idempotency: if a job is already in flight and not stale,
+            # don't double-start. Frontend will poll the existing one.
+            if qt.status in (
+                LEAIQuickTake.STATUS_PENDING, LEAIQuickTake.STATUS_RUNNING,
+            ) and not _is_job_stale(qt):
+                return qt, False
+            qt.status = LEAIQuickTake.STATUS_PENDING
+            qt.error = ""
+            qt.job_started_at = now
+            qt.save(update_fields=["status", "error", "job_started_at", "updated_at"])
+
+    def _worker(qt_pk: int, course_pk: int) -> None:
+        # Each thread gets its own Django DB connection; close at end
+        # to avoid leaking connections across worker lifetimes.
+        try:
+            course_obj = Course.objects.get(pk=course_pk)
+            LEAIQuickTake.objects.filter(pk=qt_pk).update(
+                status=LEAIQuickTake.STATUS_RUNNING,
+                updated_at=timezone.now(),
+            )
+            generate_quicktake(
+                course=course_obj,
+                scope_key=scope_key,
+                scope_kind=scope_kind,
+                scope_week_number=scope_week_number,
+                scope_survey_ids=scope_survey_ids,
+                scope_session_ids=scope_session_ids,
+            )
+        except ValueError as e:
+            LEAIQuickTake.objects.filter(pk=qt_pk).update(
+                status=LEAIQuickTake.STATUS_FAILED,
+                error=str(e),
+            )
+        except openai_client.OpenAIRefusalError as e:
+            LEAIQuickTake.objects.filter(pk=qt_pk).update(
+                status=LEAIQuickTake.STATUS_FAILED,
+                error=getattr(e, "detail", str(e)),
+            )
+        except openai_client.OpenAIClientError as e:
+            LEAIQuickTake.objects.filter(pk=qt_pk).update(
+                status=LEAIQuickTake.STATUS_FAILED,
+                error=getattr(e, "detail", str(e)),
+            )
+        except Exception as e:
+            logger.exception("quicktake worker crashed for qt=%s", qt_pk)
+            LEAIQuickTake.objects.filter(pk=qt_pk).update(
+                status=LEAIQuickTake.STATUS_FAILED,
+                error=f"Internal error: {type(e).__name__}",
+            )
+        finally:
+            connection.close()
+
+    thread = threading.Thread(
+        target=_worker,
+        args=(qt.pk, course.pk),
+        name=f"quicktake-{qt.pk}",
+        daemon=True,
+    )
+    thread.start()
+    return qt, True
 
 
 def _split_corpus_for_quicktake(
@@ -511,6 +657,7 @@ def _run_chunked_quicktake(
             user_text=user_text,
             json_schema=QUICKTAKE_SCHEMA,
             schema_name="quicktake",
+            model=QUICKTAKE_MODEL,
             temperature=0,
         )
 
@@ -558,6 +705,7 @@ def _run_chunked_quicktake(
             user_text=reducer_user,
             json_schema=QUICKTAKE_SCHEMA,
             schema_name="quicktake",
+            model=QUICKTAKE_MODEL,
             temperature=0,
         )
         bullets = reduced["parsed"].get("bullets", [])
