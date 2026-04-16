@@ -992,6 +992,23 @@ def leai_chat_sessions_list(request):
                 cited=[],
             )
 
+        # Optional: seed a visible assistant message (e.g. a Quick Take handoff)
+        # with its own citation array. Must be a dict with `text` and
+        # `cited` (list of {rid, pill_index, verdict?}).
+        seed_assistant = data.get('seed_assistant_message')
+        if seed_assistant and isinstance(seed_assistant, dict):
+            text = seed_assistant.get('text') or ''
+            cited = seed_assistant.get('cited') or []
+            if not isinstance(cited, list):
+                cited = []
+            if text:
+                LEAIChatMessage.objects.create(
+                    session=session,
+                    role='assistant',
+                    text=text,
+                    cited=cited,
+                )
+
         return _session_detail_response(session, status=201)
 
     return JsonResponse({'error': 'Method not allowed'}, status=405)

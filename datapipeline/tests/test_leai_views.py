@@ -122,6 +122,39 @@ class ChatSessionsListTest(TestCase):
         self.assertEqual(data["messages"][0]["role"], "system")
         self.assertEqual(data["messages"][0]["text"], "You are a custom assistant.")
 
+    def test_create_session_with_seed_assistant_message(self):
+        payload = {
+            "course_id": self.course.course_id,
+            "scope": {"kind": "course"},
+            "seed_assistant_message": {
+                "text": "- Students liked the group work [1][2]",
+                "cited": [
+                    {"rid": "R1", "pill_index": 1, "verdict": "verified"},
+                    {"rid": "R3", "pill_index": 2, "verdict": None},
+                ],
+            },
+        }
+        resp = _post(self.client, self.list_url, payload)
+        self.assertEqual(resp.status_code, 201)
+        data = resp.json()
+        self.assertEqual(len(data["messages"]), 1)
+        msg = data["messages"][0]
+        self.assertEqual(msg["role"], "assistant")
+        self.assertIn("[1][2]", msg["text"])
+        self.assertEqual(len(msg["cited"]), 2)
+        self.assertEqual(msg["cited"][0]["rid"], "R1")
+        self.assertEqual(msg["cited"][1]["pill_index"], 2)
+
+    def test_create_session_ignores_empty_seed_assistant(self):
+        payload = {
+            "course_id": self.course.course_id,
+            "scope": {"kind": "course"},
+            "seed_assistant_message": {"text": "", "cited": []},
+        }
+        resp = _post(self.client, self.list_url, payload)
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(len(resp.json()["messages"]), 0)
+
     def test_create_session_missing_course_id(self):
         resp = _post(self.client, self.list_url, {"scope": {"kind": "course"}})
         self.assertEqual(resp.status_code, 400)
