@@ -17,6 +17,12 @@ from openai import OpenAI
 
 
 DEFAULT_MODEL: str = os.environ.get("OPENAI_DEFAULT_MODEL", "gpt-5.1")
+DEFAULT_TTS_MODEL: str = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
+DEFAULT_TTS_VOICE: str = os.environ.get("OPENAI_TTS_VOICE", "nova")
+DEFAULT_STT_MODEL: str = os.environ.get("OPENAI_STT_MODEL", "whisper-1")
+
+ALLOWED_TTS_VOICES = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
+ALLOWED_TTS_FORMATS = {"mp3", "opus", "aac", "flac", "wav", "pcm"}
 
 
 class OpenAIClientError(Exception):
@@ -290,3 +296,187 @@ def run_structured(
         "usage": translate_usage(response.usage),
         "model": response.model,
     }
+
+
+# ---------------------------------------------------------------------------
+# Audio: TTS (speech synthesis) + STT (transcription)
+# ---------------------------------------------------------------------------
+
+def _call_audio(method, **kwargs):
+    """Internal: call client.audio.<method>.create() with typed errors."""
+    try:
+        client = get_client()
+        if method == "speech":
+            return client.audio.speech.create(**kwargs)
+        if method == "transcriptions":
+            return client.audio.transcriptions.create(**kwargs)
+        raise OpenAIClientError(f"Unknown audio method: {method}")
+    except OpenAIClientError:
+        raise
+    except openai.AuthenticationError as e:
+        raise OpenAIConfigError(f"OpenAI authentication failed: {e}") from e
+    except openai.RateLimitError as e:
+        raise OpenAIClientError(
+            f"OpenAI rate limit: {e}", status_code=429,
+        ) from e
+    except openai.BadRequestError as e:
+        raise OpenAIClientError(
+            f"OpenAI bad request: {e}", status_code=400,
+        ) from e
+    except openai.APITimeoutError as e:
+        raise OpenAIClientError(
+            f"OpenAI timeout: {e}", status_code=504,
+        ) from e
+    except openai.APIConnectionError as e:
+        raise OpenAIClientError(
+            f"OpenAI connection error: {e}", status_code=504,
+        ) from e
+    except openai.APIStatusError as e:
+        raise OpenAIClientError(
+            f"OpenAI API error: {e}",
+            status_code=getattr(e, "status_code", 502),
+        ) from e
+    except Exception as e:
+        raise OpenAIClientError(
+            f"Unexpected OpenAI audio error: {e}", status_code=500,
+        ) from e
+
+
+def synthesize_speech(
+    text: str,
+    voice: Optional[str] = None,
+    model: Optional[str] = None,
+    response_format: str = "mp3",
+) -> bytes:
+    """Synthesize speech audio from text via OpenAI TTS.
+
+    Returns the raw audio bytes. Caller is responsible for returning them
+    with the right `Content-Type` header (e.g. `audio/mpeg` for mp3).
+
+    Raises OpenAIClientError on validation or SDK failure."""
+    if not text or not text.strip():
+        raise OpenAIClientError("text is required", status_code=400)
+    if len(text) > 4096:
+        raise OpenAIClientError(
+            "text exceeds OpenAI 4096-char limit", status_code=400,
+        )
+
+    voice = (voice or DEFAULT_TTS_VOICE).lower()
+    if voice not in ALLOWED_TTS_VOICES:
+        raise OpenAIClientError(
+            f"unsupported voice: {voice}", status_code=400,
+        )
+
+    response_format = (response_format or "mp3").lower()
+    if response_format not in ALLOWED_TTS_FORMATS:
+        raise OpenAIClientError(
+            f"unsupported response_format: {response_format}", status_code=400,
+        )
+
+    response = _call_audio(
+        "speech",
+        model=model or DEFAULT_TTS_MODEL,
+        voice=voice,
+        input=text,
+        response_format=response_format,
+    )
+    # SDK returns a streamable HttpxBinaryResponseContent; .read() yields bytes.
+    return response.read()
+
+
+_AUDIO_EXT_MIME = {
+    "webm": "audio/webm",
+    "ogg": "audio/ogg",
+    "mp3": "audio/mpeg",
+    "mpga": "audio/mpeg",
+    "mpeg": "audio/mpeg",
+    "wav": "audio/wav",
+    "m4a": "audio/mp4",
+    "mp4": "audio/mp4",
+}
+
+
+def _normalize_audio_filename_and_mime(
+    filename: str, content_type: Optional[str],
+) -> tuple[str, str]:
+    """Pick a clean (filename, content_type) pair OpenAI will accept.
+
+    OpenAI rejects mime strings with codec parameters (e.g.
+    `audio/webm;codecs=opus`) and infers format from the file extension.
+    This helper strips codec params and normalises the extension so
+    Whisper / gpt-4o-transcribe can decode the upload."""
+    name = (filename or "").strip() or "audio.webm"
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if not ct or ct == "application/octet-stream":
+        ct = _AUDIO_EXT_MIME.get(ext, "audio/webm")
+
+    # Make sure the extension matches the (now codec-free) mime type so
+    # OpenAI's server-side sniffer doesn't reject the upload.
+    if ct not in _AUDIO_EXT_MIME.values():
+        ct = "audio/webm"
+    if ext not in _AUDIO_EXT_MIME or _AUDIO_EXT_MIME[ext] != ct:
+        for candidate_ext, candidate_ct in _AUDIO_EXT_MIME.items():
+            if candidate_ct == ct:
+                name = f"audio.{candidate_ext}"
+                break
+
+    return name, ct
+
+
+def transcribe_audio(
+    file_obj,
+    filename: str,
+    model: Optional[str] = None,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
+    content_type: Optional[str] = None,
+) -> dict:
+    """Transcribe an audio file via OpenAI STT (Whisper).
+
+    Args:
+        file_obj: a file-like object with .read() (e.g. Django UploadedFile).
+        filename: original filename — extension matters for whisper-1.
+        model: optional override; defaults to DEFAULT_STT_MODEL.
+        language: optional ISO-639-1 hint to improve accuracy.
+        prompt: optional context prompt to bias terminology.
+        content_type: optional MIME hint (codec params are stripped).
+
+    Returns: {"text": str, "model": str}.
+    Raises OpenAIClientError on validation or SDK failure."""
+    if file_obj is None:
+        raise OpenAIClientError("audio file is required", status_code=400)
+
+    data = file_obj.read()
+    if not data:
+        raise OpenAIClientError("audio file is empty", status_code=400)
+    # Whisper rejects very short clips with the same opaque "could not be
+    # decoded" error — surface a clearer message to the caller.
+    if len(data) < 1024:
+        raise OpenAIClientError(
+            "audio is too short to transcribe — please record for at least 1 second",
+            status_code=400,
+        )
+    # OpenAI cap: 25 MB.
+    if len(data) > 25 * 1024 * 1024:
+        raise OpenAIClientError(
+            "audio file exceeds 25MB limit", status_code=413,
+        )
+
+    clean_name, clean_mime = _normalize_audio_filename_and_mime(
+        filename, content_type,
+    )
+
+    kwargs: dict[str, Any] = {
+        "model": model or DEFAULT_STT_MODEL,
+        "file": (clean_name, data, clean_mime),
+    }
+    if language:
+        kwargs["language"] = language
+    if prompt:
+        kwargs["prompt"] = prompt
+
+    response = _call_audio("transcriptions", **kwargs)
+    text = getattr(response, "text", None) or ""
+    return {"text": text, "model": model or DEFAULT_STT_MODEL}

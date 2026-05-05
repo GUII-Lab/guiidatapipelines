@@ -61,6 +61,12 @@ class FeedbackGPT(models.Model):
         ('identified', 'Identified'),
     ]
 
+    MODE_CHOICES = [
+        ('general', 'General course feedback'),
+        ('group', 'In-group team feedback'),
+        ('form', 'Form-mapped structured reflection'),
+    ]
+
     id = models.AutoField(primary_key=True)
     public_id = models.CharField(max_length=16, unique=True, blank=True, default='')
     name = models.CharField(max_length=100)
@@ -82,8 +88,145 @@ class FeedbackGPT(models.Model):
     reporting_structure = models.CharField(max_length=100, blank=True, default='')
     canvas_integration = models.BooleanField(default=False)
 
+    # In-Group feedback mode. Existing surveys remain 'general' by default.
+    mode = models.CharField(max_length=16, choices=MODE_CHOICES, default='general')
+
+    # When mode='form', binds the survey to a FormSchema row. The schema body
+    # (sections, prompts, probes) is loaded by feedback.html on session start.
+    # Null for general/group surveys.
+    form_schema = models.ForeignKey(
+        'FormSchema', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='surveys',
+    )
+
     def __str__(self):
         return self.name
+
+
+class FormSchema(models.Model):
+    """A structured-reflection schema (sections, prompts, probes, fields).
+
+    Stored in DB so instructors / staff can revise without a redeploy. Surveys
+    in mode='form' bind to one schema via FeedbackGPT.form_schema. The body is
+    free-form JSON consumed by leai-formmode.js + leaiInsights.
+    """
+    schema_id = models.CharField(max_length=64, unique=True)
+    version = models.CharField(max_length=16, default='1.0.0')
+    title = models.CharField(max_length=200, default='')
+    course_label = models.CharField(max_length=100, blank=True, default='')
+    week_number = models.IntegerField(null=True, blank=True)
+    body = models.JSONField()
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['course_label', 'week_number', 'schema_id']
+
+    def __str__(self):
+        return f'{self.schema_id} ({self.title})'
+
+
+# ================= In-Group feedback models =================
+# Team configurations are per-course groupings of teams (e.g. "Lab Teams" for
+# weeks 1-4, "Final Project Teams" for weeks 5-10). A survey in group mode
+# snapshots one configuration at creation time so later edits to the source
+# configuration don't retroactively change past surveys.
+
+COLOR_CHOICES = [
+    ('forest', 'forest'), ('plum', 'plum'), ('amber', 'amber'),
+    ('teal', 'teal'), ('rose', 'rose'), ('indigo', 'indigo'),
+    ('brown', 'brown'), ('slate', 'slate'),
+]
+
+
+class TeamConfiguration(models.Model):
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='team_configurations')
+    name = models.CharField(max_length=100)
+    label_prefix = models.CharField(max_length=50, default='Team')
+    color = models.CharField(max_length=16, choices=COLOR_CHOICES, default='forest')
+    archived = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('course', 'name')]
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f'{self.name} ({self.course.course_id})'
+
+
+class Team(models.Model):
+    team_configuration = models.ForeignKey(
+        TeamConfiguration, on_delete=models.CASCADE, related_name='teams',
+    )
+    number = models.IntegerField()
+    size = models.IntegerField()
+
+    class Meta:
+        unique_together = [('team_configuration', 'number')]
+        ordering = ['number']
+
+    def __str__(self):
+        return f'{self.team_configuration.label_prefix} {self.number} (size {self.size})'
+
+
+class SurveyTeamSnapshot(models.Model):
+    """Frozen team structure captured at survey creation.
+
+    Editing the source TeamConfiguration after this exists must not alter the
+    snapshot's teams, label_prefix, color, or name. Cascaded deletes from
+    FeedbackGPT remove the snapshot and its SurveyTeam rows; assignments are
+    cleared via their FK cascade from SurveyTeam.
+    """
+
+    survey = models.OneToOneField(
+        FeedbackGPT, on_delete=models.CASCADE, related_name='team_snapshot',
+    )
+    source_configuration = models.ForeignKey(
+        TeamConfiguration, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='snapshots',
+    )
+    name = models.CharField(max_length=100)
+    label_prefix = models.CharField(max_length=50, default='Team')
+    color = models.CharField(max_length=16, choices=COLOR_CHOICES, default='forest')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f'Snapshot of {self.name} for survey {self.survey_id}'
+
+
+class SurveyTeam(models.Model):
+    snapshot = models.ForeignKey(
+        SurveyTeamSnapshot, on_delete=models.CASCADE, related_name='teams',
+    )
+    number = models.IntegerField()
+    size = models.IntegerField()
+
+    class Meta:
+        unique_together = [('snapshot', 'number')]
+        ordering = ['number']
+
+    def __str__(self):
+        return f'{self.snapshot.label_prefix} {self.number} (size {self.size})'
+
+
+class SessionTeamAssignment(models.Model):
+    """Records which team a student self-identified as when they opened an
+    in-group survey. session_id is the anonymous session identifier already
+    used by FeedbackMessage (plain CharField, no FK) — we intentionally do
+    NOT reference student identity.
+    """
+
+    session_id = models.CharField(max_length=100, unique=True)
+    survey_team = models.ForeignKey(
+        SurveyTeam, on_delete=models.CASCADE, related_name='assignments',
+    )
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f'session {self.session_id[:8]}… -> team {self.survey_team.number}'
 
 
 class CustomGPT(models.Model):

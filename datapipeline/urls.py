@@ -21,12 +21,17 @@ urlpatterns = [
     path('api/images/', list_images, name='list_images'),
     path('api/openai-chat/', openai_chat, name='openai_chat'),
     path('api/openai-structured/', openai_structured, name='openai_structured'),
+    path('api/openai-tts/', openai_tts, name='openai_tts'),
+    path('api/openai-stt/', openai_stt, name='openai_stt'),
     # LEAI course management
     path('api/create_course/', create_course, name='create_course'),
     path('api/verify_course_password/', verify_course_password, name='verify_course_password'),
     path('api/create_feedback_gpt/', create_feedback_gpt, name='create_feedback_gpt'),
     path('api/feedback_gpts_by_course/', feedback_gpts_by_course, name='feedback_gpts_by_course'),
     path('api/get_feedback_gpt_by_public_id/', get_feedback_gpt_by_public_id, name='get_feedback_gpt_by_public_id'),
+    # Form-mode schema registry (read-only for now; edits via Django admin)
+    path('api/form_schemas/', list_form_schemas, name='list_form_schemas'),
+    path('api/form_schemas/<str:schema_id>/', get_form_schema, name='get_form_schema'),
     path('api/feedback_messages_by_gpt/', feedback_messages_by_gpt, name='feedback_messages_by_gpt'),
     path('api/feedback_messages_by_course/', feedback_messages_by_course, name='feedback_messages_by_course'),
     # LEAI survey lifecycle & management
@@ -41,4 +46,13 @@ urlpatterns = [
     path('api/leai_chat_sessions/<uuid:session_id>/turn/', views.leai_chat_session_turn, name='leai_chat_session_turn'),
     path('api/leai_quicktake/generate/', views.leai_quicktake_generate, name='leai_quicktake_generate'),
     path('api/leai_quicktake/', views.leai_quicktake_fetch_or_delete, name='leai_quicktake'),
+    # In-Group feedback: team configurations + survey snapshots + session assignments
+    path('api/team_configurations/', list_team_configurations, name='list_team_configurations'),
+    path('api/team_configurations/create/', create_team_configuration, name='create_team_configuration'),
+    path('api/team_configurations/update/', update_team_configuration, name='update_team_configuration'),
+    path('api/team_configurations/archive/', archive_team_configuration, name='archive_team_configuration'),
+    path('api/team_configurations/delete/', delete_team_configuration, name='delete_team_configuration'),
+    path('api/survey_team_snapshot/', get_survey_team_snapshot, name='get_survey_team_snapshot'),
+    path('api/session_team_assignment/', assign_session_to_team, name='assign_session_to_team'),
+    path('api/survey_team_assignments/', list_survey_team_assignments, name='list_survey_team_assignments'),
 ]

@@ -244,28 +244,89 @@ def create_feedback_gpt(request):
             raw_opens = data.get('opens_at')
             opens_at = parse_datetime(raw_opens) if raw_opens else None
 
-            gpt = FeedbackGPT.objects.create(
-                name=data.get('name', ''),
-                instructions=data.get('instructions', ''),
-                created_by=data.get('instructor_name', ''),
-                course=course,
-                week_number=data.get('week_number'),
-                survey_label=data.get('survey_label', ''),
-                public_id=_generate_public_id(),
-                expires_at=expires_at,
-                opens_at=opens_at,
-                is_closed=False,
-                anonymity_mode=data.get('anonymity_mode', 'anonymous'),
-                reporting_structure=data.get('reporting_structure', ''),
-                canvas_integration=data.get('canvas_integration', False),
-            )
-            return JsonResponse({
+            mode = data.get('mode', 'general')
+            if mode not in ('general', 'group', 'form'):
+                return JsonResponse({'error': "mode must be 'general', 'group', or 'form'"}, status=400)
+            team_configuration_id = data.get('team_configuration_id')
+            form_schema_id = (data.get('form_schema_id') or '').strip()
+            form_schema = None
+            # 'form' REQUIRES a schema; 'group' may OPTIONALLY bind a schema to
+            # get engine-driven coverage on top of the team-picker flow.
+            if mode == 'form' and not form_schema_id:
+                return JsonResponse({
+                    'error': "form_schema_id is required when mode='form'",
+                }, status=400)
+            if form_schema_id:
+                if mode == 'general':
+                    return JsonResponse({
+                        'error': "form_schema_id is only valid for mode='form' or mode='group'",
+                    }, status=400)
+                try:
+                    form_schema = FormSchema.objects.get(schema_id=form_schema_id, is_active=True)
+                except FormSchema.DoesNotExist:
+                    return JsonResponse({'error': 'form_schema not found or inactive'}, status=404)
+            source_cfg = None
+            if mode == 'group':
+                if not team_configuration_id:
+                    return JsonResponse({
+                        'error': "team_configuration_id is required when mode='group'",
+                    }, status=400)
+                try:
+                    source_cfg = TeamConfiguration.objects.get(id=team_configuration_id)
+                except TeamConfiguration.DoesNotExist:
+                    return JsonResponse({'error': 'team_configuration not found'}, status=404)
+                if source_cfg.archived:
+                    return JsonResponse({
+                        'error': 'team_configuration is archived; unarchive before using',
+                    }, status=400)
+                if course and source_cfg.course_id != course.id:
+                    return JsonResponse({
+                        'error': 'team_configuration belongs to a different course',
+                    }, status=400)
+
+            with transaction.atomic():
+                gpt = FeedbackGPT.objects.create(
+                    name=data.get('name', ''),
+                    instructions=data.get('instructions', ''),
+                    created_by=data.get('instructor_name', ''),
+                    course=course,
+                    week_number=data.get('week_number'),
+                    survey_label=data.get('survey_label', ''),
+                    public_id=_generate_public_id(),
+                    expires_at=expires_at,
+                    opens_at=opens_at,
+                    is_closed=False,
+                    anonymity_mode=data.get('anonymity_mode', 'anonymous'),
+                    reporting_structure=data.get('reporting_structure', ''),
+                    canvas_integration=data.get('canvas_integration', False),
+                    mode=mode,
+                    form_schema=form_schema,
+                )
+                snapshot_payload = None
+                if mode == 'group' and source_cfg is not None:
+                    snap = SurveyTeamSnapshot.objects.create(
+                        survey=gpt,
+                        source_configuration=source_cfg,
+                        name=source_cfg.name,
+                        label_prefix=source_cfg.label_prefix,
+                        color=source_cfg.color,
+                    )
+                    for t in source_cfg.teams.all():
+                        SurveyTeam.objects.create(snapshot=snap, number=t.number, size=t.size)
+                    snapshot_payload = _survey_snapshot_to_dict(snap)
+
+            resp = {
                 'status': 'success',
                 'id': gpt.id,
                 'public_id': gpt.public_id,
                 'name': gpt.name,
+                'mode': gpt.mode,
+                'form_schema_id': form_schema.schema_id if form_schema else None,
                 'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
-            })
+            }
+            if snapshot_payload:
+                resp['team_snapshot'] = snapshot_payload
+            return JsonResponse(resp)
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=400)
     return HttpResponse(status=405)
@@ -288,10 +349,12 @@ def feedback_gpts_by_course(request):
             session_count = session_ids.count()
             msg_count = FeedbackMessage.objects.filter(gpt_id=gpt.id).count()
             avg_turns = round(msg_count / session_count) if session_count else 0
+            snap = getattr(gpt, 'team_snapshot', None)
             result.append({
                 'id': gpt.id,
                 'public_id': gpt.public_id,
                 'name': gpt.name,
+                'mode': gpt.mode,
                 'week_number': gpt.week_number,
                 'survey_label': gpt.survey_label,
                 'instructions': gpt.instructions,
@@ -303,6 +366,10 @@ def feedback_gpts_by_course(request):
                 'reporting_structure': gpt.reporting_structure,
                 'session_count': session_count,
                 'avg_turns': avg_turns,
+                'team_configuration_id': snap.source_configuration_id if snap else None,
+                'team_snapshot_name': snap.name if snap else None,
+                'team_snapshot_color': snap.color if snap else None,
+                'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
             })
         return JsonResponse(result, safe=False)
     return HttpResponse(status=405)
@@ -333,10 +400,12 @@ def get_feedback_gpt_by_public_id(request):
             is_active = False
             reason = 'expired'
 
+        snap = getattr(gpt, 'team_snapshot', None)
         return JsonResponse({
             'id': gpt.id,
             'public_id': gpt.public_id,
             'name': gpt.name,
+            'mode': gpt.mode,
             'instructions': gpt.instructions,
             'week_number': gpt.week_number,
             'survey_label': gpt.survey_label,
@@ -346,7 +415,64 @@ def get_feedback_gpt_by_public_id(request):
             'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
             'anonymity_mode': gpt.anonymity_mode,
             'canvas_integration': gpt.canvas_integration,
+            'team_snapshot': _survey_snapshot_to_dict(snap) if snap else None,
+            'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
+            # Inline the schema body so feedback.html doesn't need a second
+            # round-trip to render Area-N-of-N transitions on first paint.
+            'form_schema': (
+                {
+                    'schema_id': gpt.form_schema.schema_id,
+                    'version': gpt.form_schema.version,
+                    'title': gpt.form_schema.title,
+                    'body': gpt.form_schema.body,
+                }
+                if gpt.form_schema_id else None
+            ),
         })
+
+
+@csrf_exempt
+def list_form_schemas(request):
+    """GET /form_schemas/?active=1 — registry for the PromptDesigner form tab."""
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    qs = FormSchema.objects.all()
+    if request.GET.get('active') in ('1', 'true', 'True'):
+        qs = qs.filter(is_active=True)
+    return JsonResponse([
+        {
+            'schema_id': s.schema_id,
+            'version': s.version,
+            'title': s.title,
+            'course_label': s.course_label,
+            'week_number': s.week_number,
+            'is_active': s.is_active,
+            'section_count': len((s.body or {}).get('sections', [])),
+            'updated_at': s.updated_at.isoformat(),
+        }
+        for s in qs
+    ], safe=False)
+
+
+@csrf_exempt
+def get_form_schema(request, schema_id):
+    """GET /form_schemas/<schema_id>/ — full schema body for engine + insights."""
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    try:
+        s = FormSchema.objects.get(schema_id=schema_id)
+    except FormSchema.DoesNotExist:
+        return JsonResponse({'error': 'form_schema not found'}, status=404)
+    return JsonResponse({
+        'schema_id': s.schema_id,
+        'version': s.version,
+        'title': s.title,
+        'course_label': s.course_label,
+        'week_number': s.week_number,
+        'is_active': s.is_active,
+        'body': s.body,
+        'updated_at': s.updated_at.isoformat(),
+    })
     return HttpResponse(status=405)
 
 
@@ -521,25 +647,45 @@ def clone_survey(request):
             except FeedbackGPT.DoesNotExist:
                 return JsonResponse({'error': 'Survey not found'}, status=404)
 
-            clone = FeedbackGPT.objects.create(
-                name='Copy of ' + src.name,
-                instructions=src.instructions,
-                created_by=src.created_by,
-                course=src.course,
-                week_number=src.week_number,
-                survey_label=src.survey_label,
-                public_id=_generate_public_id(),
-                expires_at=timezone.now() + timedelta(days=14),
-                opens_at=None,
-                is_closed=False,
-                anonymity_mode=src.anonymity_mode,
-                reporting_structure=src.reporting_structure,
-            )
+            with transaction.atomic():
+                clone = FeedbackGPT.objects.create(
+                    name='Copy of ' + src.name,
+                    instructions=src.instructions,
+                    created_by=src.created_by,
+                    course=src.course,
+                    week_number=src.week_number,
+                    survey_label=src.survey_label,
+                    public_id=_generate_public_id(),
+                    expires_at=timezone.now() + timedelta(days=14),
+                    opens_at=None,
+                    is_closed=False,
+                    anonymity_mode=src.anonymity_mode,
+                    reporting_structure=src.reporting_structure,
+                    mode=src.mode,
+                )
+                # For group-mode surveys, take a fresh snapshot from the same source
+                # configuration (if still available) so the clone gets current team sizes.
+                src_snap = getattr(src, 'team_snapshot', None)
+                if src.mode == 'group' and src_snap and src_snap.source_configuration_id:
+                    source_cfg = src_snap.source_configuration
+                    new_snap = SurveyTeamSnapshot.objects.create(
+                        survey=clone,
+                        source_configuration=source_cfg,
+                        name=source_cfg.name,
+                        label_prefix=source_cfg.label_prefix,
+                        color=source_cfg.color,
+                    )
+                    for t in source_cfg.teams.all():
+                        SurveyTeam.objects.create(
+                            snapshot=new_snap, number=t.number, size=t.size,
+                        )
+
             return JsonResponse({
                 'status': 'success',
                 'id': clone.id,
                 'public_id': clone.public_id,
                 'name': clone.name,
+                'mode': clone.mode,
             })
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=400)
@@ -869,6 +1015,89 @@ def openai_structured(request):
         'response': result['response'],
         'parsed': result['parsed'],
         'usage': result['usage'],
+    })
+
+
+_TTS_FORMAT_MIME = {
+    'mp3': 'audio/mpeg',
+    'opus': 'audio/ogg',
+    'aac': 'audio/aac',
+    'flac': 'audio/flac',
+    'wav': 'audio/wav',
+    'pcm': 'application/octet-stream',
+}
+
+
+@csrf_exempt
+def openai_tts(request):
+    """Proxy endpoint for OpenAI text-to-speech.
+
+    POST body: {text: str, voice?: str, model?: str, format?: str}
+    200 body:  raw audio bytes with appropriate Content-Type."""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Only POST method allowed'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+    text = (data.get('text') or '').strip()
+    if not text:
+        return JsonResponse({'error': 'text is required'}, status=400)
+
+    fmt = (data.get('format') or 'mp3').lower()
+
+    try:
+        audio_bytes = openai_client.synthesize_speech(
+            text=text,
+            voice=data.get('voice'),
+            model=data.get('model'),
+            response_format=fmt,
+        )
+    except openai_client.OpenAIClientError as e:
+        return JsonResponse({'error': e.detail}, status=e.status_code)
+
+    return HttpResponse(
+        audio_bytes,
+        content_type=_TTS_FORMAT_MIME.get(fmt, 'application/octet-stream'),
+    )
+
+
+@csrf_exempt
+def openai_stt(request):
+    """Proxy endpoint for OpenAI speech-to-text (Whisper).
+
+    POST multipart/form-data:
+        file: audio blob (webm/mp4/wav/mp3/m4a/ogg/flac, <=25MB)
+        language?: ISO-639-1 hint
+        prompt?: context prompt to bias terminology
+        model?: override default STT model
+
+    200 body: {status: "success", text: str, model: str}"""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Only POST method allowed'}, status=405)
+
+    upload = request.FILES.get('file')
+    if upload is None:
+        return JsonResponse({'error': 'file is required'}, status=400)
+
+    try:
+        result = openai_client.transcribe_audio(
+            file_obj=upload,
+            filename=upload.name or 'audio.webm',
+            model=request.POST.get('model'),
+            language=request.POST.get('language') or None,
+            prompt=request.POST.get('prompt') or None,
+            content_type=getattr(upload, 'content_type', None),
+        )
+    except openai_client.OpenAIClientError as e:
+        return JsonResponse({'error': e.detail}, status=e.status_code)
+
+    return JsonResponse({
+        'status': 'success',
+        'text': result['text'],
+        'model': result['model'],
     })
 
 
@@ -1211,3 +1440,298 @@ def leai_quicktake_generate(request):
 
     return JsonResponse(_quicktake_to_dict(qt), status=202)
 
+
+
+# ================= In-Group feedback endpoints =================
+# Palette order must match CONFIG_COLOR_PALETTE in LEAI/leai-shared.js so
+# auto-assigned colors stay consistent across frontend ↔ backend.
+_CONFIG_COLOR_PALETTE = ['forest', 'plum', 'amber', 'teal', 'rose', 'indigo', 'brown', 'slate']
+
+
+def _pick_next_config_color(existing_configs):
+    """Return the first palette color not already used by a sibling configuration.
+    Cycles by count when all 8 colors are in use."""
+    used = {c.color for c in existing_configs}
+    for color in _CONFIG_COLOR_PALETTE:
+        if color not in used:
+            return color
+    return _CONFIG_COLOR_PALETTE[len(list(existing_configs)) % len(_CONFIG_COLOR_PALETTE)]
+
+
+def _team_configuration_to_dict(cfg):
+    return {
+        'id': cfg.id,
+        'courseId': cfg.course.course_id if cfg.course else None,
+        'name': cfg.name,
+        'label_prefix': cfg.label_prefix,
+        'color': cfg.color,
+        'archived': cfg.archived,
+        'teams': [
+            {'id': t.id, 'number': t.number, 'size': t.size}
+            for t in cfg.teams.all().order_by('number')
+        ],
+        'created_at': cfg.created_at.isoformat(),
+        'updated_at': cfg.updated_at.isoformat(),
+    }
+
+
+def _survey_snapshot_to_dict(snap):
+    return {
+        'id': snap.id,
+        'survey_id': snap.survey_id,
+        'source_configuration_id': snap.source_configuration_id,
+        'name': snap.name,
+        'label_prefix': snap.label_prefix,
+        'color': snap.color,
+        'teams': [
+            {'id': t.id, 'number': t.number, 'size': t.size}
+            for t in snap.teams.all().order_by('number')
+        ],
+        'created_at': snap.created_at.isoformat(),
+    }
+
+
+def _assignment_to_dict(a):
+    return {
+        'id': a.id,
+        'session_id': a.session_id,
+        'survey_team_id': a.survey_team_id,
+        'assigned_at': a.assigned_at.isoformat(),
+    }
+
+
+@csrf_exempt
+def list_team_configurations(request):
+    """GET /team_configurations/?course_id=...&include_archived=0|1"""
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    course_id = request.GET.get('course_id')
+    if not course_id:
+        return JsonResponse({'error': 'course_id required'}, status=400)
+    try:
+        course = Course.objects.get(course_id=course_id)
+    except Course.DoesNotExist:
+        return JsonResponse({'error': 'Course not found'}, status=404)
+    include_archived = request.GET.get('include_archived') in ('1', 'true')
+    qs = TeamConfiguration.objects.filter(course=course)
+    if not include_archived:
+        qs = qs.filter(archived=False)
+    qs = qs.order_by('created_at')
+    return JsonResponse([_team_configuration_to_dict(c) for c in qs], safe=False)
+
+
+@csrf_exempt
+def create_team_configuration(request):
+    """POST /team_configurations/create/  body: {course_id, name, label_prefix, teams:[{number,size}...], color?}"""
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+        course_id = data.get('course_id')
+        name = (data.get('name') or 'Primary').strip()
+        label_prefix = data.get('label_prefix') or 'Team'
+        teams = data.get('teams') or []
+        explicit_color = data.get('color')
+        if not course_id:
+            return JsonResponse({'error': 'course_id required'}, status=400)
+        try:
+            course = Course.objects.get(course_id=course_id)
+        except Course.DoesNotExist:
+            return JsonResponse({'error': 'Course not found'}, status=404)
+
+        siblings = list(TeamConfiguration.objects.filter(course=course, archived=False))
+        sibling_names = {c.name for c in siblings}
+        # Auto-dedupe: "Primary" → "Primary 2" → "Primary 3"
+        if name in sibling_names:
+            n = 2
+            while f'{name} {n}' in sibling_names:
+                n += 1
+            name = f'{name} {n}'
+
+        color = explicit_color if explicit_color in dict(COLOR_CHOICES) else _pick_next_config_color(siblings)
+
+        with transaction.atomic():
+            cfg = TeamConfiguration.objects.create(
+                course=course, name=name, label_prefix=label_prefix, color=color,
+            )
+            for t in teams:
+                Team.objects.create(
+                    team_configuration=cfg,
+                    number=int(t['number']),
+                    size=int(t['size']),
+                )
+        return JsonResponse(_team_configuration_to_dict(cfg))
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+
+@csrf_exempt
+def update_team_configuration(request):
+    """POST /team_configurations/update/  body: {id, name?, label_prefix?, color?, teams?, archived?}"""
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+        cfg_id = data.get('id')
+        if not cfg_id:
+            return JsonResponse({'error': 'id required'}, status=400)
+        try:
+            cfg = TeamConfiguration.objects.get(id=cfg_id)
+        except TeamConfiguration.DoesNotExist:
+            return JsonResponse({'error': 'Configuration not found'}, status=404)
+
+        with transaction.atomic():
+            if 'name' in data and data['name']:
+                new_name = data['name'].strip()
+                # Dedupe against siblings (excluding self)
+                sibling_names = set(
+                    TeamConfiguration.objects
+                    .filter(course=cfg.course).exclude(id=cfg.id).filter(archived=False)
+                    .values_list('name', flat=True)
+                )
+                if new_name in sibling_names:
+                    n = 2
+                    while f'{new_name} {n}' in sibling_names:
+                        n += 1
+                    new_name = f'{new_name} {n}'
+                cfg.name = new_name
+            if 'label_prefix' in data:
+                cfg.label_prefix = data['label_prefix']
+            if 'color' in data and data['color'] in dict(COLOR_CHOICES):
+                cfg.color = data['color']
+            if 'archived' in data:
+                cfg.archived = bool(data['archived'])
+            cfg.save()
+
+            if 'teams' in data:
+                # Replace the teams wholesale. Preserve existing ids where number matches
+                # so any downstream references don't break.
+                existing_by_number = {t.number: t for t in cfg.teams.all()}
+                incoming_numbers = set()
+                for t in data['teams']:
+                    number = int(t['number'])
+                    size = int(t['size'])
+                    incoming_numbers.add(number)
+                    if number in existing_by_number:
+                        team = existing_by_number[number]
+                        team.size = size
+                        team.save()
+                    else:
+                        Team.objects.create(team_configuration=cfg, number=number, size=size)
+                # Remove teams that no longer exist
+                cfg.teams.exclude(number__in=incoming_numbers).delete()
+
+        return JsonResponse(_team_configuration_to_dict(cfg))
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+
+@csrf_exempt
+def archive_team_configuration(request):
+    """POST /team_configurations/archive/  body: {id}"""
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+        cfg_id = data.get('id')
+        try:
+            cfg = TeamConfiguration.objects.get(id=cfg_id)
+        except TeamConfiguration.DoesNotExist:
+            return JsonResponse({'error': 'Configuration not found'}, status=404)
+        cfg.archived = True
+        cfg.save()
+        return JsonResponse({'ok': True})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+
+@csrf_exempt
+def delete_team_configuration(request):
+    """POST /team_configurations/delete/  body: {id}
+    Refuses with 409 if any snapshot references this configuration."""
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+        cfg_id = data.get('id')
+        try:
+            cfg = TeamConfiguration.objects.get(id=cfg_id)
+        except TeamConfiguration.DoesNotExist:
+            return JsonResponse({'error': 'Configuration not found'}, status=404)
+        if SurveyTeamSnapshot.objects.filter(source_configuration=cfg).exists():
+            return JsonResponse({
+                'error': 'configuration is referenced by surveys; archive instead',
+            }, status=409)
+        cfg.delete()
+        return JsonResponse({'ok': True})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+
+@csrf_exempt
+def get_survey_team_snapshot(request):
+    """GET /survey_team_snapshot/?survey_id=... OR public_id=..."""
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    survey_id = request.GET.get('survey_id')
+    public_id = request.GET.get('public_id')
+    try:
+        if public_id:
+            survey = FeedbackGPT.objects.get(public_id=public_id)
+        elif survey_id:
+            survey = FeedbackGPT.objects.get(id=survey_id)
+        else:
+            return JsonResponse({'error': 'survey_id or public_id required'}, status=400)
+    except FeedbackGPT.DoesNotExist:
+        return JsonResponse({'error': 'Survey not found'}, status=404)
+    snap = getattr(survey, 'team_snapshot', None)
+    if not snap:
+        return JsonResponse({'error': 'No team snapshot for this survey'}, status=404)
+    return JsonResponse(_survey_snapshot_to_dict(snap))
+
+
+@csrf_exempt
+def assign_session_to_team(request):
+    """POST /session_team_assignment/  body: {session_id, survey_team_id}. Idempotent — later calls update the existing row."""
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+        session_id = data.get('session_id')
+        team_id = data.get('survey_team_id')
+        if not session_id or not team_id:
+            return JsonResponse({'error': 'session_id and survey_team_id required'}, status=400)
+        try:
+            survey_team = SurveyTeam.objects.get(id=team_id)
+        except SurveyTeam.DoesNotExist:
+            return JsonResponse({'error': 'SurveyTeam not found'}, status=404)
+        obj, _ = SessionTeamAssignment.objects.update_or_create(
+            session_id=session_id,
+            defaults={'survey_team': survey_team},
+        )
+        return JsonResponse({'ok': True, 'id': obj.id})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+
+@csrf_exempt
+def list_survey_team_assignments(request):
+    """GET /survey_team_assignments/?survey_id=... OR public_id=..."""
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    survey_id = request.GET.get('survey_id')
+    public_id = request.GET.get('public_id')
+    try:
+        if public_id:
+            survey = FeedbackGPT.objects.get(public_id=public_id)
+        elif survey_id:
+            survey = FeedbackGPT.objects.get(id=survey_id)
+        else:
+            return JsonResponse({'error': 'survey_id or public_id required'}, status=400)
+    except FeedbackGPT.DoesNotExist:
+        return JsonResponse({'error': 'Survey not found'}, status=404)
+    snap = getattr(survey, 'team_snapshot', None)
+    if not snap:
+        return JsonResponse([], safe=False)
+    assignments = SessionTeamAssignment.objects.filter(survey_team__snapshot=snap)
+    return JsonResponse([_assignment_to_dict(a) for a in assignments], safe=False)
