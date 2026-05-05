@@ -173,12 +173,16 @@ class Team(models.Model):
 
 
 class SurveyTeamSnapshot(models.Model):
-    """Frozen team structure captured at survey creation.
+    """Per-survey team structure captured at survey creation.
 
-    Editing the source TeamConfiguration after this exists must not alter the
-    snapshot's teams, label_prefix, color, or name. Cascaded deletes from
-    FeedbackGPT remove the snapshot and its SurveyTeam rows; assignments are
-    cleared via their FK cascade from SurveyTeam.
+    `name`, `label_prefix`, and `color` are frozen at creation (renaming or
+    recoloring the source TeamConfiguration does not propagate). The
+    `teams` (number + size) DO follow the source: when an instructor edits
+    teams in update_team_configuration, every snapshot tied to that source
+    is synced — adds/resizes propagate, and obsolete numbers are removed
+    only when no SessionTeamAssignment references them, so existing student
+    team picks are preserved. Cascaded deletes from FeedbackGPT remove the
+    snapshot and its SurveyTeam rows; assignments cascade with SurveyTeam.
     """
 
     survey = models.OneToOneField(

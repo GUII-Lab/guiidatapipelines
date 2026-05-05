@@ -1621,6 +1621,29 @@ def update_team_configuration(request):
                 # Remove teams that no longer exist
                 cfg.teams.exclude(number__in=incoming_numbers).delete()
 
+                # Propagate the new team list to every survey snapshot sourced from
+                # this configuration so already-created surveys reflect the latest
+                # team count/sizes (matches the team list students see in the
+                # picker on feedback.html). Without this, edits only affect newly
+                # created surveys and duplicates — past surveys keep their stale
+                # snapshot even after the instructor adjusts teams.
+                incoming_sizes = {int(t['number']): int(t['size']) for t in data['teams']}
+                for snap in cfg.snapshots.all():
+                    snap_existing = {st.number: st for st in snap.teams.all()}
+                    for number, size in incoming_sizes.items():
+                        if number in snap_existing:
+                            st = snap_existing[number]
+                            if st.size != size:
+                                st.size = size
+                                st.save()
+                        else:
+                            SurveyTeam.objects.create(snapshot=snap, number=number, size=size)
+                    # Remove snapshot teams that no longer exist in the source —
+                    # but only when no student has self-assigned to them, so we
+                    # don't cascade-delete an existing SessionTeamAssignment.
+                    obsolete = snap.teams.exclude(number__in=incoming_numbers)
+                    obsolete.filter(assignments__isnull=True).delete()
+
         return JsonResponse(_team_configuration_to_dict(cfg))
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=400)
