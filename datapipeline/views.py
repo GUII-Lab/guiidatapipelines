@@ -601,8 +601,60 @@ def update_survey(request):
             if 'opens_at' in data:
                 gpt.opens_at = parse_datetime(data['opens_at']) if data['opens_at'] else None
 
+            # Swap team configuration for an existing group-mode survey. Only
+            # allowed when no student has self-assigned to a team yet — once
+            # assignments exist, switching would orphan their picks. In that
+            # case instructors should duplicate the survey instead.
+            new_cfg_id = data.get('team_configuration_id')
+            snapshot_payload = None
+            if new_cfg_id is not None and gpt.mode == 'group':
+                try:
+                    new_cfg_id = int(new_cfg_id)
+                except (TypeError, ValueError):
+                    return JsonResponse({'error': 'team_configuration_id must be an integer'}, status=400)
+                current_snap = getattr(gpt, 'team_snapshot', None)
+                current_source_id = current_snap.source_configuration_id if current_snap else None
+                if new_cfg_id != current_source_id:
+                    try:
+                        new_cfg = TeamConfiguration.objects.get(id=new_cfg_id)
+                    except TeamConfiguration.DoesNotExist:
+                        return JsonResponse({'error': 'team_configuration not found'}, status=404)
+                    if new_cfg.archived:
+                        return JsonResponse({
+                            'error': 'team_configuration is archived; unarchive before using',
+                        }, status=400)
+                    if gpt.course_id and new_cfg.course_id != gpt.course_id:
+                        return JsonResponse({
+                            'error': 'team_configuration belongs to a different course',
+                        }, status=400)
+                    if current_snap and SessionTeamAssignment.objects.filter(
+                        survey_team__snapshot=current_snap
+                    ).exists():
+                        return JsonResponse({
+                            'error': "Can't switch team configuration: students have already picked teams in this survey. Duplicate the survey instead so existing responses keep their team picks.",
+                        }, status=400)
+                    with transaction.atomic():
+                        if current_snap:
+                            current_snap.delete()
+                        snap = SurveyTeamSnapshot.objects.create(
+                            survey=gpt,
+                            source_configuration=new_cfg,
+                            name=new_cfg.name,
+                            label_prefix=new_cfg.label_prefix,
+                            color=new_cfg.color,
+                        )
+                        for t in new_cfg.teams.all():
+                            SurveyTeam.objects.create(
+                                snapshot=snap, number=t.number, size=t.size,
+                                display_name=t.display_name,
+                            )
+                        snapshot_payload = _survey_snapshot_to_dict(snap)
+
             gpt.save()
-            return JsonResponse({'status': 'success', 'id': gpt.id})
+            resp = {'status': 'success', 'id': gpt.id}
+            if snapshot_payload is not None:
+                resp['team_snapshot'] = snapshot_payload
+            return JsonResponse(resp)
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=400)
     return HttpResponse(status=405)
