@@ -527,6 +527,7 @@ def feedback_messages_by_course(request):
             result.append({
                 'gpt_id': gpt.id,
                 'name': gpt.name,
+                'mode': gpt.mode,
                 'week_number': gpt.week_number,
                 'survey_label': gpt.survey_label,
                 'sessions': dict(sessions),
@@ -536,6 +537,7 @@ def feedback_messages_by_course(request):
                 'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
                 'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
                 'canvas_integration': gpt.canvas_integration,
+                'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
             })
         return JsonResponse(result, safe=False)
     return HttpResponse(status=405)
