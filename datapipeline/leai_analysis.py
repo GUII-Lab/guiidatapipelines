@@ -180,10 +180,13 @@ def build_response_corpus(
     }
     survey_ids = list(survey_map.keys())
 
-    # 2. Fetch student messages (exclude AI turns)
+    # 2. Fetch student messages (exclude AI turns).
+    # Legacy rows carry the CSS-class tag 'user-message'; submissions written
+    # after the storeData normalization (commit 105a7f9) carry the canonical
+    # role 'user'. Accept both so newer corpora aren't silently empty.
     messages_qs = (
         FeedbackMessage.objects
-        .filter(gpt_id__in=survey_ids, sent_by="user-message")
+        .filter(gpt_id__in=survey_ids, sent_by__in=["user-message", "user"])
         .order_by("session_id", "created_at")
     )
 
