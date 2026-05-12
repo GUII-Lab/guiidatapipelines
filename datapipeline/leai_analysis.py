@@ -288,36 +288,32 @@ def _normalize_citations(text: str) -> str:
 
 
 def parse_inline_citations(text: str) -> tuple[str, list[str]]:
-    """Replace [R<n>] citations with sequential [1], [2], ... indices.
+    """Replace [R<n>] citations with stable [1], [2], ... pill indices.
 
     Returns:
         (cleaned_text, cited_list)
 
-    Each occurrence of [R<n>] in `text` is replaced with a 1-based sequential
-    index.  The same R-id appearing multiple times gets separate sequential
-    pill indices (i.e. duplicate R-ids are NOT collapsed).
+    Each unique R-id gets a 1-based pill index in the order it first appears.
+    Repeated occurrences of the same R-id reuse that pill index, so the
+    rendered text and the cited[] array always agree on pill_index → rid.
 
     Also handles comma-separated citations like [R5, R25, R35] by first
     expanding them into individual [R5][R25][R35] format.
-
-    cited_list contains the original R-ids in the order they first appear in
-    the text (de-duplicated for the list, but pills are still sequential).
     """
     # Normalize variant citation formats first
     text = _normalize_citations(text)
 
     cited_order: list[str] = []  # ordered unique R-ids
-    seen: set[str] = set()
-    pill_counter = 0
+    pill_by_rid: dict[str, int] = {}
 
     def replace(match: re.Match) -> str:
-        nonlocal pill_counter
         rid = f"R{match.group(1)}"
-        pill_counter += 1
-        if rid not in seen:
-            seen.add(rid)
+        pill = pill_by_rid.get(rid)
+        if pill is None:
             cited_order.append(rid)
-        return f"[{pill_counter}]"
+            pill = len(cited_order)
+            pill_by_rid[rid] = pill
+        return f"[{pill}]"
 
     cleaned = _CITATION_RE.sub(replace, text)
     return cleaned, cited_order

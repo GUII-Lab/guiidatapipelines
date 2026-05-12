@@ -154,15 +154,20 @@ class ParseInlineCitationsTest(TestCase):
         self.assertEqual(cleaned, text)
         self.assertEqual(cited, [])
 
-    def test_duplicate_citation_gets_separate_pills(self):
-        # [R17] appears twice → two separate pill indices [1] and [2]
+    def test_duplicate_citation_reuses_pill_index(self):
+        # [R17] appears twice → both occurrences become [1], matching the
+        # single entry in cited[] so the popover can resolve every pill.
         text = "First mention [R17] and again [R17]."
         cleaned, cited = parse_inline_citations(text)
-        self.assertIn("[1]", cleaned)
-        self.assertIn("[2]", cleaned)
-        self.assertNotIn("[R17]", cleaned)
-        # cited list de-duplicates: R17 listed once
+        self.assertEqual(cleaned, "First mention [1] and again [1].")
         self.assertEqual(cited, ["R17"])
+
+    def test_interleaved_repeats_keep_stable_pill_indices(self):
+        # Pill numbers track unique R-ids, so [R17][R42][R17] → [1][2][1].
+        text = "[R17] then [R42] then back to [R17]."
+        cleaned, cited = parse_inline_citations(text)
+        self.assertEqual(cleaned, "[1] then [2] then back to [1].")
+        self.assertEqual(cited, ["R17", "R42"])
 
     def test_comma_separated_citations(self):
         text = "Students struggled [R5, R25, R35] with the project."
