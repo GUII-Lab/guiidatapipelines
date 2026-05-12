@@ -34,8 +34,9 @@ class TeamConfigurationAdmin(admin.ModelAdmin):
 
 @admin.register(Team)
 class TeamAdmin(admin.ModelAdmin):
-    list_display = ('id', 'team_configuration', 'number', 'size')
+    list_display = ('id', 'team_configuration', 'number', 'size', 'display_name')
     list_filter = ('team_configuration',)
+    search_fields = ('display_name',)
 
 
 class SurveyTeamInline(admin.TabularInline):
@@ -53,8 +54,9 @@ class SurveyTeamSnapshotAdmin(admin.ModelAdmin):
 
 @admin.register(SurveyTeam)
 class SurveyTeamAdmin(admin.ModelAdmin):
-    list_display = ('id', 'snapshot', 'number', 'size')
+    list_display = ('id', 'snapshot', 'number', 'size', 'display_name')
     list_filter = ('snapshot',)
+    search_fields = ('display_name',)
 
 
 @admin.register(SessionTeamAssignment)

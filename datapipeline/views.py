@@ -312,7 +312,10 @@ def create_feedback_gpt(request):
                         color=source_cfg.color,
                     )
                     for t in source_cfg.teams.all():
-                        SurveyTeam.objects.create(snapshot=snap, number=t.number, size=t.size)
+                        SurveyTeam.objects.create(
+                            snapshot=snap, number=t.number, size=t.size,
+                            display_name=t.display_name,
+                        )
                     snapshot_payload = _survey_snapshot_to_dict(snap)
 
             resp = {
@@ -680,6 +683,7 @@ def clone_survey(request):
                     for t in source_cfg.teams.all():
                         SurveyTeam.objects.create(
                             snapshot=new_snap, number=t.number, size=t.size,
+                            display_name=t.display_name,
                         )
 
             return JsonResponse({
@@ -1469,7 +1473,8 @@ def _team_configuration_to_dict(cfg):
         'color': cfg.color,
         'archived': cfg.archived,
         'teams': [
-            {'id': t.id, 'number': t.number, 'size': t.size}
+            {'id': t.id, 'number': t.number, 'size': t.size,
+             'display_name': t.display_name}
             for t in cfg.teams.all().order_by('number')
         ],
         'created_at': cfg.created_at.isoformat(),
@@ -1486,7 +1491,8 @@ def _survey_snapshot_to_dict(snap):
         'label_prefix': snap.label_prefix,
         'color': snap.color,
         'teams': [
-            {'id': t.id, 'number': t.number, 'size': t.size}
+            {'id': t.id, 'number': t.number, 'size': t.size,
+             'display_name': t.display_name}
             for t in snap.teams.all().order_by('number')
         ],
         'created_at': snap.created_at.isoformat(),
@@ -1561,6 +1567,7 @@ def create_team_configuration(request):
                     team_configuration=cfg,
                     number=int(t['number']),
                     size=int(t['size']),
+                    display_name=(t.get('display_name') or '').strip(),
                 )
         return JsonResponse(_team_configuration_to_dict(cfg))
     except Exception as e:
@@ -1613,33 +1620,50 @@ def update_team_configuration(request):
                 for t in data['teams']:
                     number = int(t['number'])
                     size = int(t['size'])
+                    display_name = (t.get('display_name') or '').strip()
                     incoming_numbers.add(number)
                     if number in existing_by_number:
                         team = existing_by_number[number]
                         team.size = size
+                        team.display_name = display_name
                         team.save()
                     else:
-                        Team.objects.create(team_configuration=cfg, number=number, size=size)
+                        Team.objects.create(
+                            team_configuration=cfg, number=number, size=size,
+                            display_name=display_name,
+                        )
                 # Remove teams that no longer exist
                 cfg.teams.exclude(number__in=incoming_numbers).delete()
 
                 # Propagate the new team list to every survey snapshot sourced from
                 # this configuration so already-created surveys reflect the latest
-                # team count/sizes (matches the team list students see in the
-                # picker on feedback.html). Without this, edits only affect newly
-                # created surveys and duplicates — past surveys keep their stale
-                # snapshot even after the instructor adjusts teams.
-                incoming_sizes = {int(t['number']): int(t['size']) for t in data['teams']}
+                # team count/sizes/names (matches the team list students see in
+                # the picker on feedback.html). Without this, edits only affect
+                # newly created surveys and duplicates — past surveys keep their
+                # stale snapshot even after the instructor adjusts teams.
+                incoming_meta = {
+                    int(t['number']): {
+                        'size': int(t['size']),
+                        'display_name': (t.get('display_name') or '').strip(),
+                    } for t in data['teams']
+                }
                 for snap in cfg.snapshots.all():
                     snap_existing = {st.number: st for st in snap.teams.all()}
-                    for number, size in incoming_sizes.items():
+                    for number, meta in incoming_meta.items():
                         if number in snap_existing:
                             st = snap_existing[number]
-                            if st.size != size:
-                                st.size = size
+                            dirty = False
+                            if st.size != meta['size']:
+                                st.size = meta['size']; dirty = True
+                            if st.display_name != meta['display_name']:
+                                st.display_name = meta['display_name']; dirty = True
+                            if dirty:
                                 st.save()
                         else:
-                            SurveyTeam.objects.create(snapshot=snap, number=number, size=size)
+                            SurveyTeam.objects.create(
+                                snapshot=snap, number=number, size=meta['size'],
+                                display_name=meta['display_name'],
+                            )
                     # Remove snapshot teams that no longer exist in the source —
                     # but only when no student has self-assigned to them, so we
                     # don't cascade-delete an existing SessionTeamAssignment.

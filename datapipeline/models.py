@@ -163,6 +163,9 @@ class Team(models.Model):
     )
     number = models.IntegerField()
     size = models.IntegerField()
+    # Optional instructor-supplied label that overrides "<label_prefix> <number>"
+    # in student-facing UI and the analyzer (e.g., sponsor team names in HCI 271).
+    display_name = models.CharField(max_length=100, blank=True, default='')
 
     class Meta:
         unique_together = [('team_configuration', 'number')]
@@ -207,6 +210,10 @@ class SurveyTeam(models.Model):
     )
     number = models.IntegerField()
     size = models.IntegerField()
+    # Frozen at snapshot creation but synced with source Team.display_name on
+    # update_team_configuration (same as size). Empty string means "no custom
+    # name — show <label_prefix> <number>".
+    display_name = models.CharField(max_length=100, blank=True, default='')
 
     class Meta:
         unique_together = [('snapshot', 'number')]
