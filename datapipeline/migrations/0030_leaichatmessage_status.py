@@ -1,0 +1,40 @@
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('datapipeline', '0029_leaiquicktake_form_sections'),
+    ]
+
+    operations = [
+        migrations.AlterField(
+            model_name='leaichatmessage',
+            name='text',
+            field=models.TextField(blank=True),
+        ),
+        migrations.AddField(
+            model_name='leaichatmessage',
+            name='status',
+            field=models.CharField(
+                choices=[
+                    ('pending', 'Pending'),
+                    ('running', 'Running'),
+                    ('ready', 'Ready'),
+                    ('failed', 'Failed'),
+                ],
+                default='ready',
+                max_length=16,
+            ),
+        ),
+        migrations.AddField(
+            model_name='leaichatmessage',
+            name='error',
+            field=models.TextField(blank=True, default=''),
+        ),
+        migrations.AddField(
+            model_name='leaichatmessage',
+            name='job_started_at',
+            field=models.DateTimeField(blank=True, null=True),
+        ),
+    ]

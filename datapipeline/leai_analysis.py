@@ -1493,27 +1493,46 @@ def _run_chunked_quicktake(
 
 
 # ---------------------------------------------------------------------------
-# LLM flow: run_chat_turn
+# LLM flow: chat turn (async)
 # ---------------------------------------------------------------------------
 
-def run_chat_turn(
+# A chat turn that stays in pending/running past this many seconds is
+# treated as a dyno-cycle zombie by the polling endpoints, which flip it
+# to failed so the UI can retry instead of spinning forever.
+CHAT_TURN_JOB_STALE_SECONDS = 180
+
+
+def _is_chat_message_stale(msg: LEAIChatMessage) -> bool:
+    """True if a pending/running assistant row has outlived the stale threshold."""
+    if msg.status not in (
+        LEAIChatMessage.STATUS_PENDING, LEAIChatMessage.STATUS_RUNNING,
+    ):
+        return False
+    started = msg.job_started_at or msg.created_at
+    if started is None:
+        return True
+    return (timezone.now() - started).total_seconds() > CHAT_TURN_JOB_STALE_SECONDS
+
+
+def _generate_assistant_response(
     session: LEAIChatSession,
     user_text: str,
-) -> LEAIChatMessage:
-    """Execute one chat turn for a Feedback Chat session.
+    *,
+    exclude_message_pks: Optional[list] = None,
+) -> tuple[str, list]:
+    """Pure LLM body of a chat turn: build context, call the model + verifier,
+    return ``(cleaned_text, cited)``. Does NOT write to the database.
 
-    Saves the user message, calls the LLM, parses citations, runs
-    verify_claims, saves the assistant message.
+    ``exclude_message_pks`` is the set of message rows to omit from the
+    rebuilt chat history — typically the just-saved user message (and, in
+    the async path, the pending assistant placeholder). Prior messages
+    with status != ready are skipped automatically so failed turns do not
+    contaminate future turns.
 
-    The entire operation (save user + save assistant) is wrapped in
-    transaction.atomic() so that an LLM failure rolls back the user message.
-
-    Returns:
-        The saved LEAIChatMessage for the assistant turn.
+    Raises:
+        OpenAI* errors from openai_client on LLM failure.
     """
     course = session.course
-
-    # Build corpus once (outside the transaction — read-only)
     corpus = build_response_corpus(
         course=course,
         scope_kind=session.scope_kind,
@@ -1522,7 +1541,6 @@ def run_chat_turn(
         scope_session_ids=list(session.scope_session_ids or []),
     )
 
-    # Build system prompt (allow override)
     base_system = (
         session.system_prompt_override
         if session.system_prompt_override
@@ -1531,90 +1549,191 @@ def run_chat_turn(
     corpus_block = build_chat_corpus_block(corpus)
     full_system = f"{base_system}\n\n{corpus_block}"
 
+    prior_qs = session.messages.filter(status=LEAIChatMessage.STATUS_READY)
+    if exclude_message_pks:
+        prior_qs = prior_qs.exclude(pk__in=exclude_message_pks)
+    prior_messages = prior_qs.order_by("created_at")
+
+    chat_history = [{"role": "system", "content": full_system}]
+    for msg in prior_messages:
+        if msg.role in ("user", "assistant"):
+            chat_history.append({"role": msg.role, "content": msg.text})
+
+    # Structured output (Phase 6): the model returns { answer, quotes }
+    # where quotes carries one verbatim span per cited rid for the
+    # popover surface.
+    result = openai_client.run_structured(
+        chat_history=chat_history,
+        user_text=user_text,
+        json_schema=CHAT_TURN_SCHEMA,
+        schema_name="chat_turn",
+    )
+    parsed = result.get("parsed") or {}
+    raw_answer = parsed.get("answer", "")
+    raw_quotes = parsed.get("quotes", []) or []
+
+    # Strip rids the model invented (not in corpus); otherwise the
+    # frontend renders pills whose popovers can't resolve.
+    valid_rids = {e["rid"] for e in corpus}
+    cleaned_text, cited_rids = parse_inline_citations(raw_answer, valid_rids)
+
+    # Verify each quote against the cited rid's source. A verified quote
+    # becomes the popover content; unverified ones leave quote_text empty
+    # so the popover falls back to the full session text.
+    corpus_by_rid_norm = {
+        e["rid"]: _normalize_for_quote_match(e["text"]) for e in corpus
+    }
+    quote_text_by_rid: dict[str, str] = {}
+    for q in raw_quotes:
+        rid = q.get("rid", "")
+        qtext = q.get("text", "")
+        if not rid or not qtext or rid not in valid_rids:
+            continue
+        source = corpus_by_rid_norm.get(rid, "")
+        if _normalize_for_quote_match(qtext) in source:
+            quote_text_by_rid.setdefault(rid, qtext)
+
+    cited = []
+    for i, rid in enumerate(cited_rids, 1):
+        cited.append({
+            'rid': rid,
+            'pill_index': i,
+            'verdict': None,
+            'quote_text': quote_text_by_rid.get(rid, ''),
+        })
+
+    if cited:
+        pseudo_bullets = [{"text": cleaned_text, "cited_ids": cited_rids}]
+        try:
+            verification = verify_claims(corpus=corpus, bullets=pseudo_bullets)
+            verdict_map = {v['source_id']: v['verdict'] for v in verification}
+            for c in cited:
+                c['verdict'] = verdict_map.get(c['rid'])
+        except Exception:
+            pass  # leave verdicts as None
+
+    return cleaned_text, cited
+
+
+def run_chat_turn(
+    session: LEAIChatSession,
+    user_text: str,
+) -> LEAIChatMessage:
+    """Synchronous chat turn (legacy entry point).
+
+    Saves user + assistant messages atomically so an LLM failure rolls
+    back the user message. Kept for unit tests and any direct in-process
+    caller; the HTTP turn endpoint uses ``start_chat_turn_job`` instead so
+    the LLM work happens off the request thread (Heroku's 30s router
+    timeout makes a synchronous response unsafe for multi-survey scopes).
+    """
     with transaction.atomic():
-        # Save user message
         user_msg = LEAIChatMessage.objects.create(
             session=session,
             role="user",
             text=user_text,
             cited=[],
         )
-
-        # Build chat history from prior messages (excluding the one just saved)
-        prior_messages = (
-            session.messages
-            .exclude(pk=user_msg.pk)
-            .order_by("created_at")
+        cleaned_text, cited = _generate_assistant_response(
+            session, user_text, exclude_message_pks=[user_msg.pk],
         )
-        chat_history = [{"role": "system", "content": full_system}]
-        for msg in prior_messages:
-            if msg.role in ("user", "assistant"):
-                chat_history.append({"role": msg.role, "content": msg.text})
-
-        # Call LLM — structured output (Phase 6). The model returns
-        # { answer, quotes } where quotes carries one verbatim span per
-        # cited rid. The popover surface in the chat UI then shows this
-        # quote instead of dumping the entire session transcript.
-        result = openai_client.run_structured(
-            chat_history=chat_history,
-            user_text=user_text,
-            json_schema=CHAT_TURN_SCHEMA,
-            schema_name="chat_turn",
-        )
-        parsed = result.get("parsed") or {}
-        raw_answer = parsed.get("answer", "")
-        raw_quotes = parsed.get("quotes", []) or []
-
-        # Filter rids the model invented (not in corpus). Without this
-        # guard the frontend renders pills whose popovers can't resolve.
-        valid_rids = {e["rid"] for e in corpus}
-        cleaned_text, cited_rids = parse_inline_citations(raw_answer, valid_rids)
-
-        # Validate each quote against the cited rid's corpus text. A
-        # verified quote becomes the popover content; unverified ones
-        # leave `quote_text` empty (popover falls back to session text).
-        corpus_by_rid_norm = {
-            e["rid"]: _normalize_for_quote_match(e["text"]) for e in corpus
-        }
-        quote_text_by_rid: dict[str, str] = {}
-        for q in raw_quotes:
-            rid = q.get("rid", "")
-            qtext = q.get("text", "")
-            if not rid or not qtext or rid not in valid_rids:
-                continue
-            source = corpus_by_rid_norm.get(rid, "")
-            if _normalize_for_quote_match(qtext) in source:
-                # Keep the first verified quote per rid (model may emit
-                # multiple; we only render one inline in the popover).
-                quote_text_by_rid.setdefault(rid, qtext)
-
-        # Build full cited array with pill indices and quote text.
-        cited = []
-        for i, rid in enumerate(cited_rids, 1):
-            cited.append({
-                'rid': rid,
-                'pill_index': i,
-                'verdict': None,
-                'quote_text': quote_text_by_rid.get(rid, ''),
-            })
-
-        # Verify citations (graceful — never raises)
-        if cited:
-            pseudo_bullets = [{"text": cleaned_text, "cited_ids": cited_rids}]
-            try:
-                verification = verify_claims(corpus=corpus, bullets=pseudo_bullets)
-                verdict_map = {v['source_id']: v['verdict'] for v in verification}
-                for c in cited:
-                    c['verdict'] = verdict_map.get(c['rid'])
-            except Exception:
-                pass  # leave verdicts as None
-
-        # Save assistant message
         assistant_msg = LEAIChatMessage.objects.create(
             session=session,
             role="assistant",
             text=cleaned_text,
             cited=cited,
         )
-
     return assistant_msg
+
+
+def start_chat_turn_job(
+    session: LEAIChatSession,
+    user_text: str,
+) -> tuple[LEAIChatMessage, LEAIChatMessage]:
+    """Async chat turn: save user msg + pending assistant placeholder, spawn
+    a worker thread, return both rows immediately.
+
+    The HTTP request returns 202 with the placeholder; the frontend polls
+    ``GET /api/leai_chat_sessions/<sid>/messages/<mid>/`` until status
+    flips to ready or failed. This keeps the request well under Heroku's
+    30s router timeout regardless of how many surveys are in scope.
+
+    Raises:
+        ValueError on empty user_text.
+    """
+    user_text = (user_text or "").strip()
+    if not user_text:
+        raise ValueError("user_text is required")
+
+    now = timezone.now()
+    with transaction.atomic():
+        user_msg = LEAIChatMessage.objects.create(
+            session=session,
+            role="user",
+            text=user_text,
+            cited=[],
+            status=LEAIChatMessage.STATUS_READY,
+        )
+        assistant_msg = LEAIChatMessage.objects.create(
+            session=session,
+            role="assistant",
+            text="",
+            cited=[],
+            status=LEAIChatMessage.STATUS_PENDING,
+            job_started_at=now,
+        )
+
+    def _worker(session_pk, user_msg_pk, assistant_msg_pk, user_text_local):
+        try:
+            sess = LEAIChatSession.objects.get(pk=session_pk)
+            LEAIChatMessage.objects.filter(pk=assistant_msg_pk).update(
+                status=LEAIChatMessage.STATUS_RUNNING,
+            )
+            cleaned_text, cited = _generate_assistant_response(
+                sess,
+                user_text_local,
+                exclude_message_pks=[user_msg_pk, assistant_msg_pk],
+            )
+            LEAIChatMessage.objects.filter(pk=assistant_msg_pk).update(
+                text=cleaned_text,
+                cited=cited,
+                status=LEAIChatMessage.STATUS_READY,
+                error="",
+            )
+        except ValueError as e:
+            LEAIChatMessage.objects.filter(pk=assistant_msg_pk).update(
+                status=LEAIChatMessage.STATUS_FAILED, error=str(e),
+            )
+        except openai_client.OpenAIRefusalError as e:
+            LEAIChatMessage.objects.filter(pk=assistant_msg_pk).update(
+                status=LEAIChatMessage.STATUS_FAILED,
+                error=getattr(e, "detail", str(e)),
+            )
+        except openai_client.OpenAIClientError as e:
+            LEAIChatMessage.objects.filter(pk=assistant_msg_pk).update(
+                status=LEAIChatMessage.STATUS_FAILED,
+                error=getattr(e, "detail", str(e)),
+            )
+        except Exception as e:
+            logger.exception("chat turn worker crashed for msg=%s", assistant_msg_pk)
+            LEAIChatMessage.objects.filter(pk=assistant_msg_pk).update(
+                status=LEAIChatMessage.STATUS_FAILED,
+                error=f"Internal error: {type(e).__name__}",
+            )
+        finally:
+            # Close this thread's DB connection so long-running daemons
+            # don't leak — but skip when the worker is running on the
+            # main thread (unit tests using an inline Thread shim);
+            # closing the test's connection would break subsequent
+            # assertions on the same TestCase.
+            if threading.current_thread() is not threading.main_thread():
+                connection.close()
+
+    thread = threading.Thread(
+        target=_worker,
+        args=(session.pk, user_msg.pk, assistant_msg.pk, user_text),
+        name=f"chat-turn-{assistant_msg.pk}",
+        daemon=True,
+    )
+    thread.start()
+    return user_msg, assistant_msg

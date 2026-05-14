@@ -44,6 +44,7 @@ urlpatterns = [
     path('api/leai_chat_sessions/', views.leai_chat_sessions_list, name='leai_chat_sessions_list'),
     path('api/leai_chat_sessions/<uuid:session_id>/', views.leai_chat_session_detail, name='leai_chat_session_detail'),
     path('api/leai_chat_sessions/<uuid:session_id>/turn/', views.leai_chat_session_turn, name='leai_chat_session_turn'),
+    path('api/leai_chat_sessions/<uuid:session_id>/messages/<int:message_id>/', views.leai_chat_message_detail, name='leai_chat_message_detail'),
     path('api/leai_quicktake/generate/', views.leai_quicktake_generate, name='leai_quicktake_generate'),
     path('api/leai_quicktake/', views.leai_quicktake_fetch_or_delete, name='leai_quicktake'),
     # In-Group feedback: team configurations + survey snapshots + session assignments

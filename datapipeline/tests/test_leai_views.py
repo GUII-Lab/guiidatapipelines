@@ -287,7 +287,24 @@ class ChatSessionTurnTest(TestCase):
         )
         self.url = f"/datapipeline/api/leai_chat_sessions/{self.session.pk}/turn/"
 
-    def test_successful_turn_returns_assistant_message(self):
+    def _run_worker_inline(self):
+        """Replace threading.Thread inside leai_analysis so the worker
+        executes on the request thread — tests stay synchronous while the
+        production view still spawns a real daemon thread."""
+        class _InlineThread:
+            def __init__(self, target=None, args=(), name=None, daemon=None,
+                         **kwargs):
+                self._target = target
+                self._args = args
+
+            def start(self):
+                self._target(*self._args)
+
+        return patch(
+            "datapipeline.leai_analysis.threading.Thread", _InlineThread,
+        )
+
+    def test_successful_turn_returns_pending_then_ready(self):
         # Phase 6: chat turns go through run_structured for both the chat
         # answer and the verifier. side_effect feeds them in order.
         chat_result = {
@@ -307,19 +324,26 @@ class ChatSessionTurnTest(TestCase):
             "usage": {},
         }
         with patch.object(openai_client, "run_structured",
-                          side_effect=[chat_result, verifier_result]):
-            resp = _post(self.client, self.url, {"user_text": "What are the main themes?"})
+                          side_effect=[chat_result, verifier_result]), \
+                self._run_worker_inline():
+            resp = _post(self.client, self.url,
+                         {"user_text": "What are the main themes?"})
 
-        self.assertEqual(resp.status_code, 200)
+        # 202 with pending placeholder + user message saved synchronously.
+        self.assertEqual(resp.status_code, 202)
         data = resp.json()
         self.assertIn("message", data)
+        self.assertIn("user_message", data)
         self.assertEqual(data["message"]["role"], "assistant")
-        # Citations replaced: [R1] -> [1], [R2] -> [2]
-        self.assertIn("[1]", data["message"]["text"])
+        self.assertEqual(data["user_message"]["role"], "user")
         self.assertIn("session_updated_at", data)
-        # Verified quote attached to its citation.
-        cited = data["message"]["cited"]
-        rid_to_quote = {c["rid"]: c["quote_text"] for c in cited}
+
+        # Worker ran inline, so the DB now has the ready assistant message.
+        msg = LEAIChatMessage.objects.get(pk=data["message"]["id"])
+        self.assertEqual(msg.status, LEAIChatMessage.STATUS_READY)
+        # Citations replaced: [R1] -> [1], [R2] -> [2]
+        self.assertIn("[1]", msg.text)
+        rid_to_quote = {c["rid"]: c["quote_text"] for c in msg.cited}
         self.assertEqual(rid_to_quote["R1"], "Feedback 0")
 
     def test_empty_user_text_returns_400(self):
@@ -330,23 +354,75 @@ class ChatSessionTurnTest(TestCase):
         resp = _post(self.client, self.url, {})
         self.assertEqual(resp.status_code, 400)
 
-    def test_llm_refusal_returns_422(self):
+    def test_llm_refusal_marks_message_failed(self):
         with patch.object(openai_client, "run_structured",
-                          side_effect=openai_client.OpenAIRefusalError("refused")):
+                          side_effect=openai_client.OpenAIRefusalError("refused")), \
+                self._run_worker_inline():
             resp = _post(self.client, self.url, {"user_text": "Tell me something"})
-        self.assertEqual(resp.status_code, 422)
 
-    def test_llm_error_returns_502(self):
+        self.assertEqual(resp.status_code, 202)
+        msg = LEAIChatMessage.objects.get(pk=resp.json()["message"]["id"])
+        self.assertEqual(msg.status, LEAIChatMessage.STATUS_FAILED)
+        self.assertTrue(msg.error)
+
+    def test_llm_error_marks_message_failed(self):
         with patch.object(openai_client, "run_structured",
-                          side_effect=openai_client.OpenAIClientError("network error", 502)):
+                          side_effect=openai_client.OpenAIClientError(
+                              "network error", 502)), \
+                self._run_worker_inline():
             resp = _post(self.client, self.url, {"user_text": "Tell me something"})
-        self.assertEqual(resp.status_code, 502)
+
+        self.assertEqual(resp.status_code, 202)
+        msg = LEAIChatMessage.objects.get(pk=resp.json()["message"]["id"])
+        self.assertEqual(msg.status, LEAIChatMessage.STATUS_FAILED)
+        self.assertIn("network error", msg.error)
 
     def test_session_not_found_returns_404(self):
         import uuid
         url = f"/datapipeline/api/leai_chat_sessions/{uuid.uuid4()}/turn/"
         resp = _post(self.client, url, {"user_text": "Hello"})
         self.assertEqual(resp.status_code, 404)
+
+    def test_message_detail_returns_status(self):
+        # Create a pending assistant message directly, then GET it.
+        msg = LEAIChatMessage.objects.create(
+            session=self.session, role="assistant", text="",
+            cited=[], status=LEAIChatMessage.STATUS_PENDING,
+        )
+        url = (f"/datapipeline/api/leai_chat_sessions/{self.session.pk}"
+               f"/messages/{msg.pk}/")
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["id"], msg.pk)
+        self.assertEqual(data["status"], LEAIChatMessage.STATUS_PENDING)
+        self.assertEqual(data["role"], "assistant")
+
+    def test_message_detail_404_for_unknown_message(self):
+        url = (f"/datapipeline/api/leai_chat_sessions/{self.session.pk}"
+               f"/messages/999999/")
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 404)
+
+    def test_message_detail_recovers_stale_pending(self):
+        # A pending message past the stale threshold gets reported as failed.
+        from datetime import timedelta
+        from django.utils import timezone
+        from datapipeline import leai_analysis
+        msg = LEAIChatMessage.objects.create(
+            session=self.session, role="assistant", text="",
+            cited=[], status=LEAIChatMessage.STATUS_PENDING,
+            job_started_at=timezone.now() - timedelta(
+                seconds=leai_analysis.CHAT_TURN_JOB_STALE_SECONDS + 60,
+            ),
+        )
+        url = (f"/datapipeline/api/leai_chat_sessions/{self.session.pk}"
+               f"/messages/{msg.pk}/")
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], LEAIChatMessage.STATUS_FAILED)
+        self.assertTrue(data["error"])
 
 
 # ---------------------------------------------------------------------------

@@ -307,7 +307,13 @@ class LEAIChatSession(models.Model):
 
 
 class LEAIChatMessage(models.Model):
-    """One turn in a Feedback Chat session."""
+    """One turn in a Feedback Chat session.
+
+    Assistant messages are generated asynchronously: the turn endpoint
+    saves a placeholder with status=pending and a worker thread populates
+    text/cited then flips status to ready (or failed). User and system
+    messages are always written with status=ready.
+    """
 
     ROLE_CHOICES = [
         ('user', 'user'),
@@ -315,12 +321,28 @@ class LEAIChatMessage(models.Model):
         ('system', 'system'),
     ]
 
+    STATUS_PENDING = 'pending'
+    STATUS_RUNNING = 'running'
+    STATUS_READY = 'ready'
+    STATUS_FAILED = 'failed'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_RUNNING, 'Running'),
+        (STATUS_READY, 'Ready'),
+        (STATUS_FAILED, 'Failed'),
+    ]
+
     session = models.ForeignKey(
         LEAIChatSession, on_delete=models.CASCADE, related_name='messages',
     )
     role = models.CharField(max_length=16, choices=ROLE_CHOICES)
-    text = models.TextField()
+    text = models.TextField(blank=True)
     cited = models.JSONField(default=list, blank=True)
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default=STATUS_READY,
+    )
+    error = models.TextField(blank=True, default='')
+    job_started_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

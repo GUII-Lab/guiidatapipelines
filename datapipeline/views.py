@@ -1163,6 +1163,37 @@ def openai_stt(request):
 # LEAI Chat Session helpers
 # ---------------------------------------------------------------------------
 
+def _chat_message_to_dict(msg):
+    """Serialize a LEAIChatMessage to a plain dict for API responses."""
+    return {
+        'id': msg.pk,
+        'role': msg.role,
+        'text': msg.text,
+        'cited': msg.cited,
+        'status': msg.status,
+        'error': msg.error,
+        'created_at': msg.created_at.isoformat(),
+    }
+
+
+def _recover_stale_chat_messages(session):
+    """Flip any of this session's pending/running messages past the stale
+    threshold to failed, so the UI can retry instead of polling forever
+    after a dyno cycle mid-turn. Mirrors the QuickTake recovery path."""
+    from . import leai_analysis
+    pending = session.messages.filter(
+        status__in=[
+            LEAIChatMessage.STATUS_PENDING, LEAIChatMessage.STATUS_RUNNING,
+        ]
+    )
+    stale_pks = [m.pk for m in pending if leai_analysis._is_chat_message_stale(m)]
+    if stale_pks:
+        LEAIChatMessage.objects.filter(pk__in=stale_pks).update(
+            status=LEAIChatMessage.STATUS_FAILED,
+            error='Generation did not complete in time. Please retry.',
+        )
+
+
 def _session_detail_response(session, status=200):
     """Serialize a LEAIChatSession (with messages) to a JsonResponse.
 
@@ -1172,9 +1203,10 @@ def _session_detail_response(session, status=200):
     without rebuilding the index (and without risking a scope mismatch
     that would silently show the wrong response text).
     """
+    _recover_stale_chat_messages(session)
     messages = list(
         session.messages.order_by('created_at').values(
-            'id', 'role', 'text', 'cited', 'created_at'
+            'id', 'role', 'text', 'cited', 'status', 'error', 'created_at'
         )
     )
     for m in messages:
@@ -1389,7 +1421,17 @@ def leai_chat_session_detail(request, session_id):
 
 @csrf_exempt
 def leai_chat_session_turn(request, session_id):
-    """POST /api/leai_chat_sessions/<uuid>/turn/"""
+    """POST /api/leai_chat_sessions/<uuid>/turn/
+
+    Enqueues a chat turn in a background thread and returns 202 with both
+    the saved user message and the placeholder assistant message
+    (status=pending). Clients poll
+    ``GET /api/leai_chat_sessions/<uuid>/messages/<id>/`` on the assistant
+    message until status flips to ready or failed.
+
+    Async because corpus build + LLM call + verify_claims can exceed
+    Heroku's 30s router timeout once the scope spans multiple surveys.
+    """
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
@@ -1409,25 +1451,46 @@ def leai_chat_session_turn(request, session_id):
 
     from . import leai_analysis
     try:
-        assistant_msg = leai_analysis.run_chat_turn(session, user_text)
+        user_msg, assistant_msg = leai_analysis.start_chat_turn_job(
+            session=session, user_text=user_text,
+        )
     except ValueError as e:
         return JsonResponse({'error': str(e)}, status=400)
-    except openai_client.OpenAIRefusalError as e:
-        return JsonResponse({'error': e.detail}, status=422)
-    except openai_client.OpenAIClientError as e:
-        return JsonResponse({'error': e.detail}, status=e.status_code)
 
-    session.refresh_from_db()
     return JsonResponse({
-        'message': {
-            'id': assistant_msg.pk,
-            'role': assistant_msg.role,
-            'text': assistant_msg.text,
-            'cited': assistant_msg.cited,
-            'created_at': assistant_msg.created_at.isoformat(),
-        },
+        'user_message': _chat_message_to_dict(user_msg),
+        'message': _chat_message_to_dict(assistant_msg),
         'session_updated_at': session.updated_at.isoformat(),
-    })
+    }, status=202)
+
+
+@csrf_exempt
+def leai_chat_message_detail(request, session_id, message_id):
+    """GET /api/leai_chat_sessions/<uuid>/messages/<int>/
+
+    Returns a single chat message. Used by the frontend to poll a pending
+    assistant message until its status is ready or failed. Mirrors the
+    stale-recovery semantics of leai_quicktake_fetch_or_delete: a
+    pending/running row past CHAT_TURN_JOB_STALE_SECONDS is reported as
+    failed so the UI can retry.
+    """
+    if request.method != 'GET':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+    try:
+        msg = LEAIChatMessage.objects.get(pk=message_id, session_id=session_id)
+    except LEAIChatMessage.DoesNotExist:
+        return JsonResponse({'error': 'Message not found'}, status=404)
+
+    from . import leai_analysis
+    if leai_analysis._is_chat_message_stale(msg):
+        LEAIChatMessage.objects.filter(pk=msg.pk).update(
+            status=LEAIChatMessage.STATUS_FAILED,
+            error='Generation did not complete in time. Please retry.',
+        )
+        msg.refresh_from_db()
+
+    return JsonResponse(_chat_message_to_dict(msg))
 
 
 # ---------------------------------------------------------------------------
