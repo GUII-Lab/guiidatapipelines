@@ -192,6 +192,46 @@ class ChatSessionDetailTest(TestCase):
         self.assertEqual(len(data["messages"]), 1)
         self.assertEqual(data["messages"][0]["role"], "user")
 
+    def test_get_session_includes_corpus_keyed_by_rid(self):
+        # The session-detail endpoint must ship the same corpus the chat
+        # turn used, so the frontend can resolve citation popovers without
+        # rebuilding (and risking a scope mismatch).
+        survey = _make_survey(self.course, week_number=1)
+        _make_msg(survey, session_id="sa", content="First reflection")
+        _make_msg(survey, session_id="sb", content="Second reflection")
+
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+
+        self.assertIn("corpus", data)
+        rids = [e["rid"] for e in data["corpus"]]
+        # R1, R2 in deterministic backend order
+        self.assertEqual(rids, ["R1", "R2"])
+        # Each entry carries the metadata the frontend needs for the popover
+        first = data["corpus"][0]
+        for key in ("rid", "text", "session_id", "week_number"):
+            self.assertIn(key, first)
+
+    def test_get_session_corpus_respects_week_scope(self):
+        # With a week-scoped session, the corpus only contains that week's
+        # sessions — and the rid numbering reflects that narrower set.
+        wk1 = _make_survey(self.course, week_number=1, suffix="a")
+        wk2 = _make_survey(self.course, week_number=2, suffix="b")
+        _make_msg(wk1, "sa", "wk1 only")
+        _make_msg(wk2, "sb", "wk2 only")
+
+        self.session.scope_kind = "week"
+        self.session.scope_week_number = 2
+        self.session.save()
+
+        resp = self.client.get(self.url)
+        data = resp.json()
+        rids = [e["rid"] for e in data["corpus"]]
+        texts = [e["text"] for e in data["corpus"]]
+        self.assertEqual(rids, ["R1"])
+        self.assertEqual(texts, ["wk2 only"])
+
     def test_get_session_404(self):
         import uuid
         resp = self.client.get(f"/datapipeline/api/leai_chat_sessions/{uuid.uuid4()}/")
@@ -248,13 +288,26 @@ class ChatSessionTurnTest(TestCase):
         self.url = f"/datapipeline/api/leai_chat_sessions/{self.session.pk}/turn/"
 
     def test_successful_turn_returns_assistant_message(self):
-        mock_chat_result = {"response": "Great insights [R1][R2].", "usage": {}}
-        mock_struct_result = {
-            "parsed": {"results": [{"bullet_index": 0, "source_id": "R1", "verdict": "supported"}]},
+        # Phase 6: chat turns go through run_structured for both the chat
+        # answer and the verifier. side_effect feeds them in order.
+        chat_result = {
+            "response": '{"answer":"Great insights [R1][R2].","quotes":[]}',
+            "parsed": {
+                "answer": "Great insights [R1][R2].",
+                "quotes": [
+                    {"rid": "R1", "text": "Feedback 0"},
+                    {"rid": "R2", "text": "Feedback 1"},
+                ],
+            },
             "usage": {},
         }
-        with patch.object(openai_client, "run_chat", return_value=mock_chat_result) as m_chat, \
-             patch.object(openai_client, "run_structured", return_value=mock_struct_result):
+        verifier_result = {
+            "parsed": {"results": [{"bullet_index": 0, "source_id": "R1",
+                                    "verdict": "supported"}]},
+            "usage": {},
+        }
+        with patch.object(openai_client, "run_structured",
+                          side_effect=[chat_result, verifier_result]):
             resp = _post(self.client, self.url, {"user_text": "What are the main themes?"})
 
         self.assertEqual(resp.status_code, 200)
@@ -264,6 +317,10 @@ class ChatSessionTurnTest(TestCase):
         # Citations replaced: [R1] -> [1], [R2] -> [2]
         self.assertIn("[1]", data["message"]["text"])
         self.assertIn("session_updated_at", data)
+        # Verified quote attached to its citation.
+        cited = data["message"]["cited"]
+        rid_to_quote = {c["rid"]: c["quote_text"] for c in cited}
+        self.assertEqual(rid_to_quote["R1"], "Feedback 0")
 
     def test_empty_user_text_returns_400(self):
         resp = _post(self.client, self.url, {"user_text": ""})
@@ -274,16 +331,14 @@ class ChatSessionTurnTest(TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_llm_refusal_returns_422(self):
-        with patch.object(openai_client, "run_chat",
-                          side_effect=openai_client.OpenAIRefusalError("refused")), \
-             patch.object(openai_client, "run_structured", return_value={"parsed": {"results": []}, "usage": {}}):
+        with patch.object(openai_client, "run_structured",
+                          side_effect=openai_client.OpenAIRefusalError("refused")):
             resp = _post(self.client, self.url, {"user_text": "Tell me something"})
         self.assertEqual(resp.status_code, 422)
 
     def test_llm_error_returns_502(self):
-        with patch.object(openai_client, "run_chat",
-                          side_effect=openai_client.OpenAIClientError("network error", 502)), \
-             patch.object(openai_client, "run_structured", return_value={"parsed": {"results": []}, "usage": {}}):
+        with patch.object(openai_client, "run_structured",
+                          side_effect=openai_client.OpenAIClientError("network error", 502)):
             resp = _post(self.client, self.url, {"user_text": "Tell me something"})
         self.assertEqual(resp.status_code, 502)
 

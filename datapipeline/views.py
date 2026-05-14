@@ -1164,7 +1164,14 @@ def openai_stt(request):
 # ---------------------------------------------------------------------------
 
 def _session_detail_response(session, status=200):
-    """Serialize a LEAIChatSession (with messages) to a JsonResponse."""
+    """Serialize a LEAIChatSession (with messages) to a JsonResponse.
+
+    Includes a `corpus` array built with the session's own scope. This is
+    the authoritative rid→response mapping the assistant used when
+    generating turns, so the frontend can resolve citation popovers
+    without rebuilding the index (and without risking a scope mismatch
+    that would silently show the wrong response text).
+    """
     messages = list(
         session.messages.order_by('created_at').values(
             'id', 'role', 'text', 'cited', 'created_at'
@@ -1172,6 +1179,17 @@ def _session_detail_response(session, status=200):
     )
     for m in messages:
         m['created_at'] = m['created_at'].isoformat()
+
+    # Build the same corpus the chat turn used. Cheap (read-only query +
+    # in-memory group/sort) and small enough to ship in the detail payload.
+    from . import leai_analysis
+    corpus = leai_analysis.build_response_corpus(
+        course=session.course,
+        scope_kind=session.scope_kind,
+        scope_week_number=session.scope_week_number,
+        scope_survey_ids=list(session.scope_survey_ids or []),
+        scope_session_ids=list(session.scope_session_ids or []),
+    )
 
     return JsonResponse({
         'id': str(session.pk),
@@ -1187,6 +1205,7 @@ def _session_detail_response(session, status=200):
         'created_at': session.created_at.isoformat(),
         'updated_at': session.updated_at.isoformat(),
         'messages': messages,
+        'corpus': corpus,
     }, status=status)
 
 
@@ -1197,6 +1216,10 @@ def _quicktake_to_dict(qt):
         'course_id': qt.course.course_id,
         'scope_key': qt.scope_key,
         'bullets': qt.bullets,
+        'tensions': qt.tensions,
+        'gaps': qt.gaps,
+        'team_health': qt.team_health,
+        'form_sections': qt.form_sections,
         'verification': qt.verification,
         'system_prompt': qt.system_prompt,
         'user_text': qt.user_text,

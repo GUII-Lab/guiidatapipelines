@@ -350,6 +350,18 @@ class LEAIQuickTake(models.Model):
     )
     scope_key = models.CharField(max_length=64)
     bullets = models.JSONField(default=list)
+    # Phase 5: disagreements (tensions) and noticeable absences (gaps).
+    # Older rows have default empty arrays; the frontend renders them
+    # only when present.
+    tensions = models.JSONField(default=list, blank=True)
+    gaps = models.JSONField(default=list, blank=True)
+    # Phase 7: per-team rollup, populated only when the scope contains
+    # group-mode survey responses. Same nullable-empty contract as
+    # tensions/gaps so older rows continue to deserialize.
+    team_health = models.JSONField(default=list, blank=True)
+    # Phase 8: per-form-section rollup, populated only when the scope
+    # contains form-mode (mode='form') survey responses.
+    form_sections = models.JSONField(default=list, blank=True)
     verification = models.JSONField(default=list)
     system_prompt = models.TextField()
     user_text = models.TextField()
