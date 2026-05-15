@@ -47,6 +47,14 @@ urlpatterns = [
     path('api/leai_chat_sessions/<uuid:session_id>/messages/<int:message_id>/', views.leai_chat_message_detail, name='leai_chat_message_detail'),
     path('api/leai_quicktake/generate/', views.leai_quicktake_generate, name='leai_quicktake_generate'),
     path('api/leai_quicktake/', views.leai_quicktake_fetch_or_delete, name='leai_quicktake'),
+    # LEAI PDF reflection ingest
+    path('api/leai_pdf_ingest/start/', views.leai_pdf_ingest_start, name='leai_pdf_ingest_start'),
+    path('api/leai_pdf_ingest/roster/', views.leai_pdf_ingest_roster, name='leai_pdf_ingest_roster'),
+    path('api/leai_pdf_ingest/dedup_check/', views.leai_pdf_ingest_dedup_check, name='leai_pdf_ingest_dedup_check'),
+    path('api/leai_pdf_ingest/<uuid:job_id>/', views.leai_pdf_ingest_detail, name='leai_pdf_ingest_detail'),
+    path('api/leai_pdf_ingest/<uuid:job_id>/commit/', views.leai_pdf_ingest_commit, name='leai_pdf_ingest_commit'),
+    path('api/leai_pdf_ingest_batches/', views.leai_pdf_ingest_batches_list, name='leai_pdf_ingest_batches_list'),
+    path('api/leai_pdf_ingest_batches/<uuid:batch_id>/revert/', views.leai_pdf_ingest_batch_revert, name='leai_pdf_ingest_batch_revert'),
     # In-Group feedback: team configurations + survey snapshots + session assignments
     path('api/team_configurations/', list_team_configurations, name='list_team_configurations'),
     path('api/team_configurations/create/', create_team_configuration, name='create_team_configuration'),

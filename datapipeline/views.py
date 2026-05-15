@@ -494,6 +494,10 @@ def feedback_messages_by_gpt(request):
                 'sent_by': m.sent_by,
                 'content': m.content,
                 'created_at': m.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                # New: tells the analyzer this row is from an instructor-
+                # uploaded PDF (renders 📄 badge + drives Source filter).
+                'source': m.source,
+                'pdf_batch_id': str(m.pdf_batch_id) if m.pdf_batch_id else None,
             })
         return JsonResponse({
             'sessions': dict(sessions),
@@ -523,6 +527,8 @@ def feedback_messages_by_course(request):
                     'sent_by': m.sent_by,
                     'content': m.content,
                     'created_at': m.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                    'source': m.source,
+                    'pdf_batch_id': str(m.pdf_batch_id) if m.pdf_batch_id else None,
                 })
             session_count = len(sessions)
             msg_count = messages.count()
@@ -1922,3 +1928,317 @@ def list_survey_team_assignments(request):
         return JsonResponse([], safe=False)
     assignments = SessionTeamAssignment.objects.filter(survey_team__snapshot=snap)
     return JsonResponse([_assignment_to_dict(a) for a in assignments], safe=False)
+
+
+# =========================================================================
+# LEAI PDF reflection ingest
+# =========================================================================
+# Instructor uploads PDFs of student template-style reflections in
+# FeedbackAnalyzer; we parse, propose a section→prompt mapping, let the
+# instructor confirm/edit, then commit as FeedbackMessage rows that blend
+# into the existing analytics surface. Every commit produces a batch row
+# the instructor can revert from the UI.
+
+def _job_to_dict(job) -> dict:
+    """Serialise an LEAIPdfIngestJob for the polling client."""
+    from . import leai_pdf_ingest
+    # Always refresh from DB — the worker thread mutates status/items
+    # asynchronously and the caller's instance can be stale (especially
+    # under inline-thread tests, where the worker has already finished
+    # by the time the view serialises).
+    job.refresh_from_db()
+    # Apply stale recovery on read so a dyno-cycle zombie surfaces as
+    # failed (mirrors the chat-turn / quicktake pattern).
+    if leai_pdf_ingest.is_job_stale(job):
+        LEAIPdfIngestJob.objects.filter(pk=job.pk).update(
+            status=LEAIPdfIngestJob.STATUS_FAILED,
+            error='Processing took too long. Please try again with fewer files.',
+        )
+        job.refresh_from_db()
+    schema_body = job.survey.form_schema.body if job.survey.form_schema_id else None
+    prompts = leai_pdf_ingest.flatten_prompts_from_schema(schema_body)
+    return {
+        'job_id': str(job.id),
+        'survey_id': job.survey_id,
+        'status': job.status,
+        'progress': job.progress or {},
+        'items': job.items or [],
+        'prompts': prompts,
+        'error': job.error or '',
+        'created_at': job.created_at.isoformat() if job.created_at else None,
+        'updated_at': job.updated_at.isoformat() if job.updated_at else None,
+    }
+
+
+def _batch_to_dict(batch) -> dict:
+    return {
+        'batch_id': str(batch.id),
+        'survey_id': batch.survey_id,
+        'committed_by': batch.committed_by,
+        'student_count': batch.student_count,
+        'message_count': batch.message_count,
+        'items_summary': batch.items_summary or [],
+        'reverted_at': batch.reverted_at.isoformat() if batch.reverted_at else None,
+        'created_at': batch.created_at.isoformat() if batch.created_at else None,
+    }
+
+
+@csrf_exempt
+def leai_pdf_ingest_start(request):
+    """POST /api/leai_pdf_ingest/start/ — multipart upload.
+
+    Form fields:
+        survey_id: int
+        attributions: JSON {filename: student_id}
+        created_by: str (optional)
+        files: one or more uploaded PDFs (form field name 'files')
+
+    Returns 202 with the job descriptor (status='pending'). Worker
+    runs in a background thread; client polls
+    GET /api/leai_pdf_ingest/<job_id>/.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+    survey_id = request.POST.get('survey_id') or request.POST.get('surveyId')
+    if not survey_id:
+        return JsonResponse({'error': 'survey_id is required'}, status=400)
+    try:
+        survey = FeedbackGPT.objects.select_related('form_schema').get(pk=int(survey_id))
+    except (FeedbackGPT.DoesNotExist, ValueError, TypeError):
+        return JsonResponse({'error': 'Survey not found'}, status=404)
+
+    if survey.mode != 'form' or not survey.form_schema_id:
+        return JsonResponse(
+            {'error': 'PDF ingest is only available for Structured Reflection surveys.'},
+            status=400,
+        )
+
+    try:
+        attributions_raw = request.POST.get('attributions') or '{}'
+        attributions = json.loads(attributions_raw)
+        if not isinstance(attributions, dict):
+            raise ValueError('attributions must be a JSON object')
+    except (json.JSONDecodeError, ValueError) as e:
+        return JsonResponse({'error': f'Bad attributions: {e}'}, status=400)
+
+    uploaded = request.FILES.getlist('files')
+    if not uploaded:
+        return JsonResponse({'error': 'No files uploaded.'}, status=400)
+
+    files: list[tuple[str, bytes]] = []
+    for f in uploaded:
+        files.append((f.name, f.read()))
+
+    from . import leai_pdf_ingest
+    try:
+        job = leai_pdf_ingest.start_pdf_ingest_job(
+            survey=survey,
+            files=files,
+            attributions={str(k): str(v) for k, v in attributions.items()},
+            created_by=request.POST.get('created_by') or '',
+        )
+    except ValueError as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+    return JsonResponse(_job_to_dict(job), status=202)
+
+
+@csrf_exempt
+def leai_pdf_ingest_detail(request, job_id):
+    """GET/DELETE /api/leai_pdf_ingest/<job_id>/
+
+    GET — poll for status + items. Stale recovery applies.
+    DELETE — abandon a preview without committing.
+    """
+    try:
+        job = LEAIPdfIngestJob.objects.select_related('survey', 'survey__form_schema').get(pk=job_id)
+    except LEAIPdfIngestJob.DoesNotExist:
+        return JsonResponse({'error': 'Job not found'}, status=404)
+
+    if request.method == 'GET':
+        return JsonResponse(_job_to_dict(job))
+    if request.method == 'DELETE':
+        job.delete()
+        return HttpResponse(status=204)
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+
+@csrf_exempt
+def leai_pdf_ingest_commit(request, job_id):
+    """POST /api/leai_pdf_ingest/<job_id>/commit/
+
+    Body:
+        {items: [{filename, student_id, mapping, skip}], dedup_decisions: {sid: 'replace'|'skip'|'add'}, committed_by: str}
+
+    Writes FeedbackMessage rows + creates an LEAIPdfIngestBatch.
+    Invalidates the course's Quick Takes. Deletes the preview job.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+    try:
+        job = LEAIPdfIngestJob.objects.select_related('survey', 'survey__form_schema').get(pk=job_id)
+    except LEAIPdfIngestJob.DoesNotExist:
+        return JsonResponse({'error': 'Job not found'}, status=404)
+    try:
+        data = json.loads(request.body or '{}')
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+    items = data.get('items') or []
+    dedup = data.get('dedup_decisions') or {}
+    committed_by = data.get('committed_by') or ''
+    if not isinstance(items, list) or not isinstance(dedup, dict):
+        return JsonResponse({'error': 'items must be a list, dedup_decisions a dict'}, status=400)
+
+    from . import leai_pdf_ingest
+    try:
+        batch = leai_pdf_ingest.commit_pdf_ingest_job(
+            job=job,
+            confirmed_items=items,
+            dedup_decisions={str(k): str(v) for k, v in dedup.items()},
+            committed_by=str(committed_by),
+        )
+    except ValueError as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
+    return JsonResponse({
+        'batch': _batch_to_dict(batch),
+        'committed_count': batch.message_count,
+        'students_affected': batch.student_count,
+    })
+
+
+@csrf_exempt
+def leai_pdf_ingest_roster(request):
+    """GET /api/leai_pdf_ingest/roster/?survey_id=<id>
+
+    Returns the per-survey roster the upload UI uses to attribute PDFs.
+    Combines:
+      1. Students who've submitted to any survey in this course (so the
+         instructor sees the natural roster, not just the current survey).
+      2. Students who already have PDF responses on this specific
+         survey (used to flag dedup before commit).
+
+    Response:
+        {
+          'students': [{'student_id': str, 'submitted_to_this_survey': bool,
+                        'has_pdf_on_this_survey': bool, 'submission_count': int}],
+        }
+    """
+    if request.method != 'GET':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+    survey_id = request.GET.get('survey_id')
+    if not survey_id:
+        return JsonResponse({'error': 'survey_id is required'}, status=400)
+    try:
+        survey = FeedbackGPT.objects.select_related('course').get(pk=int(survey_id))
+    except (FeedbackGPT.DoesNotExist, ValueError, TypeError):
+        return JsonResponse({'error': 'Survey not found'}, status=404)
+
+    course = survey.course
+    course_surveys = FeedbackGPT.objects.filter(course=course).values_list('id', flat=True) if course else [survey.id]
+    # Anonymous string ids are fine for our roster — the analyzer is
+    # already instructor-only and shows the same ids in the response
+    # browser. We exclude blank/None ids.
+    course_msgs = (
+        FeedbackMessage.objects
+        .filter(gpt_id__in=list(course_surveys))
+        .exclude(student_id__in=['', None])
+        .values('student_id', 'gpt_id', 'source')
+    )
+    by_student: dict[str, dict] = {}
+    for row in course_msgs:
+        sid = row['student_id']
+        rec = by_student.setdefault(sid, {
+            'student_id': sid,
+            'submitted_to_this_survey': False,
+            'has_pdf_on_this_survey': False,
+            'submission_count': 0,
+        })
+        rec['submission_count'] += 1
+        if int(row['gpt_id']) == int(survey.id):
+            rec['submitted_to_this_survey'] = True
+            if row['source'] == FeedbackMessage.SOURCE_PDF:
+                rec['has_pdf_on_this_survey'] = True
+
+    # Sort: this-survey submitters first, then by id
+    students = sorted(
+        by_student.values(),
+        key=lambda r: (not r['submitted_to_this_survey'], r['student_id']),
+    )
+    return JsonResponse({'students': students})
+
+
+@csrf_exempt
+def leai_pdf_ingest_dedup_check(request):
+    """POST /api/leai_pdf_ingest/dedup_check/
+
+    Body: {survey_id: int, student_ids: [str]}
+    Returns: {existing: [str]} — subset already having PDF responses.
+
+    Used by the commit modal to surface which students already have
+    PDF responses so the instructor can pick replace/skip/add per
+    student. Pure read, no side effects.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+    try:
+        data = json.loads(request.body or '{}')
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    survey_id = data.get('survey_id')
+    student_ids = data.get('student_ids') or []
+    if not survey_id or not isinstance(student_ids, list):
+        return JsonResponse({'error': 'survey_id + student_ids required'}, status=400)
+    try:
+        survey = FeedbackGPT.objects.get(pk=int(survey_id))
+    except (FeedbackGPT.DoesNotExist, ValueError, TypeError):
+        return JsonResponse({'error': 'Survey not found'}, status=404)
+    from . import leai_pdf_ingest
+    existing = leai_pdf_ingest.detect_existing_pdf_students(
+        survey=survey,
+        student_ids=[str(s) for s in student_ids if s],
+    )
+    return JsonResponse({'existing': existing})
+
+
+@csrf_exempt
+def leai_pdf_ingest_batches_list(request):
+    """GET /api/leai_pdf_ingest_batches/?survey_id=<id>[&include_reverted=1]
+
+    Lists ingest batches for a survey, newest first. Reverted batches
+    are excluded by default; pass include_reverted=1 to include them
+    (with a `reverted_at` timestamp on the row).
+    """
+    if request.method != 'GET':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+    survey_id = request.GET.get('survey_id')
+    if not survey_id:
+        return JsonResponse({'error': 'survey_id is required'}, status=400)
+    qs = LEAIPdfIngestBatch.objects.filter(survey_id=survey_id)
+    if request.GET.get('include_reverted') not in ('1', 'true', 'yes'):
+        qs = qs.filter(reverted_at__isnull=True)
+    return JsonResponse([_batch_to_dict(b) for b in qs.order_by('-created_at')[:100]], safe=False)
+
+
+@csrf_exempt
+def leai_pdf_ingest_batch_revert(request, batch_id):
+    """POST /api/leai_pdf_ingest_batches/<batch_id>/revert/
+
+    Hard-deletes the batch's FeedbackMessage rows, marks the batch
+    reverted, invalidates Quick Take. Idempotent — calling on an
+    already-reverted batch is a 409.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+    try:
+        batch = LEAIPdfIngestBatch.objects.select_related('survey').get(pk=batch_id)
+    except LEAIPdfIngestBatch.DoesNotExist:
+        return JsonResponse({'error': 'Batch not found'}, status=404)
+    if batch.reverted_at:
+        return JsonResponse({'error': 'Batch already reverted', 'batch': _batch_to_dict(batch)}, status=409)
+    from . import leai_pdf_ingest
+    deleted = leai_pdf_ingest.revert_pdf_ingest_batch(batch)
+    batch.refresh_from_db()
+    return JsonResponse({'deleted_count': deleted, 'batch': _batch_to_dict(batch)})

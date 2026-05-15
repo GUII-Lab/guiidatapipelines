@@ -26,6 +26,10 @@ class Message(models.Model):
         return f"{self.student_id} used {self.gpt_used}"
 
 class FeedbackMessage(models.Model):
+    SOURCE_CHAT = 'chat'
+    SOURCE_PDF = 'pdf'
+    SOURCE_CHOICES = [(SOURCE_CHAT, 'Chat'), (SOURCE_PDF, 'PDF')]
+
     session_id = models.CharField(max_length=100)
     student_id = models.CharField(max_length=100)
     sent_by = models.CharField(max_length = 20)
@@ -38,6 +42,18 @@ class FeedbackMessage(models.Model):
     # message. When False, the message must NOT be used for any GUII Lab
     # research analysis (Privacy Policy §5).
     research_consent = models.BooleanField(default=False)
+    # Distinguishes chat-collected responses (default) from instructor-
+    # ingested PDF reflections. Frontend renders a 📄 badge when 'pdf'.
+    source = models.CharField(
+        max_length=8, choices=SOURCE_CHOICES, default=SOURCE_CHAT,
+    )
+    # When source='pdf', points to the ingest batch that created this row.
+    # SET_NULL on batch delete so manifest can be archived without
+    # cascading the responses (revert uses explicit bulk delete instead).
+    pdf_batch = models.ForeignKey(
+        'LEAIPdfIngestBatch', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='messages',
+    )
 
     def __str__(self):
         return f"{self.student_id} used {self.gpt_used}"
@@ -402,3 +418,85 @@ class LEAIQuickTake(models.Model):
 
     def __str__(self):
         return f'QuickTake {self.scope_key} ({self.course.course_id})'
+
+
+class LEAIPdfIngestBatch(models.Model):
+    """Permanent manifest of a committed PDF ingest batch.
+
+    Created by `commit/` after the instructor confirms a mapping. Holds
+    only counts + a per-PDF summary for audit; the actual response rows
+    live in FeedbackMessage with `pdf_batch` set to this batch.
+
+    Revert sets `reverted_at` and bulk-deletes the linked FeedbackMessage
+    rows. The batch row itself stays for audit, with the manifest intact.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    survey = models.ForeignKey(
+        'FeedbackGPT', on_delete=models.CASCADE,
+        related_name='pdf_ingest_batches',
+    )
+    committed_by = models.CharField(max_length=100, blank=True, default='')
+    student_count = models.IntegerField(default=0)
+    message_count = models.IntegerField(default=0)
+    # Snapshot per ingested PDF: {filename, student_id, status, prompt_count}
+    items_summary = models.JSONField(default=list)
+    reverted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['survey', '-created_at'])]
+
+    def __str__(self):
+        state = ' (reverted)' if self.reverted_at else ''
+        return f'PdfBatch {self.survey_id} · {self.student_count} students{state}'
+
+
+class LEAIPdfIngestJob(models.Model):
+    """Transient PDF-ingest preview job.
+
+    Created by `start/`, populated by a worker thread, polled by the
+    instructor's UI. Lives until `commit/` consumes it (worker deletes
+    the row) or stale-recovery auto-fails it.
+
+    `items` is a list of dicts:
+        {filename, student_id,
+         status: 'ok'|'low_conf'|'failed',
+         extracted_text, mapping: {prompt_id: text},
+         low_conf_prompts: [prompt_id], error: str}
+    """
+
+    STATUS_PENDING = 'pending'
+    STATUS_RUNNING = 'running'
+    STATUS_READY = 'ready'
+    STATUS_FAILED = 'failed'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_RUNNING, 'Running'),
+        (STATUS_READY, 'Ready'),
+        (STATUS_FAILED, 'Failed'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    survey = models.ForeignKey(
+        'FeedbackGPT', on_delete=models.CASCADE,
+        related_name='pdf_ingest_jobs',
+    )
+    created_by = models.CharField(max_length=100, blank=True, default='')
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING,
+    )
+    items = models.JSONField(default=list)
+    progress = models.JSONField(default=dict)
+    error = models.TextField(blank=True, default='')
+    job_started_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['survey', '-created_at'])]
+
+    def __str__(self):
+        return f'PdfIngestJob {self.id} · {self.status}'
