@@ -590,6 +590,7 @@ def feedback_messages_by_course(request):
             avg_turns = round(msg_count / session_count) if session_count else 0
             result.append({
                 'gpt_id': gpt.id,
+                'public_id': gpt.public_id,
                 'name': gpt.name,
                 'mode': gpt.mode,
                 'week_number': gpt.week_number,
