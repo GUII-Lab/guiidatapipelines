@@ -523,6 +523,39 @@ class ViewLayerTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["existing"], ["alice"])
 
+    def test_commit_rejects_malformed_items(self):
+        # Seed a ready job so commit reaches the validator.
+        with inline_thread_patch():
+            job = leai_pdf_ingest.start_pdf_ingest_job(
+                self.survey,
+                [("a.pdf", make_clean_pdf())],
+                {"a.pdf": "alice"},
+            )
+        url = reverse("leai_pdf_ingest_commit", args=[str(job.pk)])
+        # items[0].mapping is a string (should be a dict) — clear 400.
+        resp = self.client.post(
+            url,
+            data=json.dumps({
+                "items": [{"filename": "a.pdf", "student_id": "alice", "mapping": "oops"}],
+                "dedup_decisions": {},
+            }),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("mapping", resp.json()["error"])
+
+        # Bad dedup choice → clear 400.
+        resp = self.client.post(
+            url,
+            data=json.dumps({
+                "items": [{"filename": "a.pdf", "student_id": "alice", "mapping": {}}],
+                "dedup_decisions": {"alice": "ZAP"},
+            }),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("dedup_decisions", resp.json()["error"])
+
     def test_roster_endpoint_combines_chat_and_pdf(self):
         FeedbackMessage.objects.create(
             session_id="s1", student_id="alice", sent_by="student",

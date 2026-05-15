@@ -2097,6 +2097,28 @@ def leai_pdf_ingest_commit(request, job_id):
     committed_by = data.get('committed_by') or ''
     if not isinstance(items, list) or not isinstance(dedup, dict):
         return JsonResponse({'error': 'items must be a list, dedup_decisions a dict'}, status=400)
+    # Defensive shape-check on each item — a malformed POST that slipped
+    # through validation (e.g. proxy mangling, custom client) shouldn't
+    # reach the worker and surface as a generic 500. Each item is a
+    # dict with string filename + student_id + dict mapping.
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            return JsonResponse({'error': f'items[{idx}] must be an object'}, status=400)
+        if not isinstance(item.get('filename', ''), str):
+            return JsonResponse({'error': f'items[{idx}].filename must be a string'}, status=400)
+        if not isinstance(item.get('student_id', ''), str):
+            return JsonResponse({'error': f'items[{idx}].student_id must be a string'}, status=400)
+        if 'mapping' in item and not isinstance(item['mapping'], dict):
+            return JsonResponse({'error': f'items[{idx}].mapping must be an object'}, status=400)
+    # dedup_decisions values must be one of the supported choices.
+    valid_choices = {'replace', 'skip', 'add'}
+    for sid, choice in dedup.items():
+        if not isinstance(sid, str) or not isinstance(choice, str):
+            return JsonResponse({'error': 'dedup_decisions keys/values must be strings'}, status=400)
+        if choice not in valid_choices:
+            return JsonResponse({
+                'error': f'dedup_decisions[{sid}]={choice!r} not in {sorted(valid_choices)}',
+            }, status=400)
 
     from . import leai_pdf_ingest
     try:
