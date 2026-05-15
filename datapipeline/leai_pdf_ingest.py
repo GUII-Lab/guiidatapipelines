@@ -294,6 +294,18 @@ def is_job_stale(job: LEAIPdfIngestJob) -> bool:
 
 # Worker -------------------------------------------------------------------
 
+class IngestJobConflict(Exception):
+    """Raised when starting a job while another job is still active for
+    the same survey. Carries the existing job's id so the view layer can
+    surface it back to the client (frontend can resume polling instead
+    of starting over).
+    """
+
+    def __init__(self, existing_job: "LEAIPdfIngestJob"):
+        super().__init__("Another ingest job is already in progress for this survey.")
+        self.existing_job = existing_job
+
+
 def start_pdf_ingest_job(
     survey: FeedbackGPT,
     files: list[tuple[str, bytes]],
@@ -315,7 +327,31 @@ def start_pdf_ingest_job(
     Returns
     -------
     The created LEAIPdfIngestJob row, with status='pending'.
+
+    Raises
+    ------
+    ValueError
+        On bad input (size, count, missing attribution).
+    IngestJobConflict
+        When another live (pending/running, non-stale) job exists for
+        the same survey. Concurrent workers on the same survey would
+        race when committing, and they're never the user's intent —
+        we surface the existing job_id so the client can resume.
     """
+    # Reject if a non-stale job is already active for this survey.
+    # Stale jobs (past PDF_INGEST_JOB_STALE_SECONDS) are treated as dead
+    # and silently ignored — the new job supersedes them.
+    active = (
+        LEAIPdfIngestJob.objects
+        .filter(survey=survey, status__in=[
+            LEAIPdfIngestJob.STATUS_PENDING,
+            LEAIPdfIngestJob.STATUS_RUNNING,
+        ])
+        .order_by("-created_at")
+        .first()
+    )
+    if active and not is_job_stale(active):
+        raise IngestJobConflict(active)
     if not files:
         raise ValueError("At least one file is required.")
     if len(files) > MAX_FILES_PER_BATCH:

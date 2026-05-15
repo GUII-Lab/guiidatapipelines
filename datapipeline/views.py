@@ -2038,6 +2038,13 @@ def leai_pdf_ingest_start(request):
             attributions={str(k): str(v) for k, v in attributions.items()},
             created_by=request.POST.get('created_by') or '',
         )
+    except leai_pdf_ingest.IngestJobConflict as e:
+        # 409 + the existing job descriptor so the frontend can resume
+        # polling that job instead of presenting a generic error.
+        return JsonResponse({
+            'error': str(e),
+            'existing_job': _job_to_dict(e.existing_job),
+        }, status=409)
     except ValueError as e:
         return JsonResponse({'error': str(e)}, status=400)
 

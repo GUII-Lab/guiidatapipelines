@@ -204,6 +204,48 @@ class WorkerTests(TestCase):
                 self.survey, [("a.pdf", big)], {"a.pdf": "alice"},
             )
 
+    def test_parallel_active_job_rejected_with_existing(self):
+        # Seed an existing pending job so a fresh start triggers the
+        # conflict guard. We don't run a worker for the seed — the row
+        # itself is enough to claim the survey's "active" slot.
+        from django.utils import timezone
+        active = LEAIPdfIngestJob.objects.create(
+            survey=self.survey,
+            status=LEAIPdfIngestJob.STATUS_RUNNING,
+            job_started_at=timezone.now(),
+        )
+        with self.assertRaises(leai_pdf_ingest.IngestJobConflict) as cm:
+            leai_pdf_ingest.start_pdf_ingest_job(
+                self.survey,
+                [("a.pdf", make_clean_pdf())],
+                {"a.pdf": "alice"},
+            )
+        self.assertEqual(cm.exception.existing_job.pk, active.pk)
+        # No new job was created.
+        self.assertEqual(LEAIPdfIngestJob.objects.filter(survey=self.survey).count(), 1)
+
+    def test_stale_active_job_does_not_block_new_one(self):
+        # Stale jobs (past PDF_INGEST_JOB_STALE_SECONDS) should not
+        # block — they're treated as dead and superseded.
+        from datetime import timedelta
+        from django.utils import timezone
+        stale_when = timezone.now() - timedelta(
+            seconds=leai_pdf_ingest.PDF_INGEST_JOB_STALE_SECONDS + 60,
+        )
+        LEAIPdfIngestJob.objects.create(
+            survey=self.survey,
+            status=LEAIPdfIngestJob.STATUS_RUNNING,
+            job_started_at=stale_when,
+        )
+        with inline_thread_patch():
+            job = leai_pdf_ingest.start_pdf_ingest_job(
+                self.survey,
+                [("alice.pdf", make_clean_pdf())],
+                {"alice.pdf": "alice"},
+            )
+        job.refresh_from_db()
+        self.assertEqual(job.status, "ready")
+
 
 # ─── Commit + revert ─────────────────────────────────────────────────────
 
@@ -399,6 +441,31 @@ class ViewLayerTests(TestCase):
         # second revert → 409
         again = self.client.post(reverse("leai_pdf_ingest_batch_revert", args=[batch_id]))
         self.assertEqual(again.status_code, 409)
+
+    def test_start_returns_409_when_job_already_active(self):
+        # Seed an active job so a fresh /start/ for the same survey
+        # collides — endpoint should return 409 with existing_job
+        # so the frontend can resume polling instead of starting over.
+        from django.utils import timezone
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        seed = LEAIPdfIngestJob.objects.create(
+            survey=self.survey,
+            status=LEAIPdfIngestJob.STATUS_RUNNING,
+            job_started_at=timezone.now(),
+        )
+        f = SimpleUploadedFile("a.pdf", make_clean_pdf(), content_type="application/pdf")
+        resp = self.client.post(
+            reverse("leai_pdf_ingest_start"),
+            data={
+                "survey_id": self.survey.id,
+                "attributions": json.dumps({"a.pdf": "alice"}),
+                "files": [f],
+            },
+        )
+        self.assertEqual(resp.status_code, 409)
+        body = resp.json()
+        self.assertIn("existing_job", body)
+        self.assertEqual(body["existing_job"]["job_id"], str(seed.pk))
 
     def test_start_rejects_non_form_survey(self):
         general = FeedbackGPT.objects.create(
