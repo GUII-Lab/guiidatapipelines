@@ -34,6 +34,7 @@ urlpatterns = [
     path('api/form_schemas/<str:schema_id>/', get_form_schema, name='get_form_schema'),
     path('api/feedback_messages_by_gpt/', feedback_messages_by_gpt, name='feedback_messages_by_gpt'),
     path('api/feedback_messages_by_course/', feedback_messages_by_course, name='feedback_messages_by_course'),
+    path('api/feedback_session_resume/', feedback_session_resume, name='feedback_session_resume'),
     # LEAI survey lifecycle & management
     path('api/set_survey_status/', set_survey_status, name='set_survey_status'),
     path('api/update_survey/', update_survey, name='update_survey'),

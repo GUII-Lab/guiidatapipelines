@@ -480,6 +480,61 @@ def get_form_schema(request, schema_id):
 
 
 @csrf_exempt
+def feedback_session_resume(request):
+    """Return the ordered chat transcript for one (gpt_id, session_id).
+
+    Powers cross-device server-side conversation restore. Anonymity guards:
+    - POST body (not query string) so session_id never lands in access logs.
+    - source='chat' filter so instructor-uploaded PDF rows can't leak via
+      this path.
+    - Returns only sent_by/content/created_at (no student_id, no gpt_used).
+    - Cache-Control: no-store, private so intermediaries can't cache.
+    Callers should pair this with a fragment-based URL (#cid=<uuid>) so the
+    session_id never reaches the network as a query string.
+    """
+    if request.method != 'POST':
+        return HttpResponse(status=405, content='Method not allowed')
+    try:
+        data = json.loads(request.body)
+    except ValueError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    gpt_id = data.get('gpt_id')
+    session_id = data.get('session_id')
+    if not gpt_id or not session_id:
+        return JsonResponse(
+            {'error': 'gpt_id and session_id required'}, status=400,
+        )
+    qs = (
+        FeedbackMessage.objects
+        .filter(
+            gpt_id=gpt_id,
+            session_id=session_id,
+            source=FeedbackMessage.SOURCE_CHAT,
+        )
+        .order_by('created_at')
+        .values('sent_by', 'content', 'created_at')
+    )
+    messages = [
+        {
+            'sent_by': m['sent_by'],
+            'content': m['content'],
+            'created_at': (
+                m['created_at'].isoformat() if m['created_at'] else None
+            ),
+        }
+        for m in qs
+    ]
+    resp = JsonResponse({
+        'session_id': session_id,
+        'gpt_id': int(gpt_id),
+        'messages': messages,
+        'count': len(messages),
+    })
+    resp['Cache-Control'] = 'no-store, private'
+    return resp
+
+
+@csrf_exempt
 def feedback_messages_by_gpt(request):
     if request.method == 'GET':
         gpt_id = request.GET.get('gpt_id')
