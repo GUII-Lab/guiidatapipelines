@@ -251,6 +251,92 @@ class WorkerTests(TestCase):
         self.assertEqual(item["status"], "ok")  # nothing to flag low_conf
         self.assertEqual(item["mapping"], {})  # nothing to map
 
+    def test_ai_assist_fills_low_conf_prompts(self):
+        # When regex misses a section (template heading drift), the
+        # second-pass AI call should be invoked and its result merged
+        # into the mapping. The affected prompt should move out of
+        # low_conf_prompts and into ai_assisted_prompts.
+        from unittest.mock import patch
+
+        # Use a PDF that has 1.1 and 1.2 (per DEFAULT_SECTIONS used in
+        # this test class's setUp) but is missing the 1.3 'Open Question
+        # Reflection' section — regex will flag 1.3 as low-conf, and the
+        # mocked AI will fill it in.
+        partial_pdf_lines = [
+            "Key Concepts",
+            "This week the most important concept was contextual inquiry.",
+            "",
+            "Methods in Practice",
+            "I used affinity diagramming.",
+        ]
+        from io import BytesIO
+        from reportlab.pdfgen import canvas as _c
+        from reportlab.lib.pagesizes import letter as _l
+        buf = BytesIO()
+        c = _c.Canvas(buf, pagesize=_l)
+        c.setFont("Helvetica", 11)
+        y = 750
+        for line in partial_pdf_lines:
+            c.drawString(72, y, line); y -= 16
+        c.showPage(); c.save()
+        partial = buf.getvalue()
+
+        ai_mock_response = {
+            "parsed": {"1.3": "AI-extracted Open Question answer."},
+            "response": "{}",
+            "usage": {},
+        }
+        with patch("datapipeline.leai_pdf_ingest.openai_client.run_structured",
+                   return_value=ai_mock_response), \
+             inline_thread_patch():
+            job = leai_pdf_ingest.start_pdf_ingest_job(
+                self.survey,
+                [("alice.pdf", partial)],
+                {"alice.pdf": "alice"},
+            )
+        job.refresh_from_db()
+        item = job.items[0]
+        # 1.3 should now be filled by AI assist; not flagged low_conf.
+        self.assertEqual(item["mapping"].get("1.3"),
+                         "AI-extracted Open Question answer.")
+        self.assertNotIn("1.3", item["low_conf_prompts"])
+        self.assertIn("1.3", item.get("ai_assisted_prompts", []))
+        # Item status reflects the upgraded outcome — no remaining low-conf.
+        self.assertEqual(item["status"], "ok")
+
+    def test_ai_assist_failure_leaves_regex_mapping_intact(self):
+        # When the AI call raises, we should fall back to the regex
+        # result without crashing the worker. The prompts the AI would
+        # have filled remain low_conf so the human sees them.
+        from unittest.mock import patch
+        from io import BytesIO
+        from reportlab.pdfgen import canvas as _c
+        from reportlab.lib.pagesizes import letter as _l
+        buf = BytesIO()
+        c = _c.Canvas(buf, pagesize=_l)
+        c.setFont("Helvetica", 11)
+        y = 750
+        for line in ["Key Concepts & Takeaways", "Just one section."]:
+            c.drawString(72, y, line); y -= 16
+        c.showPage(); c.save()
+        partial = buf.getvalue()
+
+        with patch("datapipeline.leai_pdf_ingest.openai_client.run_structured",
+                   side_effect=RuntimeError("simulated AI outage")), \
+             inline_thread_patch():
+            job = leai_pdf_ingest.start_pdf_ingest_job(
+                self.survey,
+                [("alice.pdf", partial)],
+                {"alice.pdf": "alice"},
+            )
+        job.refresh_from_db()
+        item = job.items[0]
+        # Worker stays alive, outcome reflects regex-only result.
+        self.assertEqual(job.status, "ready")
+        # Should remain low-conf — many prompts unmatched and AI failed.
+        self.assertIn(item["status"], ("low_conf", "ok"))
+        self.assertEqual(item.get("ai_assisted_prompts", []), [])
+
     def test_stale_active_job_does_not_block_new_one(self):
         # Stale jobs (past PDF_INGEST_JOB_STALE_SECONDS) should not
         # block — they're treated as dead and superseded.

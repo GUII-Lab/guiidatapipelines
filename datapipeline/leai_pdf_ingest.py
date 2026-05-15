@@ -38,8 +38,18 @@ from .models import (
     LEAIPdfIngestJob,
     LEAIQuickTake,
 )
+from . import openai_client
 
 logger = logging.getLogger(__name__)
+
+# AI-assist model: a small fast model is plenty for "match these blocks
+# of text to these prompts". Cost is ~$0.001 per PDF with low-conf
+# prompts, only fires when regex misses.
+AI_ASSIST_MODEL = "gpt-4o-mini"
+# Cap the extracted text we send to OpenAI to avoid blowing the context
+# window or runaway cost on a giant PDF — 12 KB covers ~3 pages of dense
+# text, which is far beyond a typical reflection.
+AI_ASSIST_TEXT_CHAR_LIMIT = 12000
 
 # Stale recovery: a job in pending/running past this many seconds is
 # auto-failed by the GET endpoint. 30 minutes covers the worst case of
@@ -280,6 +290,92 @@ def map_text_to_prompts(
     return mapping, low_conf, preamble
 
 
+# AI-assisted mapping fallback --------------------------------------------
+
+def _ai_assist_mapping(
+    text: str,
+    prompts: list[dict],
+    low_conf_prompt_ids: list[str],
+) -> dict[str, str]:
+    """Ask OpenAI to map the extracted text to the survey's prompts for
+    those flagged low-confidence by regex.
+
+    Used as a second pass when heading-based regex matching missed
+    sections — usually because the student's PDF used different wording
+    than the schema (e.g. 'My Methods This Week' instead of 'Methods in
+    Practice'). The model gets the full extracted text + the list of
+    prompts that need answers, and returns a JSON map. Empty-string
+    values mean 'I couldn't find an answer for this prompt either'.
+
+    Returns
+    -------
+    {prompt_id: answer_text} for every low-conf prompt. Failure or empty
+    returns an empty dict (caller falls back to the regex result).
+    """
+    if not text or not low_conf_prompt_ids:
+        return {}
+    relevant = [p for p in prompts if p.get("prompt_id") in low_conf_prompt_ids]
+    if not relevant:
+        return {}
+
+    # Trim huge texts so we stay well inside the model's context and
+    # keep cost predictable.
+    if len(text) > AI_ASSIST_TEXT_CHAR_LIMIT:
+        text = text[:AI_ASSIST_TEXT_CHAR_LIMIT] + "\n\n[…truncated for AI-assist pass]"
+
+    properties = {}
+    for p in relevant:
+        properties[p["prompt_id"]] = {
+            "type": "string",
+            "description": (
+                f"The student's answer to: '{p.get('opening_prompt', p.get('title', p['prompt_id']))}'. "
+                "Empty string if no answer is found in the text."
+            ),
+        }
+    schema = {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties.keys()),
+        "additionalProperties": False,
+    }
+    prompt_lines = "\n".join(
+        f"- {p['prompt_id']}: {p.get('title') or p['prompt_id']}"
+        f" — {p.get('opening_prompt', '')}".strip()
+        for p in relevant
+    )
+    system = (
+        "You are extracting student reflection answers from a PDF. The student "
+        "wrote a free-form reflection that should answer specific prompts, but "
+        "section headings may not exactly match. For each prompt below, find "
+        "the corresponding answer in the text and return it verbatim. If no "
+        "answer exists for a prompt, return an empty string for that prompt."
+    )
+    user = (
+        f"PROMPTS NEEDING ANSWERS:\n{prompt_lines}\n\n"
+        f"STUDENT'S REFLECTION TEXT:\n{text}"
+    )
+    try:
+        result = openai_client.run_structured(
+            chat_history=[{"role": "system", "content": system}],
+            user_text=user,
+            json_schema=schema,
+            schema_name="pdf_ingest_assist",
+            model=AI_ASSIST_MODEL,
+            temperature=0,
+        )
+    except Exception as e:
+        logger.info("AI-assist mapping failed (non-fatal): %s", e)
+        return {}
+
+    parsed = (result or {}).get("parsed") or {}
+    out: dict[str, str] = {}
+    for pid in low_conf_prompt_ids:
+        v = parsed.get(pid, "")
+        if isinstance(v, str) and v.strip():
+            out[pid] = v.strip()
+    return out
+
+
 # Stale recovery -----------------------------------------------------------
 
 def is_job_stale(job: LEAIPdfIngestJob) -> bool:
@@ -398,9 +494,26 @@ def start_pdf_ingest_job(
                 try:
                     text = _extract_pdf_text(blob)
                     mapping, low_conf, preamble = map_text_to_prompts(text, prompts)
+                    # Second pass: ask the AI to fill in the gaps the
+                    # regex matcher couldn't find. Best-effort — failure
+                    # leaves regex result intact, success upgrades the
+                    # affected cells from empty/low-conf to ai_assisted.
+                    ai_filled: dict[str, str] = {}
+                    if low_conf:
+                        try:
+                            ai_filled = _ai_assist_mapping(text, prompts, low_conf)
+                        except Exception as e:
+                            logger.info("ai-assist non-fatal failure for %s: %s", filename, e)
+                    if ai_filled:
+                        for pid, val in ai_filled.items():
+                            mapping[pid] = val
+                        # Remove from low_conf the prompts AI was able to fill;
+                        # keep the ones AI also missed flagged for the human.
+                        low_conf = [pid for pid in low_conf if pid not in ai_filled]
                     item["extracted_text"] = text
                     item["mapping"] = mapping
                     item["low_conf_prompts"] = low_conf
+                    item["ai_assisted_prompts"] = list(ai_filled.keys())
                     item["preamble"] = preamble
                     item["status"] = "low_conf" if low_conf else "ok"
                 except Exception as e:
