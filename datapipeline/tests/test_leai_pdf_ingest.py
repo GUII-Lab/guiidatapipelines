@@ -224,6 +224,33 @@ class WorkerTests(TestCase):
         # No new job was created.
         self.assertEqual(LEAIPdfIngestJob.objects.filter(survey=self.survey).count(), 1)
 
+    def test_worker_survives_schema_with_no_prompts(self):
+        # Defensive: a misconfigured survey whose FormSchema body has no
+        # sections should not crash the worker. Every prompt becomes
+        # low_conf-ish (no mapping possible), and the item flag is 'ok'
+        # because there are no low-confidence prompts to flag — just
+        # nothing to extract. The frontend handles the empty-prompts
+        # case via the schemaEmpty banner before it gets here.
+        empty_schema = FormSchema.objects.create(
+            schema_id="empty-schema", title="Empty", body={"sections": []},
+        )
+        empty_survey = FeedbackGPT.objects.create(
+            name="Empty Survey", instructions="x", public_id="empty-1",
+            course=self.course, mode="form", form_schema=empty_schema,
+        )
+        with inline_thread_patch():
+            job = leai_pdf_ingest.start_pdf_ingest_job(
+                empty_survey,
+                [("alice.pdf", make_clean_pdf())],
+                {"alice.pdf": "alice"},
+            )
+        job.refresh_from_db()
+        self.assertEqual(job.status, "ready")
+        self.assertEqual(len(job.items), 1)
+        item = job.items[0]
+        self.assertEqual(item["status"], "ok")  # nothing to flag low_conf
+        self.assertEqual(item["mapping"], {})  # nothing to map
+
     def test_stale_active_job_does_not_block_new_one(self):
         # Stale jobs (past PDF_INGEST_JOB_STALE_SECONDS) should not
         # block — they're treated as dead and superseded.
