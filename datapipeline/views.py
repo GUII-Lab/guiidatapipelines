@@ -712,8 +712,34 @@ def update_survey(request):
                             )
                         snapshot_payload = _survey_snapshot_to_dict(snap)
 
+            # Bind/unbind the FormSchema. Required when mode='form' (cannot
+            # unbind), optional when mode='group' (engine layers coverage on
+            # top of the team-aware prompt when set), forbidden when
+            # mode='general'.
+            if 'form_schema_id' in data:
+                raw = data.get('form_schema_id')
+                new_schema_id = (raw or '').strip() if isinstance(raw, str) else ''
+                if not new_schema_id:
+                    if gpt.mode == 'form':
+                        return JsonResponse({
+                            'error': "form_schema_id is required for mode='form' surveys",
+                        }, status=400)
+                    gpt.form_schema = None
+                else:
+                    if gpt.mode == 'general':
+                        return JsonResponse({
+                            'error': "form_schema_id is only valid for mode='form' or mode='group'",
+                        }, status=400)
+                    try:
+                        gpt.form_schema = FormSchema.objects.get(
+                            schema_id=new_schema_id, is_active=True,
+                        )
+                    except FormSchema.DoesNotExist:
+                        return JsonResponse({'error': 'form_schema not found or inactive'}, status=404)
+
             gpt.save()
-            resp = {'status': 'success', 'id': gpt.id}
+            resp = {'status': 'success', 'id': gpt.id,
+                    'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None}
             if snapshot_payload is not None:
                 resp['team_snapshot'] = snapshot_payload
             return JsonResponse(resp)
