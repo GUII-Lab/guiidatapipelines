@@ -807,6 +807,7 @@ def clone_survey(request):
                     anonymity_mode=src.anonymity_mode,
                     reporting_structure=src.reporting_structure,
                     mode=src.mode,
+                    form_schema=src.form_schema if src.form_schema_id else None,
                 )
                 # For group-mode surveys, take a fresh snapshot from the same source
                 # configuration (if still available) so the clone gets current team sizes.
@@ -832,6 +833,7 @@ def clone_survey(request):
                 'public_id': clone.public_id,
                 'name': clone.name,
                 'mode': clone.mode,
+                'form_schema_id': clone.form_schema.schema_id if clone.form_schema_id else None,
             })
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=400)
