@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from django.db import connection, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -65,36 +66,49 @@ def default_quicktake_system_prompt() -> str:
         "into a concise set of bullet points. Each bullet captures one claim "
         "the instructor should see at a glance.\n\n"
         "Evidence rules — these are non-negotiable:\n"
-        "  1. Each bullet must include 1–3 quotes drawn VERBATIM from the "
-        "cited responses. Do not paraphrase; copy a contiguous span from "
-        "the response text. Quotes are how the instructor verifies a claim "
+        "  1. Each bullet must include 1–3 representative quotes drawn "
+        "VERBATIM from the cited responses — a curated subset, NOT one per "
+        "cited id. Do not paraphrase; copy a contiguous span from the "
+        "response text. Quotes are how the instructor verifies a claim "
         "without clicking pills.\n"
-        "  2. Prefer 2–3 representative rids per bullet over a long list. "
-        "If 20 responses support a claim, pick the 2–3 most exemplary, not "
-        "all 20. Quality of evidence beats quantity.\n"
+        "  2. `cited_ids` must list EVERY response ID that genuinely "
+        "supports the claim — not a sample. The instructor reads the "
+        "length of this list as how many students are on this side, so a "
+        "claim backed by 20 responses must cite all 20 of them. Do not "
+        "truncate cited_ids to keep it short; the quotes array (rule 1) is "
+        "where you stay concise.\n"
         "  3. Only reference response IDs that genuinely support the bullet. "
         "Never invent an R-id.\n"
-        "  4. Each quote's `rid` field must be one of the IDs in `cited_ids`.\n\n"
+        "  4. Each quote's `rid` field must be one of the IDs in `cited_ids`.\n"
+        "  5. Each bullet must include a `sentiment` tag classifying the "
+        "valence of what students said in this bullet:\n"
+        "       - `positive` — students expressed satisfaction, praise, "
+        'what is working, "this helped me", confidence gains.\n'
+        "       - `negative` — students expressed frustration, confusion, "
+        "struggle, dissatisfaction, things that aren't working, "
+        "pain points, unmet needs.\n"
+        "       - `mixed` — the bullet genuinely captures both positive "
+        "and negative signals from the cited responses (e.g. \"clear "
+        "lectures but pacing felt rushed\").\n"
+        "       - `neutral` — purely descriptive or observational with no "
+        "clear valence (e.g. a behavior pattern or factual report).\n"
+        "     Classify by the tone of the cited student responses, not by "
+        "the instructor's perspective. If unsure between `mixed` and one "
+        "side, use `mixed` only when both signals are roughly equal; "
+        "otherwise pick the dominant valence. Avoid defaulting to "
+        "`neutral` when there is a real positive or negative signal.\n\n"
         "Output format (JSON, enforced by schema):\n"
         '  { "bullets": [ { "text": "...", "cited_ids": ["R5","R12"], '
-        '"quotes": [ {"rid":"R5","text":"verbatim span..."}, ... ] }, ... ] }\n\n'
+        '"quotes": [ {"rid":"R5","text":"verbatim span..."}, ... ], '
+        '"sentiment": "negative" }, ... ] }\n\n'
         "Be objective, accurate, and avoid over-generalisation.\n\n"
-        "Also produce two more fields:\n\n"
-        "TENSIONS — disagreements between students on a topic. Each tension "
-        "has a `title` and exactly two `sides`, each with a one-line "
-        "`stance` describing that camp's position, a `count` of how many "
-        "responses fall into it, and one representative `quote` "
-        "({rid, text} — verbatim span). Only emit tensions that are real; "
-        "if students are aligned, return an empty `tensions` array.\n\n"
+        "Also produce these additional fields:\n\n"
         "GAPS — topics the instructor might expect to hear about that are "
         "noticeably absent from the corpus. Each gap is an object "
         "{topic, note} where `topic` is the missing theme (e.g. "
         '"workload balance") and `note` is a short observation about its '
         "absence. Only flag gaps that genuinely matter; return an empty "
-        "`gaps` array otherwise.\n\n"
-        "Never invent quotes or content for tensions or gaps. Verbatim "
-        "spans only; if you can't find evidence for a side of a tension, "
-        "drop that tension.\n\n"
+        "`gaps` array otherwise. Never invent content for a gap.\n\n"
         "FORM_SECTIONS — only emit when the corpus contains form-mode "
         "responses (look for indented `· Section Title: ...` lines under "
         "an rid). Each distinct section title gets one entry with a "
@@ -226,44 +240,18 @@ QUICKTAKE_SCHEMA: dict = {
                             "additionalProperties": False,
                         },
                     },
-                },
-                "required": ["text", "cited_ids", "quotes"],
-                "additionalProperties": False,
-            },
-        },
-        # Phase 5: disagreements among students — first-class signal for
-        # instructors. Each tension has exactly two opposing sides with
-        # representative quotes. The model must omit this field (empty
-        # array) rather than fabricate tensions when none exist.
-        "tensions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "sides": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "stance": {"type": "string"},
-                                "count": {"type": "integer"},
-                                "quote": {
-                                    "type": "object",
-                                    "properties": {
-                                        "rid": {"type": "string"},
-                                        "text": {"type": "string"},
-                                    },
-                                    "required": ["rid", "text"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                            "required": ["stance", "count", "quote"],
-                            "additionalProperties": False,
-                        },
+                    # Per-bullet valence so the instructor UI can color-code
+                    # the takeaway list at a glance. "positive" = what's
+                    # working, "negative" = what's struggling, "mixed" =
+                    # both signals in the same bullet, "neutral" = purely
+                    # descriptive/observational. The frontend treats an
+                    # unknown or absent value as neutral.
+                    "sentiment": {
+                        "type": "string",
+                        "enum": ["positive", "negative", "mixed", "neutral"],
                     },
                 },
-                "required": ["title", "sides"],
+                "required": ["text", "cited_ids", "quotes", "sentiment"],
                 "additionalProperties": False,
             },
         },
@@ -341,7 +329,9 @@ QUICKTAKE_SCHEMA: dict = {
             },
         },
     },
-    "required": ["bullets", "tensions", "gaps", "team_health", "form_sections"],
+    "required": [
+        "bullets", "gaps", "team_health", "form_sections",
+    ],
     "additionalProperties": False,
 }
 
@@ -454,6 +444,32 @@ def _extract_form_sections(messages: list[dict]) -> list[dict]:
     ]
 
 
+def _surveys_in_scope(
+    course: Course,
+    scope_kind: str,
+    scope_week_number: Optional[int] = None,
+    scope_survey_ids: Optional[list] = None,
+):
+    """Resolve the FeedbackGPT queryset for a Quick Take scope.
+
+    Single source of truth shared by build_response_corpus (which reads the
+    responses) and compute_team_completeness (which reads the team rosters),
+    so the two always agree on which surveys are in scope:
+        "course" — every survey for the course
+        "week"   — surveys whose week_number matches
+        "custom" — surveys listed in scope_survey_ids (none when empty)
+    """
+    qs = FeedbackGPT.objects.filter(course=course)
+    if scope_kind == "week":
+        qs = qs.filter(week_number=scope_week_number)
+    elif scope_kind == "custom":
+        if scope_survey_ids:
+            qs = qs.filter(pk__in=scope_survey_ids)
+        else:
+            qs = qs.none()
+    return qs
+
+
 def build_response_corpus(
     course: Course,
     scope_kind: str,
@@ -480,15 +496,9 @@ def build_response_corpus(
         "custom"  — surveys listed in scope_survey_ids OR sessions in scope_session_ids
     """
     # 1. Resolve the set of FeedbackGPT surveys in scope
-    surveys_qs = FeedbackGPT.objects.filter(course=course)
-
-    if scope_kind == "week":
-        surveys_qs = surveys_qs.filter(week_number=scope_week_number)
-    elif scope_kind == "custom":
-        if scope_survey_ids:
-            surveys_qs = surveys_qs.filter(pk__in=scope_survey_ids)
-        else:
-            surveys_qs = surveys_qs.none()
+    surveys_qs = _surveys_in_scope(
+        course, scope_kind, scope_week_number, scope_survey_ids,
+    )
 
     survey_map: dict[int, Optional[int]] = {
         s.pk: s.week_number for s in surveys_qs
@@ -502,9 +512,14 @@ def build_response_corpus(
     form_survey_ids = {sid for sid, mode in survey_mode.items() if mode == "form"}
     nonform_survey_ids = [sid for sid in survey_ids if sid not in form_survey_ids]
 
+    # PDF-ingested rows are stored with sent_by="student" (not a "user"
+    # variant), so include source="pdf" explicitly — otherwise whole-PDF
+    # responses uploaded to non-form surveys would be silently dropped from
+    # the corpus and never reach Quick Take / FeedbackChat.
     user_only_qs = (
         FeedbackMessage.objects
-        .filter(gpt_id__in=nonform_survey_ids, sent_by__in=["user-message", "user"])
+        .filter(gpt_id__in=nonform_survey_ids)
+        .filter(Q(sent_by__in=["user-message", "user"]) | Q(source=FeedbackMessage.SOURCE_PDF))
         .order_by("session_id", "created_at")
     )
     full_qs = (
@@ -668,7 +683,11 @@ def build_quicktake_user_text(
         "different rids. Copy a contiguous run of text from the rid's "
         "actual response. A bullet with zero quotes will be rejected.\n"
         '  - `cited_ids` should be 2-3 representative rids, not a long list. '
-        "Each quote's `rid` must appear in this bullet's `cited_ids`.\n\n"
+        "Each quote's `rid` must appear in this bullet's `cited_ids`.\n"
+        '  - `sentiment` must be one of `positive`, `negative`, `mixed`, or '
+        "`neutral` (see the system prompt for the rubric). Only use "
+        "`neutral` when the bullet is genuinely descriptive without "
+        "positive or negative tone — do not default to it.\n\n"
         + (
             "REQUIRED for `form_sections`: produce one entry per distinct "
             "form section title listed above (those are the only valid "
@@ -683,7 +702,11 @@ def build_quicktake_user_text(
         )
         + "OPTIONAL: `tensions` for genuine disagreements (both sides need "
         "verbatim quotes). `gaps` for topics noticeably absent. Return empty "
-        "arrays for these if you don't see clear evidence — never invent."
+        "arrays for these if you don't see clear evidence — never invent.\n\n"
+        "REQUIRED: `actions` — 3–6 concrete, prioritised recommendations the "
+        "instructor could act on mid-course, each with a one-line `rationale` "
+        "and 1–3 `cited_ids`. Lead with `high`-priority friction. Empty array "
+        "only if nothing is genuinely actionable."
     )
     return "\n".join(lines)
 
@@ -859,6 +882,112 @@ def validate_team_health(
     return kept
 
 
+def compute_team_completeness(
+    corpus: list[dict],
+    surveys_qs,
+) -> dict[str, dict]:
+    """Deterministic per-team response completeness for group-mode scope.
+
+    Returns {team_name: {"expected": int, "submitted": int, "missing": int}}
+    covering EVERY team in the in-scope surveys' SurveyTeamSnapshots —
+    including teams nobody submitted for, so the UI can flag fully-silent
+    teams rather than letting them vanish.
+
+    expected  — the declared SurveyTeam.size (how many members the team has).
+                Summed across snapshots when the scope spans multiple surveys
+                (a multi-week scope expects one submission per member per
+                survey).
+    submitted — distinct submitting sessions in the corpus for that team. The
+                corpus carries exactly one entry per session, so counting
+                entries per team_name IS the submitter count.
+    missing   — max(0, expected - submitted); clamped so roster drift (more
+                submitters than the recorded size) can't go negative.
+
+    Team names are reproduced with the SAME rule build_response_corpus uses
+    (`display_name or "<snapshot.label_prefix> <number>"`) so they line up
+    with the corpus team_name and the model's team_health entries.
+    """
+    from .models import SurveyTeamSnapshot
+
+    submitted: dict[str, int] = {}
+    for e in corpus:
+        name = e.get("team_name")
+        if name:
+            submitted[name] = submitted.get(name, 0) + 1
+
+    expected: dict[str, int] = {}
+    snapshots = (
+        SurveyTeamSnapshot.objects
+        .filter(survey__in=list(surveys_qs))
+        .prefetch_related("teams")
+    )
+    for snap in snapshots:
+        for team in snap.teams.all():
+            name = team.display_name or f"{snap.label_prefix} {team.number}"
+            expected[name] = expected.get(name, 0) + (team.size or 0)
+
+    out: dict[str, dict] = {}
+    for name in set(expected) | set(submitted):
+        exp = expected.get(name, 0)
+        sub = submitted.get(name, 0)
+        out[name] = {
+            "expected": exp,
+            "submitted": sub,
+            "missing": max(0, exp - sub),
+        }
+    return out
+
+
+def merge_team_completeness(
+    team_health: list[dict],
+    completeness: dict[str, dict],
+) -> list[dict]:
+    """Fold deterministic completeness counts into the model's team_health.
+
+    - Every existing team_health entry gets its expected/submitted/missing
+      counts attached (matched by team_name).
+    - Every in-scope team the model did NOT assess is appended, so the
+      instructor sees the full roster. A team nobody submitted for is flagged
+      `at_risk` (the most important to surface); a partially-in team gets
+      `watch`; a fully-submitted team the model skipped is `healthy`.
+      Appended entries carry no summary/quote — the count line speaks for them.
+
+    Sorted attention-first: at_risk → watch → healthy → no_response, then
+    most-missing first, then by name, so silent and under-responding teams
+    lead the list.
+    """
+    by_name = {(t.get("team_name") or ""): t for t in (team_health or [])}
+    merged: list[dict] = []
+    for t in team_health or []:
+        c = completeness.get(t.get("team_name") or "")
+        merged.append({**t, **c} if c else dict(t))
+
+    for name, c in completeness.items():
+        if name in by_name:
+            continue
+        if c["submitted"] == 0:
+            status = "at_risk"
+        elif c["missing"] > 0:
+            status = "watch"
+        else:
+            status = "healthy"
+        merged.append({
+            "team_name": name,
+            "status": status,
+            "summary": "",
+            "quote": {},
+            **c,
+        })
+
+    status_rank = {"at_risk": 0, "watch": 1, "healthy": 2, "no_response": 3}
+    merged.sort(key=lambda t: (
+        status_rank.get(t.get("status") or "", 9),
+        -int(t.get("missing", 0) or 0),
+        t.get("team_name") or "",
+    ))
+    return merged
+
+
 def validate_tensions(
     tensions: list[dict],
     corpus: list[dict],
@@ -962,6 +1091,32 @@ def filter_bullet_citations(
     for b in bullets:
         kept = [rid for rid in b.get("cited_ids", []) if rid in valid_rids]
         cleaned.append({**b, "cited_ids": kept})
+    return cleaned
+
+
+def filter_actions(
+    actions: list[dict],
+    valid_rids: set[str],
+) -> list[dict]:
+    """Clean Quick Take `actions`: drop hallucinated rids, normalize priority.
+
+    Actions carry `cited_ids` (no verbatim quotes), so the only grounding
+    check is rid existence — same contract as `filter_bullet_citations`.
+    An action whose cited_ids are all hallucinated is kept with an empty
+    list: the recommendation text may still be sound, and an action with
+    no pills simply renders without citations. `priority` is coerced to a
+    known value (defaulting to `medium`) so the UI never sees a stray tag.
+    """
+    valid_priority = {"high", "medium", "low"}
+    cleaned: list[dict] = []
+    for a in actions or []:
+        if not (a.get("text") or "").strip():
+            continue
+        kept = [rid for rid in a.get("cited_ids", []) if rid in valid_rids]
+        priority = (a.get("priority") or "medium").strip().lower()
+        if priority not in valid_priority:
+            priority = "medium"
+        cleaned.append({**a, "cited_ids": kept, "priority": priority})
     return cleaned
 
 
@@ -1091,14 +1246,13 @@ def generate_quicktake(
             temperature=0,
         )
         bullets = result["parsed"].get("bullets", [])
-        tensions = result["parsed"].get("tensions", [])
         gaps = result["parsed"].get("gaps", [])
         team_health = result["parsed"].get("team_health", [])
         form_sections = result["parsed"].get("form_sections", [])
         model_name = result.get("model", "")
     else:
         (
-            bullets, tensions, gaps, team_health, form_sections, model_name,
+            bullets, gaps, team_health, form_sections, model_name,
         ) = _run_chunked_quicktake(
             course_name=course.course_name,
             scope_label=scope_label,
@@ -1114,11 +1268,11 @@ def generate_quicktake(
     # Filter hallucinated rids before verification so the verifier doesn't
     # waste cycles on citations that can't possibly resolve, and so the
     # frontend never receives a pill whose popover is "not available."
-    bullets = filter_bullet_citations(bullets, {e["rid"] for e in corpus})
+    corpus_rids = {e["rid"] for e in corpus}
+    bullets = filter_bullet_citations(bullets, corpus_rids)
 
     # Counts BEFORE quote validation, for diagnostic logging.
     raw_quote_count = sum(len(b.get("quotes") or []) for b in bullets)
-    raw_tensions = len(tensions or [])
     raw_gaps = len(gaps or [])
     raw_team_health = len(team_health or [])
     raw_form_sections = len(form_sections or [])
@@ -1128,27 +1282,41 @@ def generate_quicktake(
     # model can't fabricate a sentence and claim a real rid said it.
     bullets, _quote_stats = validate_quote_spans(bullets, corpus)
 
-    # Drop tensions whose side-quotes can't be verified. A half-grounded
-    # tension is worse than no tension — it suggests conflict that may
-    # not actually exist.
-    tensions = validate_tensions(tensions, corpus)
-
     # Drop team_health entries that name unknown teams or carry
     # unverifiable quotes.
     team_health = validate_team_health(team_health, corpus)
+
+    # Fold in deterministic per-team response completeness: attach
+    # expected/submitted/missing counts to each team and surface EVERY team
+    # in scope — including fully-silent ones the model never saw — so the
+    # instructor can tell which teams still owe feedback and how much.
+    # Counts come from SurveyTeam.size (the roster) vs. distinct submitters
+    # in the corpus; they are computed in code, never guessed by the model.
+    surveys_qs = _surveys_in_scope(
+        course, scope_kind, scope_week_number, scope_survey_ids,
+    )
+    team_completeness = compute_team_completeness(corpus, surveys_qs)
+    if team_completeness:
+        team_health = merge_team_completeness(team_health, team_completeness)
 
     # Drop form_sections entries that name unknown sections or carry
     # unverifiable quotes.
     form_sections = validate_form_sections(form_sections, corpus)
 
+    # Tensions and suggested actions are intentionally no longer generated:
+    # the tinted bullets (now carrying their FULL citation count) convey
+    # disagreement and how many students are on each side directly, and
+    # instructors prefer to pick their own actions. Persist empty lists so a
+    # regenerate clears any values a pre-removal row may still hold.
+    tensions = []
+    actions = []
+
     final_quote_count = sum(len(b.get("quotes") or []) for b in bullets)
     logger.info(
         "quicktake post-validation: bullets=%d quotes_raw=%d quotes_kept=%d "
-        "tensions_raw=%d tensions_kept=%d gaps=%d "
-        "form_sections_raw=%d form_sections_kept=%d "
-        "team_health_raw=%d team_health_kept=%d",
+        "gaps=%d form_sections_raw=%d form_sections_kept=%d "
+        "team_health_raw=%d team_health_final=%d",
         len(bullets), raw_quote_count, final_quote_count,
-        raw_tensions, len(tensions),
         raw_gaps,
         raw_form_sections, len(form_sections),
         raw_team_health, len(team_health),
@@ -1165,6 +1333,8 @@ def generate_quicktake(
             "gaps": gaps,
             "team_health": team_health,
             "form_sections": form_sections,
+            "actions": actions,
+            "responses_count_at_generation": len(corpus),
             "verification": verification,
             "system_prompt": system_prompt,
             "user_text": user_text,
@@ -1333,7 +1503,9 @@ def _run_chunked_quicktake(
     scope_label: str,
     system_prompt: str,
     chunks: list[list[dict]],
-) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict], str]:
+) -> tuple[
+    list[dict], list[dict], list[dict], list[dict], str,
+]:
     """Map-reduce: summarise each chunk, then merge bullets via a reducer call.
 
     Chunks run in parallel to stay under Heroku's 30s request window. The
@@ -1341,12 +1513,13 @@ def _run_chunked_quicktake(
     preserving the original global R-id citations.
 
     Returns:
-        (bullets, tensions, gaps, team_health, form_sections, model_name)
+        (bullets, gaps, team_health, form_sections, model_name)
 
-    The auxiliary fields (tensions/gaps/team_health/form_sections) are
-    union-with-dedup across chunks rather than reducer-merged — each
-    chunk independently surfaces section/team/gap insights and we keep
-    the first occurrence of each unique title/topic/team.
+    The auxiliary fields (gaps/team_health/form_sections) are union-with-dedup
+    across chunks rather than reducer-merged — each chunk independently
+    surfaces section/team/gap insights and we keep the first occurrence of
+    each unique topic/team/title. (Tensions and suggested actions are no
+    longer generated, so they are not collected here.)
     """
     total_chunks = len(chunks)
 
@@ -1375,11 +1548,9 @@ def _run_chunked_quicktake(
     # Phase 5/7/8: collect auxiliary fields from each chunk's response.
     # Dedup by a stable key per field type so we don't surface the same
     # section/team/gap N times for an N-chunk corpus.
-    seen_tension_titles: set[str] = set()
     seen_gap_topics: set[str] = set()
     seen_team_names: set[str] = set()
     seen_section_titles: set[str] = set()
-    agg_tensions: list[dict] = []
     agg_gaps: list[dict] = []
     agg_team_health: list[dict] = []
     agg_form_sections: list[dict] = []
@@ -1387,11 +1558,6 @@ def _run_chunked_quicktake(
     for res in chunk_results:
         parsed = res.get("parsed", {}) or {}
         partial_bullets.extend(parsed.get("bullets", []))
-        for t in parsed.get("tensions") or []:
-            key = (t.get("title") or "").strip().lower()
-            if key and key not in seen_tension_titles:
-                seen_tension_titles.add(key)
-                agg_tensions.append(t)
         for g in parsed.get("gaps") or []:
             key = (g.get("topic") or "").strip().lower()
             if key and key not in seen_gap_topics:
@@ -1412,8 +1578,7 @@ def _run_chunked_quicktake(
 
     if not partial_bullets:
         return (
-            [], agg_tensions, agg_gaps, agg_team_health, agg_form_sections,
-            model_name,
+            [], agg_gaps, agg_team_health, agg_form_sections, model_name,
         )
 
     # Reduce step: ask the model to consolidate overlapping bullets while
@@ -1423,22 +1588,30 @@ def _run_chunked_quicktake(
         "of the same student-feedback corpus into a single concise set of "
         "bullets. Preserve the exact [R<n>] citation IDs from the input — do "
         "not invent new ones. Merge overlapping themes, drop duplicates, and "
-        "keep the bullets objective and specific."
+        "keep the bullets objective and specific. Each merged bullet must "
+        "also carry a `sentiment` tag (`positive`, `negative`, `mixed`, or "
+        "`neutral`). Inputs are pre-tagged with their source sentiment — use "
+        "those as the primary signal; if two merged partials disagree, "
+        "prefer `mixed`. Do not default to `neutral` when a real positive "
+        "or negative signal is present."
     )
     lines = [
         f"Course: {course_name}",
         f"Scope: {scope_label}",
         f"Total chunks: {total_chunks}",
         "",
-        "--- Partial bullets ---",
+        "--- Partial bullets (each line shows [sentiment] text [R-ids]) ---",
     ]
     for b in partial_bullets:
         cited = "".join(f"[{rid}]" for rid in b.get("cited_ids", []))
-        lines.append(f"- {b.get('text', '')} {cited}".rstrip())
+        sent = (b.get("sentiment") or "neutral").strip() or "neutral"
+        lines.append(f"- [{sent}] {b.get('text', '')} {cited}".rstrip())
     lines.append("")
     lines.append(
         "Produce a merged set of bullets. Each bullet must cite the supporting "
-        "response IDs inline using [R<n>] notation drawn only from the IDs above."
+        "response IDs inline using [R<n>] notation drawn only from the IDs "
+        "above, and must include a `sentiment` value carried from (or "
+        "reconciled across) the merged partials."
     )
     reducer_user = "\n".join(lines)
 
@@ -1480,15 +1653,15 @@ def _run_chunked_quicktake(
         model_name = reduced.get("model", model_name)
         if bullets:
             return (
-                attach_quotes(bullets), agg_tensions, agg_gaps,
-                agg_team_health, agg_form_sections, model_name,
+                attach_quotes(bullets), agg_gaps, agg_team_health,
+                agg_form_sections, model_name,
             )
     except Exception:
         pass
 
     return (
-        attach_quotes(partial_bullets), agg_tensions, agg_gaps,
-        agg_team_health, agg_form_sections, model_name,
+        attach_quotes(partial_bullets), agg_gaps, agg_team_health,
+        agg_form_sections, model_name,
     )
 
 

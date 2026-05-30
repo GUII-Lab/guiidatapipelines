@@ -19,10 +19,13 @@ from datapipeline.leai_analysis import (
     build_chat_corpus_block,
     build_quicktake_user_text,
     build_response_corpus,
+    compute_team_completeness,
     default_chat_system_prompt,
     default_quicktake_system_prompt,
+    filter_actions,
     filter_bullet_citations,
     generate_quicktake,
+    merge_team_completeness,
     parse_inline_citations,
     run_chat_turn,
     validate_quote_spans,
@@ -544,6 +547,86 @@ class BuildResponseCorpusTeamAnnotationTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# TeamCompletenessTest
+# ---------------------------------------------------------------------------
+
+class TeamCompletenessTest(TestCase):
+    """compute_team_completeness + merge_team_completeness — deterministic
+    per-team response counts that surface fully-silent teams."""
+
+    def setUp(self):
+        self.course = _make_course("complete-c", "Completeness Course")
+        self.survey = _make_survey(self.course, week_number=1)
+        cfg = TeamConfiguration.objects.create(
+            course=self.course, name="Project Teams", label_prefix="Team",
+        )
+        self.snapshot = SurveyTeamSnapshot.objects.create(
+            survey=self.survey, source_configuration=cfg,
+            name="Project Teams", label_prefix="Team",
+        )
+        # Alpha: 4 members, 2 submit. Beta: 3 members, 0 submit (silent).
+        self.alpha = SurveyTeam.objects.create(
+            snapshot=self.snapshot, number=1, size=4, display_name="Alpha",
+        )
+        self.beta = SurveyTeam.objects.create(
+            snapshot=self.snapshot, number=2, size=3, display_name="",
+        )
+        for sid in ("a1", "a2"):
+            _make_msg(self.survey, sid, "Alpha checking in.")
+            SessionTeamAssignment.objects.create(
+                session_id=sid, survey_team=self.alpha,
+            )
+
+    def _completeness(self):
+        corpus = build_response_corpus(course=self.course, scope_kind="course")
+        surveys = FeedbackGPT.objects.filter(course=self.course)
+        return compute_team_completeness(corpus, surveys)
+
+    def test_counts_expected_submitted_missing(self):
+        c = self._completeness()
+        self.assertEqual(
+            c["Alpha"], {"expected": 4, "submitted": 2, "missing": 2},
+        )
+
+    def test_fully_silent_team_is_present_with_zero_submitted(self):
+        # Beta has no display_name → "Team 2"; nobody submitted, so it must
+        # still appear — catching the silent team is the whole point.
+        c = self._completeness()
+        self.assertEqual(
+            c["Team 2"], {"expected": 3, "submitted": 0, "missing": 3},
+        )
+
+    def test_merge_attaches_counts_and_appends_silent_team(self):
+        c = self._completeness()
+        # The model assessed Alpha only.
+        team_health = [{
+            "team_name": "Alpha", "status": "healthy",
+            "summary": "Good rhythm.",
+            "quote": {"rid": "R1", "text": "checking in"},
+        }]
+        merged = merge_team_completeness(team_health, c)
+        by_name = {t["team_name"]: t for t in merged}
+        # Alpha keeps its model status and gains the counts.
+        self.assertEqual(by_name["Alpha"]["status"], "healthy")
+        self.assertEqual(by_name["Alpha"]["missing"], 2)
+        # The silent team is appended and flagged at_risk.
+        self.assertIn("Team 2", by_name)
+        self.assertEqual(by_name["Team 2"]["status"], "at_risk")
+        self.assertEqual(by_name["Team 2"]["submitted"], 0)
+        # Attention-first ordering: the silent at_risk team leads.
+        self.assertEqual(merged[0]["team_name"], "Team 2")
+
+    def test_missing_clamped_at_zero_when_overfull(self):
+        # More submitters than the recorded size must not go negative.
+        c = compute_team_completeness(
+            corpus=[{"team_name": "Alpha"}] * 5,
+            surveys_qs=FeedbackGPT.objects.filter(course=self.course),
+        )
+        self.assertEqual(c["Alpha"]["submitted"], 5)
+        self.assertEqual(c["Alpha"]["missing"], 0)
+
+
+# ---------------------------------------------------------------------------
 # ValidateTensionsTest
 # ---------------------------------------------------------------------------
 
@@ -637,6 +720,63 @@ class FilterBulletCitationsTest(TestCase):
         self.assertEqual(filter_bullet_citations([], valid_rids={"R1"}), [])
 
 
+class FilterActionsTest(TestCase):
+    """Tests for filter_actions() — Phase 9 suggested-actions cleaner."""
+
+    def test_drops_hallucinated_rids(self):
+        actions = [
+            {"text": "Add a worked example.", "rationale": "confusion",
+             "priority": "high", "cited_ids": ["R5", "R99"]},
+        ]
+        cleaned = filter_actions(actions, valid_rids={"R5"})
+        self.assertEqual(cleaned[0]["cited_ids"], ["R5"])
+
+    def test_action_with_all_hallucinated_rids_kept_with_empty_cited(self):
+        actions = [{"text": "Do X.", "rationale": "y", "priority": "low",
+                    "cited_ids": ["R98", "R99"]}]
+        cleaned = filter_actions(actions, valid_rids={"R1"})
+        self.assertEqual(len(cleaned), 1)
+        self.assertEqual(cleaned[0]["cited_ids"], [])
+
+    def test_blank_text_action_dropped(self):
+        actions = [
+            {"text": "   ", "rationale": "y", "priority": "high",
+             "cited_ids": ["R1"]},
+            {"text": "Real action.", "rationale": "y", "priority": "high",
+             "cited_ids": ["R1"]},
+        ]
+        cleaned = filter_actions(actions, valid_rids={"R1"})
+        self.assertEqual(len(cleaned), 1)
+        self.assertEqual(cleaned[0]["text"], "Real action.")
+
+    def test_unknown_priority_coerced_to_medium(self):
+        actions = [{"text": "X.", "rationale": "y", "priority": "URGENT!!",
+                    "cited_ids": ["R1"]}]
+        cleaned = filter_actions(actions, valid_rids={"R1"})
+        self.assertEqual(cleaned[0]["priority"], "medium")
+
+    def test_priority_case_normalized(self):
+        actions = [{"text": "X.", "rationale": "y", "priority": "High",
+                    "cited_ids": ["R1"]}]
+        cleaned = filter_actions(actions, valid_rids={"R1"})
+        self.assertEqual(cleaned[0]["priority"], "high")
+
+    def test_missing_priority_defaults_to_medium(self):
+        actions = [{"text": "X.", "rationale": "y", "cited_ids": ["R1"]}]
+        cleaned = filter_actions(actions, valid_rids={"R1"})
+        self.assertEqual(cleaned[0]["priority"], "medium")
+
+    def test_does_not_mutate_input(self):
+        actions = [{"text": "X.", "rationale": "y", "priority": "low",
+                    "cited_ids": ["R1", "R2"]}]
+        filter_actions(actions, valid_rids={"R1"})
+        self.assertEqual(actions[0]["cited_ids"], ["R1", "R2"])
+
+    def test_empty_input(self):
+        self.assertEqual(filter_actions([], valid_rids={"R1"}), [])
+        self.assertEqual(filter_actions(None, valid_rids={"R1"}), [])
+
+
 # ---------------------------------------------------------------------------
 # PromptsAndSchemasTest
 # ---------------------------------------------------------------------------
@@ -701,6 +841,37 @@ class PromptsAndSchemasTest(TestCase):
         self.assertIn("quotes", bullet_item["required"])
         quote_item = bullet_item["properties"]["quotes"]["items"]
         self.assertEqual(set(quote_item["required"]), {"rid", "text"})
+
+    def test_quicktake_schema_requires_sentiment_per_bullet(self):
+        # Per-bullet valence drives the instructor UI's positive/negative
+        # color coding. The model must always classify; the frontend treats
+        # an absent or unknown value as neutral.
+        bullet_item = QUICKTAKE_SCHEMA["properties"]["bullets"]["items"]
+        self.assertIn("sentiment", bullet_item["properties"])
+        self.assertIn("sentiment", bullet_item["required"])
+        self.assertEqual(
+            set(bullet_item["properties"]["sentiment"]["enum"]),
+            {"positive", "negative", "mixed", "neutral"},
+        )
+
+    def test_quicktake_schema_omits_tensions_and_actions(self):
+        # Tensions and suggested actions were removed from generation:
+        # instructors prefer to choose their own actions, and the tinted
+        # bullets (now carrying their full citation count) convey
+        # disagreement and how many students are on each side directly.
+        self.assertNotIn("tensions", QUICKTAKE_SCHEMA["properties"])
+        self.assertNotIn("actions", QUICKTAKE_SCHEMA["properties"])
+        self.assertNotIn("tensions", QUICKTAKE_SCHEMA["required"])
+        self.assertNotIn("actions", QUICKTAKE_SCHEMA["required"])
+
+    def test_quicktake_prompt_drops_tensions_actions_demands_all_rids(self):
+        prompt = default_quicktake_system_prompt()
+        # No longer instructs the model on tensions or actions.
+        self.assertNotIn("TENSIONS", prompt)
+        self.assertNotIn("ACTIONS", prompt)
+        # cited_ids must now be exhaustive so the count reflects every
+        # supporting student, not a 2–3 sample.
+        self.assertIn("EVERY response ID", prompt)
 
     def test_verifier_schema_is_valid_json_schema(self):
         self.assertIsInstance(VERIFIER_SCHEMA, dict)
@@ -871,9 +1042,11 @@ class GenerateQuickTakeTest(TestCase):
         self.assertNotIn("R999", rids_in_quotes)
         self.assertEqual(rids_in_quotes, ["R1"])
 
-    def test_generate_quicktake_persists_tensions_and_gaps(self):
+    def test_generate_quicktake_drops_tensions_keeps_gaps(self):
         # The corpus from setUp has 25 sessions "Response from student {i}".
-        # Build a tension whose verbatim quotes are substrings of two of them.
+        # Tensions are fed but should be dropped (no longer generated); gaps
+        # still persist. Build a tension whose quotes are real substrings so
+        # the only reason it's gone is the removal, not quote validation.
         tension = {
             "title": "On enthusiasm",
             "sides": [
@@ -911,11 +1084,43 @@ class GenerateQuickTakeTest(TestCase):
                 course=self.course, scope_key="course", scope_kind="course",
             )
 
-        # Real tension survives; fabricated one was dropped by the validator.
-        self.assertEqual(len(qt.tensions), 1)
-        self.assertEqual(qt.tensions[0]["title"], "On enthusiasm")
+        # Tensions are no longer generated — persisted empty regardless of
+        # what the model returned.
+        self.assertEqual(qt.tensions, [])
         # Gaps persist unchanged.
         self.assertEqual(qt.gaps, gaps)
+
+    def test_generate_quicktake_drops_actions_keeps_response_count(self):
+        # Suggested actions are no longer generated; even when the model
+        # returns some, the persisted row stores an empty list. The corpus-
+        # size snapshot is still captured.
+        actions = [
+            {"text": "Add a worked example before the next studio.",
+             "rationale": "Several students were confused.",
+             "priority": "HIGH", "cited_ids": ["R1", "R999"]},
+            {"text": "Keep the current lab pacing.",
+             "rationale": "Widely praised.",
+             "priority": "weird", "cited_ids": ["R2"]},
+        ]
+        bullets = [{"text": "Synthesis.", "cited_ids": ["R1"],
+                    "quotes": [{"rid": "R1", "text": "Response from student 0"}]}]
+        parsed = {"bullets": bullets, "tensions": [], "gaps": [],
+                  "team_health": [], "form_sections": [], "actions": actions}
+        with patch(
+            "datapipeline.leai_analysis.openai_client.run_structured",
+            return_value={
+                "response": json.dumps(parsed),
+                "parsed": parsed,
+                "usage": {},
+                "model": "gpt-5.1",
+            },
+        ):
+            qt = generate_quicktake(
+                course=self.course, scope_key="course", scope_kind="course",
+            )
+
+        self.assertEqual(qt.actions, [])
+        self.assertEqual(qt.responses_count_at_generation, 25)
 
     def test_generate_quicktake_raises_on_insufficient_data(self):
         # Hard floor is < 5 responses; 4 should trigger ValueError. The
@@ -964,6 +1169,7 @@ class ChunkedQuickTakeTest(TestCase):
             "gaps": extra.get("gaps", []),
             "team_health": extra.get("team_health", []),
             "form_sections": extra.get("form_sections", []),
+            "actions": extra.get("actions", []),
         }
         return {
             "response": json.dumps(parsed),
@@ -1004,9 +1210,10 @@ class ChunkedQuickTakeTest(TestCase):
         rids_in_quotes = [q["rid"] for q in qt.bullets[0]["quotes"]]
         self.assertEqual(sorted(rids_in_quotes), ["R1", "R20"])
 
-    def test_chunked_path_aggregates_tensions_gaps_team_health_form_sections(self):
-        # Each chunk emits a distinct tension/gap/section; aggregation
-        # dedupes by title/topic/team and surfaces both.
+    def test_chunked_path_aggregates_gaps_across_chunks(self):
+        # Each chunk emits a distinct gap/section; aggregation dedupes by
+        # topic/title and surfaces both. Tensions are fed in but, post-
+        # removal, are no longer collected or stored.
         chunk1 = self._chunk_response(
             [{"text": "B1.", "cited_ids": ["R1"], "quotes": []}],
             tensions=[{"title": "Pace", "sides": [
@@ -1049,10 +1256,9 @@ class ChunkedQuickTakeTest(TestCase):
                 course=self.course, scope_key="course", scope_kind="course",
             )
 
-        # Tensions deduped by title.
-        self.assertEqual(len(qt.tensions), 1)
-        self.assertEqual(qt.tensions[0]["title"], "Pace")
-        # Two distinct gaps.
+        # Tensions are no longer generated — always empty post-removal.
+        self.assertEqual(qt.tensions, [])
+        # Two distinct gaps still aggregate across chunks.
         self.assertEqual({g["topic"] for g in qt.gaps},
                          {"Workload balance", "Office hours"})
 
