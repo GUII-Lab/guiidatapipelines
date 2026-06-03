@@ -29,11 +29,20 @@ logger = logging.getLogger(__name__)
 QUICKTAKE_CHUNK_CHAR_LIMIT = 40_000
 QUICKTAKE_CHUNK_MAX_WORKERS = 5
 
-# Latency-optimised model for Quick Take calls. The quicktake path runs
-# summariser + reducer + verifier — a reasoning model (gpt-5.1) blows the
-# Heroku 30s budget even for modest corpora, and the Quick Take job is now
-# async anyway, so we trade reasoning depth for throughput.
-QUICKTAKE_MODEL = "gpt-4.1-mini"
+# A bullet backed by this many distinct students (or fewer) is treated as an
+# isolated one-off rather than a theme. The instructor UI splits these into a
+# separate "Mentioned by one student" group so a single voice can't read as a
+# class-wide pattern. Raise to 2 to require 3+ students before a claim counts
+# as a theme.
+ISOLATED_SUPPORT_MAX = 1
+
+# Model for Quick Take / Instructor Insights calls (summariser + reducer +
+# verifier + bullet-coherence pass). These judgments — especially detecting
+# when a bullet bundles two distinct one-offs into a fake theme — benefit from
+# a reasoning model, and the Quick Take job is async so it is no longer bound
+# by the Heroku 30s request budget. We therefore use the reasoning model
+# (gpt-5.1) rather than trading reasoning depth for throughput.
+QUICKTAKE_MODEL = "gpt-5.1"
 
 # If a quicktake row stays in pending/running past this many seconds past
 # job_started_at, the web tier treats it as a zombie (dyno cycled mid-job)
@@ -96,12 +105,29 @@ def default_quicktake_system_prompt() -> str:
         "the instructor's perspective. If unsure between `mixed` and one "
         "side, use `mixed` only when both signals are roughly equal; "
         "otherwise pick the dominant valence. Avoid defaulting to "
-        "`neutral` when there is a real positive or negative signal.\n\n"
+        "`neutral` when there is a real positive or negative signal.\n"
+        "  6. One claim per bullet, and EVERY response you cite on a bullet "
+        "must actually express that same claim. Do not bundle different "
+        "observations — even related-sounding ones — under a single umbrella "
+        "bullet to make them look like a shared theme: if two students raised "
+        "genuinely different points, that is two bullets, not one. A point "
+        "only one student made is a one-off, not a theme — give it its own "
+        "single bullet (cited to that one response), and never reuse the same "
+        "quote or response as the evidence for more than one bullet. "
+        "Single-student bullets are grouped separately downstream, so there "
+        "is no need to merge or stretch responses into a class-wide claim. "
+        "Concretely: NEVER write a bullet like \"students feel disconnected "
+        "and think design is only about pretty interfaces\" that cites one "
+        "response for the first half and a different response for the second "
+        "— those are two separate one-offs, each its own single bullet. If a "
+        "bullet joins two different observations with \"and\", split it.\n\n"
         "Output format (JSON, enforced by schema):\n"
         '  { "bullets": [ { "text": "...", "cited_ids": ["R5","R12"], '
         '"quotes": [ {"rid":"R5","text":"verbatim span..."}, ... ], '
         '"sentiment": "negative" }, ... ] }\n\n'
-        "Be objective, accurate, and avoid over-generalisation.\n\n"
+        "Be objective and accurate. Avoid over-generalisation: never let one "
+        "response stand in for the class, and weight each theme by how many "
+        "distinct students actually voiced it.\n\n"
         "Also produce these additional fields:\n\n"
         "GAPS — topics the instructor might expect to hear about that are "
         "noticeably absent from the corpus. Each gap is an object "
@@ -379,6 +405,29 @@ VERIFIER_SCHEMA: dict = {
                     },
                 },
                 "required": ["bullet_index", "source_id", "verdict"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["results"],
+    "additionalProperties": False,
+}
+
+# Bullet-level coherence: is each themed bullet ONE shared claim, or a bundle
+# of distinct points different responses made separately? Drives the split in
+# enforce_coherence so two one-offs can't masquerade as a multi-student theme.
+COHERENCE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "bullet_index": {"type": "integer"},
+                    "coherent": {"type": "boolean"},
+                },
+                "required": ["bullet_index", "coherent"],
                 "additionalProperties": False,
             },
         },
@@ -677,13 +726,22 @@ def build_quicktake_user_text(
         "Synthesise these responses into bullet points, citing response IDs "
         "inline.\n\n"
         "REQUIRED for every bullet:\n"
-        '  - `quotes` must contain at least 1 entry — a verbatim span '
-        "copied character-for-character from one of the cited responses. "
+        '  - `quotes`: 1–3 verbatim spans copied character-for-character '
+        "from the cited responses — a curated subset, NOT one per cited id. "
         "Do NOT paraphrase, summarise, or stitch together pieces from "
         "different rids. Copy a contiguous run of text from the rid's "
-        "actual response. A bullet with zero quotes will be rejected.\n"
-        '  - `cited_ids` should be 2-3 representative rids, not a long list. '
-        "Each quote's `rid` must appear in this bullet's `cited_ids`.\n"
+        "actual response. A bullet with zero quotes will be rejected. Do "
+        "NOT reuse the same quote (same response and span) across bullets, "
+        "and do not build more than one bullet around a single response.\n"
+        '  - `cited_ids`: list EVERY response that genuinely supports this '
+        "claim — not a sample. The instructor reads the length of this list "
+        "as how many students are on this side, so cite all of them; keep "
+        "`quotes` (above) short instead. Cite a response only if it actually "
+        "expresses THIS bullet's claim — do not merge unrelated "
+        "single-student points to inflate the count. If a bullet joins two "
+        "different observations with \"and\" (e.g. \"X and Y\"), split it into "
+        "separate bullets. Each quote's `rid` must "
+        "appear in this bullet's `cited_ids`.\n"
         '  - `sentiment` must be one of `positive`, `negative`, `mixed`, or '
         "`neutral` (see the system prompt for the rubric). Only use "
         "`neutral` when the bullet is genuinely descriptive without "
@@ -1094,6 +1152,151 @@ def filter_bullet_citations(
     return cleaned
 
 
+def annotate_support(
+    bullets: list[dict],
+    isolated_max: int = ISOLATED_SUPPORT_MAX,
+) -> list[dict]:
+    """Tag each bullet with its student-support count and an isolation flag.
+
+    `support_count` is the number of DISTINCT cited responses — the model is
+    told to cite every response that supports a claim, so this is "how many
+    students are on this side". `is_isolated` is True when that count is at
+    most `isolated_max` (default 1), marking a single-student one-off that the
+    frontend renders in a separate "Mentioned by one student" group instead of
+    among the themes. Call this AFTER filter_bullet_citations so hallucinated
+    rids don't inflate the count.
+
+    Returns a new list; does not mutate the input.
+    """
+    annotated: list[dict] = []
+    for b in bullets:
+        count = len({rid for rid in b.get("cited_ids", []) if rid})
+        annotated.append({
+            **b,
+            "support_count": count,
+            "is_isolated": count <= isolated_max,
+        })
+    return annotated
+
+
+def dedupe_bullet_quotes(bullets: list[dict]) -> list[dict]:
+    """Stop one vivid quote from anchoring multiple bullets.
+
+    Identical evidence — the same response (rid) quoted with the same span —
+    reused across bullets is the reported failure mode where one student's
+    striking line gets repeated on nearly every takeaway. Each quote, keyed by
+    (rid, normalized text), is kept only under the FIRST bullet that uses it;
+    later repeats are dropped. The same span from two DIFFERENT students is
+    genuine corroboration and is left intact.
+
+    A bullet that loses all its quotes is kept (its claim text and citation
+    count still stand) — consistent with validate_quote_spans.
+
+    Returns a new list; does not mutate the input.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for b in bullets:
+        kept_quotes: list[dict] = []
+        for q in b.get("quotes") or []:
+            rid = (q.get("rid") or "").strip()
+            key = (rid, _normalize_for_quote_match(q.get("text") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            kept_quotes.append(q)
+        out.append({**b, "quotes": kept_quotes})
+    return out
+
+
+def enforce_coherence(
+    bullets: list[dict],
+    incoherent_indices,
+    verification: list[dict],
+    isolated_max: int = ISOLATED_SUPPORT_MAX,
+) -> tuple[list[dict], list[dict]]:
+    """Split bundled bullets flagged incoherent into single-student one-offs.
+
+    The per-claim count gate (`annotate_support`) is evaded when the model
+    merges two DISTINCT single-student points into one bullet citing both rids
+    — `support=2` makes it read as a class-wide theme even though neither
+    student made the merged claim. Per-citation verification can't catch it:
+    the bullet is phrased "some students feel X and [some] feel Y", so each
+    response genuinely backs its own half and passes. `check_bullet_coherence`
+    asks the orthogonal question — do ALL cited responses make the SAME point?
+    — and reports the indices of bullets that are bundles.
+
+    `incoherent_indices` is that set. Each flagged bullet citing >=2 responses
+    is split into one single-student one-off per cited response, using that
+    response's own verbatim quote as the claim, so neither point can
+    masquerade as a shared theme. Other bullets are kept; `support_count` and
+    `is_isolated` are derived from the distinct cited responses.
+
+    `verification` (per (bullet_index, source_id) verdict) is re-indexed to the
+    new bullet positions so the frontend's citation-dropping stays correct
+    after a split. When `incoherent_indices` is empty (e.g. the coherence pass
+    degraded to []), nothing is split — a strict superset of
+    `annotate_support`, never a regression. Does not mutate the inputs.
+    """
+    incoherent = set(incoherent_indices or ())
+    verdict_of: dict[tuple, Optional[str]] = {}
+    for v in verification or []:
+        verdict_of[(v.get("bullet_index"), v.get("source_id"))] = v.get("verdict")
+
+    def distinct(seq):
+        return list(dict.fromkeys(rid for rid in (seq or []) if rid))
+
+    new_bullets: list[dict] = []
+    new_verification: list[dict] = []
+
+    for bi, b in enumerate(bullets):
+        cited = distinct(b.get("cited_ids"))
+        quote_by_rid: dict[str, dict] = {}
+        for q in b.get("quotes") or []:
+            rid = (q.get("rid") or "").strip()
+            if rid and rid not in quote_by_rid:
+                quote_by_rid[rid] = q
+
+        is_bundle = bi in incoherent and len(cited) >= 2
+
+        if is_bundle:
+            # One self-standing one-off per cited response; its claim is the
+            # student's own words, so nothing is synthesized across responses.
+            for r in cited:
+                q = quote_by_rid.get(r)
+                claim = (q.get("text") or "").strip() if q else ""
+                if not claim:
+                    claim = (b.get("text") or "").strip()
+                idx = len(new_bullets)
+                new_bullets.append({
+                    **b,
+                    "text": claim,
+                    "cited_ids": [r],
+                    "quotes": [],
+                    "support_count": 1,
+                    "is_isolated": True,
+                })
+                new_verification.append({
+                    "bullet_index": idx, "source_id": r, "verdict": "supported",
+                })
+        else:
+            count = len(cited)
+            idx = len(new_bullets)
+            new_bullets.append({
+                **b,
+                "support_count": count,
+                "is_isolated": count <= isolated_max,
+            })
+            for r in cited:
+                vd = verdict_of.get((bi, r))
+                if vd is not None:
+                    new_verification.append({
+                        "bullet_index": idx, "source_id": r, "verdict": vd,
+                    })
+
+    return new_bullets, new_verification
+
+
 def filter_actions(
     actions: list[dict],
     valid_rids: set[str],
@@ -1157,8 +1360,15 @@ def verify_claims(
 
     system_msg = (
         "You are a verification assistant. "
-        "For each bullet point, check whether each cited response ID actually "
-        "supports the claim. "
+        "For each bullet point, judge whether each cited response expresses "
+        "that bullet's claim. Use these verdicts strictly:\n"
+        "- 'supported': the response, on its own, clearly states this bullet's "
+        "FULL claim.\n"
+        "- 'partial': the response is related but does not itself state the "
+        "full claim — for instance it backs only ONE part of a claim that "
+        "combines several points, so the claim only holds by stitching this "
+        "response together with a different one.\n"
+        "- 'unsupported': the response does not back the claim at all.\n"
         "Return a 'results' array where each entry has: "
         "bullet_index (int), source_id (the R-id string), "
         "and verdict ('supported', 'partial', or 'unsupported')."
@@ -1181,6 +1391,75 @@ def verify_claims(
         return result["parsed"].get("results", [])
     except Exception:
         # Graceful degradation: verification failure must not break the turn
+        return []
+
+
+def check_bullet_coherence(
+    corpus: list[dict],
+    bullets: list[dict],
+    model: Optional[str] = None,
+) -> list[dict]:
+    """Judge whether each multi-citation bullet is ONE shared claim or a bundle.
+
+    The count gate is evaded when the model merges two distinct single-student
+    points into one bullet phrased "some students feel X and [some] feel Y" —
+    each cited response then genuinely backs its own half, so per-citation
+    verification passes it. This asks the orthogonal question: do ALL the cited
+    responses make the SAME point (a real theme), or do different responses
+    make different points (a bundle that should be split)?
+
+    Only bullets citing >=2 distinct responses are evaluated; a single-citation
+    bullet is trivially coherent and the model is not consulted when none
+    qualify. Returns a list of {bullet_index, coherent: bool}. On failure
+    returns [] (graceful: callers treat a missing judgment as coherent, so a
+    verifier outage never splits a bullet).
+    """
+    if not bullets or not corpus:
+        return []
+
+    corpus_by_rid = {e["rid"]: e for e in corpus if e.get("rid")}
+    blocks = []
+    for idx, b in enumerate(bullets):
+        cited = list(dict.fromkeys(r for r in (b.get("cited_ids") or []) if r))
+        if len(cited) < 2:
+            continue
+        lines = [f"Bullet {idx}: \"{b.get('text', '')}\""]
+        for r in cited:
+            entry = corpus_by_rid.get(r)
+            snippet = (entry["text"] if entry else "").strip()
+            lines.append(f"   - {r}: {snippet}")
+        blocks.append("\n".join(lines))
+    if not blocks:
+        return []
+
+    system_msg = (
+        "You check whether each themed bullet represents a SINGLE shared idea. "
+        "For each bullet you are given its cited student responses. Answer "
+        "coherent=true if the cited responses all make essentially the SAME "
+        "point (a genuine shared theme). Answer coherent=false if the bullet "
+        "lumps together DIFFERENT points that different responses make "
+        "separately — for example \"students feel disconnected and think "
+        "design is just about pretty interfaces\", where one response is about "
+        "feeling disconnected and a different response is about design being "
+        "only aesthetics. If the cited responses are about different topics, "
+        "the bullet is NOT coherent. Return a 'results' array of objects "
+        "{bullet_index (int), coherent (bool)}."
+    )
+    user_text = "Bullets to check:\n\n" + "\n\n".join(blocks)
+
+    try:
+        result = openai_client.run_structured(
+            chat_history=[{"role": "system", "content": system_msg}],
+            user_text=user_text,
+            json_schema=COHERENCE_SCHEMA,
+            schema_name="bullet_coherence",
+            model=model,
+            temperature=0,
+        )
+        return result["parsed"].get("results", [])
+    except Exception:
+        # Graceful degradation: a coherence-check failure must not break the
+        # turn — callers treat the absence of a verdict as "coherent".
         return []
 
 
@@ -1282,6 +1561,18 @@ def generate_quicktake(
     # model can't fabricate a sentence and claim a real rid said it.
     bullets, _quote_stats = validate_quote_spans(bullets, corpus)
 
+    # Stop one vivid quote from anchoring every line: a response quoted with
+    # the same span on an earlier bullet is dropped from later bullets, so a
+    # single student's striking line can't masquerade as the whole class.
+    bullets = dedupe_bullet_quotes(bullets)
+
+    # Tag each bullet with its distinct-student support count and flag
+    # single-student one-offs. The frontend reads `is_isolated` to split a
+    # one-off out of the themes (its own "Mentioned by one student" group)
+    # instead of letting an n=1 observation read as a class-wide pattern.
+    # Runs after citation filtering so hallucinated rids never inflate a count.
+    bullets = annotate_support(bullets)
+
     # Drop team_health entries that name unknown teams or carry
     # unverifiable quotes.
     team_health = validate_team_health(team_health, corpus)
@@ -1323,6 +1614,21 @@ def generate_quicktake(
     )
 
     verification = verify_claims(corpus=corpus, bullets=bullets, model=QUICKTAKE_MODEL)
+
+    # Last line of defense against count-gate evasion. A bullet that lumps two
+    # distinct one-offs is phrased so each citation backs its own half, so
+    # per-citation verification passes it. A separate coherence pass asks the
+    # orthogonal question — do ALL cited responses make the SAME point? — and
+    # any multi-citation bullet judged a bundle is split into per-response
+    # one-offs (re-indexing `verification`) so a lone voice can't masquerade
+    # as a theme.
+    coherence = check_bullet_coherence(
+        corpus=corpus, bullets=bullets, model=QUICKTAKE_MODEL,
+    )
+    incoherent = {
+        c["bullet_index"] for c in coherence if c.get("coherent") is False
+    }
+    bullets, verification = enforce_coherence(bullets, incoherent, verification)
 
     quicktake, _ = LEAIQuickTake.objects.update_or_create(
         course=course,
@@ -1588,7 +1894,11 @@ def _run_chunked_quicktake(
         "of the same student-feedback corpus into a single concise set of "
         "bullets. Preserve the exact [R<n>] citation IDs from the input — do "
         "not invent new ones. Merge overlapping themes, drop duplicates, and "
-        "keep the bullets objective and specific. Each merged bullet must "
+        "keep the bullets objective and specific. When you merge two bullets "
+        "about the same theme, the merged bullet must carry the UNION of all "
+        "their [R<n>] citations — never drop a citation, since the count of "
+        "distinct citations is how many students back the theme. Each merged "
+        "bullet must "
         "also carry a `sentiment` tag (`positive`, `negative`, `mixed`, or "
         "`neutral`). Inputs are pre-tagged with their source sentiment — use "
         "those as the primary signal; if two merged partials disagree, "

@@ -1012,6 +1012,96 @@ class GenerateQuickTakeTest(TestCase):
         self.assertIn("Response from student 1", verified_texts)
         self.assertNotIn("I just made this up.", verified_texts)
 
+    def test_generate_quicktake_gates_singletons_and_strips_reused_quotes(self):
+        # A multi-student theme and a single-student one-off that reuses the
+        # theme's exact quote. After generation the theme must be flagged as
+        # not isolated, the one-off as isolated, and the reused quote must
+        # survive only on the first (theme) bullet — the two failure modes
+        # the instructors reported, fixed at the persistence layer.
+        bullets = [
+            {"text": "Theme bullet", "cited_ids": ["R1", "R2", "R3"],
+             "quotes": [{"rid": "R1", "text": "Response from student"}],
+             "sentiment": "negative"},
+            {"text": "One-off bullet", "cited_ids": ["R1"],
+             "quotes": [{"rid": "R1", "text": "Response from student"}],
+             "sentiment": "neutral"},
+        ]
+        parsed = {"bullets": bullets, "tensions": [], "gaps": [],
+                  "team_health": [], "form_sections": []}
+        with patch(
+            "datapipeline.leai_analysis.openai_client.run_structured",
+            return_value={
+                "response": json.dumps(parsed), "parsed": parsed,
+                "usage": {}, "model": "gpt-5.1",
+            },
+        ):
+            qt = generate_quicktake(
+                course=self.course, scope_key="course", scope_kind="course",
+            )
+
+        self.assertEqual(len(qt.bullets), 2)
+        theme, oneoff = qt.bullets[0], qt.bullets[1]
+        # Support counts come from distinct cited_ids.
+        self.assertEqual(theme["support_count"], 3)
+        self.assertFalse(theme["is_isolated"])
+        self.assertEqual(oneoff["support_count"], 1)
+        self.assertTrue(oneoff["is_isolated"])
+        # The reused quote is kept on the theme, stripped from the one-off.
+        self.assertEqual(len(theme["quotes"]), 1)
+        self.assertEqual(oneoff["quotes"], [])
+
+    def test_generate_quicktake_splits_bundled_oneoffs(self):
+        # End-to-end count-gate evasion: the model bundles two DISTINCT
+        # single-student points into one compound bullet citing both rids
+        # (support=2 -> looks like a theme). Per-citation verification passes
+        # (each response backs its own half); the coherence pass is what flags
+        # it as a bundle. After generation the compound "theme" must be gone,
+        # replaced by two isolated one-offs — the lumping failure, fixed at the
+        # persistence layer so a stronger corpus can't sneak it past the gate.
+        gen_bullets = [{
+            "text": "Students feel disconnected and misunderstand design.",
+            "cited_ids": ["R1", "R2"],
+            "quotes": [
+                {"rid": "R1", "text": "Response from student 0"},
+                {"rid": "R2", "text": "Response from student 1"},
+            ],
+            "sentiment": "negative",
+        }]
+        gen_parsed = {"bullets": gen_bullets, "tensions": [], "gaps": [],
+                      "team_health": [], "form_sections": []}
+        verify_parsed = {"results": [
+            {"bullet_index": 0, "source_id": "R1", "verdict": "supported"},
+            {"bullet_index": 0, "source_id": "R2", "verdict": "supported"},
+        ]}
+        coherence_parsed = {"results": [{"bullet_index": 0, "coherent": False}]}
+
+        def _wrap(p):
+            return {"response": json.dumps(p), "parsed": p, "usage": {},
+                    "model": "gpt-5.1"}
+
+        def _route(*args, **kwargs):
+            schema = kwargs.get("schema_name")
+            if schema == "verification_result":
+                return _wrap(verify_parsed)
+            if schema == "bullet_coherence":
+                return _wrap(coherence_parsed)
+            return _wrap(gen_parsed)
+
+        with patch(
+            "datapipeline.leai_analysis.openai_client.run_structured",
+            side_effect=_route,
+        ):
+            qt = generate_quicktake(
+                course=self.course, scope_key="course", scope_kind="course",
+            )
+
+        # The compound 2-citation "theme" is gone; two isolated one-offs remain.
+        self.assertEqual(len(qt.bullets), 2)
+        self.assertTrue(all(b["is_isolated"] for b in qt.bullets))
+        self.assertTrue(all(b["support_count"] == 1 for b in qt.bullets))
+        self.assertTrue(all(len(b["cited_ids"]) == 1 for b in qt.bullets))
+        self.assertEqual(sorted(b["cited_ids"][0] for b in qt.bullets), ["R1", "R2"])
+
     def test_generate_quicktake_drops_hallucinated_rids_and_quotes(self):
         # Defense in depth: hallucinated rid first, then quote validator
         # never even sees it because filter_bullet_citations strips it.
@@ -1199,7 +1289,8 @@ class ChunkedQuickTakeTest(TestCase):
 
         with patch(
             "datapipeline.leai_analysis.openai_client.run_structured",
-            side_effect=[chunk1, chunk2, reducer, self._chunk_response([])],
+            side_effect=[chunk1, chunk2, reducer, self._chunk_response([]),
+                         self._chunk_response([])],
         ):
             qt = generate_quicktake(
                 course=self.course, scope_key="course", scope_kind="course",
@@ -1250,7 +1341,8 @@ class ChunkedQuickTakeTest(TestCase):
 
         with patch(
             "datapipeline.leai_analysis.openai_client.run_structured",
-            side_effect=[chunk1, chunk2, reducer, self._chunk_response([])],
+            side_effect=[chunk1, chunk2, reducer, self._chunk_response([]),
+                         self._chunk_response([])],
         ):
             qt = generate_quicktake(
                 course=self.course, scope_key="course", scope_kind="course",
@@ -1281,7 +1373,8 @@ class ChunkedQuickTakeTest(TestCase):
         ])
         with patch(
             "datapipeline.leai_analysis.openai_client.run_structured",
-            side_effect=[chunk1, chunk2, reducer, self._chunk_response([])],
+            side_effect=[chunk1, chunk2, reducer, self._chunk_response([]),
+                         self._chunk_response([])],
         ):
             qt = generate_quicktake(
                 course=self.course, scope_key="course", scope_kind="course",
@@ -1451,3 +1544,352 @@ class RunChatTurnTest(TestCase):
         # No messages should have been saved (transaction rolled back)
         count = LEAIChatMessage.objects.filter(session=self.session).count()
         self.assertEqual(count, 0)
+
+
+class AnnotateSupportTest(TestCase):
+    """Tests for annotate_support() — per-bullet student-count gating.
+
+    The instructor reads cited_ids length as "how many students are on this
+    side". A claim backed by a single student is an isolated one-off, not a
+    theme — annotate_support tags each bullet with that count and an
+    `is_isolated` flag the frontend uses to split themes from one-offs.
+    """
+
+    def test_support_count_is_number_of_distinct_cited_ids(self):
+        bullets = [{"text": "Pacing felt rushed", "cited_ids": ["R1", "R2", "R3"]}]
+        out = leai_analysis.annotate_support(bullets)
+        self.assertEqual(out[0]["support_count"], 3)
+        self.assertFalse(out[0]["is_isolated"])
+
+    def test_duplicate_cited_ids_counted_once(self):
+        bullets = [{"text": "X", "cited_ids": ["R5", "R5", "R7"]}]
+        out = leai_analysis.annotate_support(bullets)
+        self.assertEqual(out[0]["support_count"], 2)
+        self.assertFalse(out[0]["is_isolated"])
+
+    def test_single_student_claim_is_isolated(self):
+        bullets = [{"text": "Felt disconnected from class", "cited_ids": ["R9"]}]
+        out = leai_analysis.annotate_support(bullets)
+        self.assertEqual(out[0]["support_count"], 1)
+        self.assertTrue(out[0]["is_isolated"])
+
+    def test_zero_citations_is_isolated(self):
+        bullets = [{"text": "Unverifiable claim", "cited_ids": []}]
+        out = leai_analysis.annotate_support(bullets)
+        self.assertEqual(out[0]["support_count"], 0)
+        self.assertTrue(out[0]["is_isolated"])
+
+    def test_missing_cited_ids_field_is_isolated(self):
+        bullets = [{"text": "No citation field at all"}]
+        out = leai_analysis.annotate_support(bullets)
+        self.assertEqual(out[0]["support_count"], 0)
+        self.assertTrue(out[0]["is_isolated"])
+
+    def test_isolated_max_override_widens_the_gate(self):
+        bullets = [{"text": "Two students", "cited_ids": ["R1", "R2"]}]
+        out = leai_analysis.annotate_support(bullets, isolated_max=2)
+        self.assertEqual(out[0]["support_count"], 2)
+        self.assertTrue(out[0]["is_isolated"])
+
+    def test_preserves_other_fields(self):
+        bullets = [{
+            "text": "Labs helped",
+            "cited_ids": ["R1", "R2"],
+            "quotes": [{"rid": "R1", "text": "the labs helped"}],
+            "sentiment": "positive",
+        }]
+        out = leai_analysis.annotate_support(bullets)
+        self.assertEqual(out[0]["text"], "Labs helped")
+        self.assertEqual(out[0]["sentiment"], "positive")
+        self.assertEqual(out[0]["quotes"], [{"rid": "R1", "text": "the labs helped"}])
+
+    def test_does_not_mutate_input(self):
+        bullets = [{"text": "X", "cited_ids": ["R1"]}]
+        leai_analysis.annotate_support(bullets)
+        self.assertNotIn("support_count", bullets[0])
+        self.assertNotIn("is_isolated", bullets[0])
+
+
+class DedupeBulletQuotesTest(TestCase):
+    """Tests for dedupe_bullet_quotes() — one vivid quote can't anchor every line.
+
+    The reported failure mode: a single student's striking quote (same rid +
+    same span) gets reused as evidence across many bullets. A given quote
+    should appear under only the first bullet that uses it; later repeats are
+    dropped so one voice can't masquerade as the whole class.
+    """
+
+    def test_repeated_quote_kept_only_in_first_bullet(self):
+        q = {"rid": "R5", "text": "design is just pretty interfaces"}
+        bullets = [
+            {"text": "Bullet A", "cited_ids": ["R5"], "quotes": [dict(q)]},
+            {"text": "Bullet B", "cited_ids": ["R5"], "quotes": [dict(q)]},
+        ]
+        out = leai_analysis.dedupe_bullet_quotes(bullets)
+        self.assertEqual(len(out[0]["quotes"]), 1)
+        self.assertEqual(out[1]["quotes"], [])
+
+    def test_same_text_different_rid_both_kept(self):
+        # Two different students saying the same thing is corroboration,
+        # not the reuse bug — keep both.
+        bullets = [
+            {"text": "A", "cited_ids": ["R5"], "quotes": [{"rid": "R5", "text": "too fast"}]},
+            {"text": "B", "cited_ids": ["R7"], "quotes": [{"rid": "R7", "text": "too fast"}]},
+        ]
+        out = leai_analysis.dedupe_bullet_quotes(bullets)
+        self.assertEqual(len(out[0]["quotes"]), 1)
+        self.assertEqual(len(out[1]["quotes"]), 1)
+
+    def test_normalization_ignores_case_and_whitespace(self):
+        bullets = [
+            {"text": "A", "cited_ids": ["R5"], "quotes": [{"rid": "R5", "text": "Design  Is Pretty"}]},
+            {"text": "B", "cited_ids": ["R5"], "quotes": [{"rid": "R5", "text": "design is pretty"}]},
+        ]
+        out = leai_analysis.dedupe_bullet_quotes(bullets)
+        self.assertEqual(len(out[0]["quotes"]), 1)
+        self.assertEqual(out[1]["quotes"], [])
+
+    def test_partial_dedupe_within_a_bullet_keeps_the_fresh_quote(self):
+        bullets = [
+            {"text": "A", "cited_ids": ["R5"], "quotes": [{"rid": "R5", "text": "q1"}]},
+            {"text": "B", "cited_ids": ["R5", "R7"], "quotes": [
+                {"rid": "R5", "text": "q1"},
+                {"rid": "R7", "text": "q2"},
+            ]},
+        ]
+        out = leai_analysis.dedupe_bullet_quotes(bullets)
+        self.assertEqual(out[1]["quotes"], [{"rid": "R7", "text": "q2"}])
+
+    def test_missing_quotes_field_is_safe(self):
+        bullets = [{"text": "A", "cited_ids": ["R5"]}]
+        out = leai_analysis.dedupe_bullet_quotes(bullets)
+        self.assertEqual(out[0].get("quotes", []), [])
+
+    def test_preserves_fields_and_bullet_order(self):
+        bullets = [
+            {"text": "First", "cited_ids": ["R1"], "sentiment": "negative",
+             "quotes": [{"rid": "R1", "text": "a"}]},
+            {"text": "Second", "cited_ids": ["R2"], "sentiment": "positive",
+             "quotes": [{"rid": "R2", "text": "b"}]},
+        ]
+        out = leai_analysis.dedupe_bullet_quotes(bullets)
+        self.assertEqual([b["text"] for b in out], ["First", "Second"])
+        self.assertEqual(out[0]["sentiment"], "negative")
+        self.assertEqual(out[1]["sentiment"], "positive")
+
+    def test_does_not_mutate_input(self):
+        bullets = [
+            {"text": "A", "cited_ids": ["R5"], "quotes": [{"rid": "R5", "text": "dup"}]},
+            {"text": "B", "cited_ids": ["R5"], "quotes": [{"rid": "R5", "text": "dup"}]},
+        ]
+        leai_analysis.dedupe_bullet_quotes(bullets)
+        self.assertEqual(len(bullets[1]["quotes"]), 1)
+
+
+class EnforceCoherenceTest(TestCase):
+    """Tests for enforce_coherence() — split flagged bundles into one-offs.
+
+    The model evades the per-claim count gate by merging two DISTINCT
+    single-student points into one bullet citing both rids (support=2 -> reads
+    as a class-wide theme), phrased "some students feel X and [some] feel Y"
+    so each citation backs its own half and PASSES per-citation verification.
+    check_bullet_coherence flags such a bullet as incoherent; enforce_coherence
+    then splits each flagged multi-citation bullet into one single-student
+    one-off per cited response, re-indexing verification to the new positions.
+    Bullets not flagged are kept untouched.
+    """
+
+    def _verif(self, *triples):
+        return [
+            {"bullet_index": bi, "source_id": rid, "verdict": v}
+            for (bi, rid, v) in triples
+        ]
+
+    def test_flagged_bundle_splits_into_two_isolated_oneoffs(self):
+        bullets = [{
+            "text": "Students feel disconnected and think design is only aesthetics.",
+            "cited_ids": ["R1", "R2"],
+            "quotes": [
+                {"rid": "R1", "text": "design is just about making pretty interfaces"},
+                {"rid": "R2", "text": "I feel disconnected from this class"},
+            ],
+            "sentiment": "negative",
+        }]
+        # Per-citation verification PASSES both (each backs its own half) — the
+        # split must hinge on the coherence flag alone, not on the verdicts.
+        verification = self._verif((0, "R1", "supported"), (0, "R2", "supported"))
+        new_bullets, new_verif = leai_analysis.enforce_coherence(
+            bullets, {0}, verification,
+        )
+
+        self.assertEqual(len(new_bullets), 2)
+        for b in new_bullets:
+            self.assertTrue(b["is_isolated"])
+            self.assertEqual(b["support_count"], 1)
+            self.assertEqual(len(b["cited_ids"]), 1)
+            self.assertEqual(b["sentiment"], "negative")  # inherited
+        # Each one-off's claim is the student's own verbatim words.
+        texts = [b["text"] for b in new_bullets]
+        self.assertIn("design is just about making pretty interfaces", texts)
+        self.assertIn("I feel disconnected from this class", texts)
+        # Verification is re-indexed to the new split bullet positions.
+        self.assertEqual(
+            {(v["bullet_index"], v["source_id"]) for v in new_verif},
+            {(0, "R1"), (1, "R2")},
+        )
+
+    def test_unflagged_pair_kept_as_theme(self):
+        bullets = [{
+            "text": "Readings are too long and dense.",
+            "cited_ids": ["R1", "R2"],
+            "quotes": [
+                {"rid": "R1", "text": "readings are too long"},
+                {"rid": "R2", "text": "papers are super dense"},
+            ],
+            "sentiment": "negative",
+        }]
+        verification = self._verif((0, "R1", "supported"), (0, "R2", "supported"))
+        new_bullets, _ = leai_analysis.enforce_coherence(bullets, set(), verification)
+
+        self.assertEqual(len(new_bullets), 1)
+        self.assertFalse(new_bullets[0]["is_isolated"])
+        self.assertEqual(new_bullets[0]["support_count"], 2)
+
+    def test_three_way_bundle_splits_into_three(self):
+        bullets = [{
+            "text": "Various unrelated gripes.",
+            "cited_ids": ["R1", "R2", "R3"],
+            "quotes": [
+                {"rid": "R1", "text": "the room is freezing cold"},
+                {"rid": "R2", "text": "parking is too expensive"},
+                {"rid": "R3", "text": "the textbook is overpriced"},
+            ],
+            "sentiment": "negative",
+        }]
+        new_bullets, _ = leai_analysis.enforce_coherence(bullets, {0}, [])
+
+        self.assertEqual(len(new_bullets), 3)
+        self.assertTrue(
+            all(b["is_isolated"] and b["support_count"] == 1 for b in new_bullets)
+        )
+
+    def test_no_flags_behaves_like_annotate_support(self):
+        # Graceful degradation: no incoherent flags -> never split; count by
+        # distinct cited_ids and flag isolation by threshold, exactly like
+        # annotate_support. (A strict superset, never a regression.)
+        bullets = [
+            {"text": "Theme", "cited_ids": ["R1", "R2", "R3"], "quotes": []},
+            {"text": "One-off", "cited_ids": ["R9"], "quotes": []},
+        ]
+        new_bullets, new_verif = leai_analysis.enforce_coherence(bullets, set(), [])
+
+        self.assertEqual(len(new_bullets), 2)
+        self.assertEqual(new_bullets[0]["support_count"], 3)
+        self.assertFalse(new_bullets[0]["is_isolated"])
+        self.assertTrue(new_bullets[1]["is_isolated"])
+        self.assertEqual(new_verif, [])
+
+    def test_flagged_single_citation_bullet_never_splits(self):
+        # A bundle needs >=2 citations; a flagged single-citation bullet stays.
+        bullets = [{
+            "text": "A lone point.", "cited_ids": ["R1"],
+            "quotes": [{"rid": "R1", "text": "a lone point"}], "sentiment": "neutral",
+        }]
+        new_bullets, _ = leai_analysis.enforce_coherence(bullets, {0}, [])
+
+        self.assertEqual(len(new_bullets), 1)
+        self.assertTrue(new_bullets[0]["is_isolated"])
+        self.assertEqual(new_bullets[0]["support_count"], 1)
+
+    def test_kept_bullet_verdicts_reindexed_after_earlier_split(self):
+        # Bullet 0 (a bundle) splits into 2 one-offs, shifting bullet 1 (a real
+        # theme) to position 2. Its verdicts must follow it so the frontend's
+        # citation-dropping still lines up.
+        bullets = [
+            {"text": "Disconnected and aesthetics.", "cited_ids": ["R1", "R2"],
+             "quotes": [{"rid": "R1", "text": "q1"}, {"rid": "R2", "text": "q2"}],
+             "sentiment": "negative"},
+            {"text": "Pace too fast.", "cited_ids": ["R3", "R4"],
+             "quotes": [{"rid": "R3", "text": "q3"}], "sentiment": "negative"},
+        ]
+        verification = self._verif(
+            (0, "R1", "supported"), (0, "R2", "supported"),
+            (1, "R3", "supported"), (1, "R4", "supported"),
+        )
+        new_bullets, new_verif = leai_analysis.enforce_coherence(
+            bullets, {0}, verification,
+        )
+
+        self.assertEqual(len(new_bullets), 3)  # 2 split one-offs + 1 theme
+        self.assertFalse(new_bullets[2]["is_isolated"])  # the real theme
+        theme_verdicts = {
+            v["source_id"] for v in new_verif if v["bullet_index"] == 2
+        }
+        self.assertEqual(theme_verdicts, {"R3", "R4"})
+
+    def test_does_not_mutate_input(self):
+        bullets = [{
+            "text": "x", "cited_ids": ["R1", "R2"], "quotes": [], "sentiment": "negative",
+        }]
+        leai_analysis.enforce_coherence(bullets, {0}, [])
+        self.assertEqual(bullets[0]["cited_ids"], ["R1", "R2"])
+        self.assertNotIn("support_count", bullets[0])
+
+
+class CheckBulletCoherenceTest(TestCase):
+    """Tests for check_bullet_coherence() — mocks openai_client.run_structured."""
+
+    def _mock(self, parsed):
+        return {"response": json.dumps(parsed), "parsed": parsed,
+                "usage": {}, "model": "gpt-5.1"}
+
+    def test_returns_results_for_multi_citation_bullets(self):
+        corpus = [
+            {"rid": "R1", "text": "design is just pretty interfaces",
+             "survey_id": 1, "session_id": "s1", "week_number": 1},
+            {"rid": "R2", "text": "I feel disconnected",
+             "survey_id": 1, "session_id": "s2", "week_number": 1},
+        ]
+        bullets = [{"text": "disconnected and design is aesthetics",
+                    "cited_ids": ["R1", "R2"]}]
+        parsed = {"results": [{"bullet_index": 0, "coherent": False}]}
+        with patch(
+            "datapipeline.leai_analysis.openai_client.run_structured",
+            return_value=self._mock(parsed),
+        ) as m:
+            results = leai_analysis.check_bullet_coherence(
+                corpus=corpus, bullets=bullets,
+            )
+
+        self.assertEqual(results, [{"bullet_index": 0, "coherent": False}])
+        self.assertTrue(m.called)
+
+    def test_skips_model_when_no_multi_citation_bullets(self):
+        corpus = [{"rid": "R1", "text": "x", "survey_id": 1,
+                   "session_id": "s1", "week_number": 1}]
+        bullets = [{"text": "single", "cited_ids": ["R1"]}]
+        with patch(
+            "datapipeline.leai_analysis.openai_client.run_structured",
+        ) as m:
+            results = leai_analysis.check_bullet_coherence(
+                corpus=corpus, bullets=bullets,
+            )
+
+        self.assertEqual(results, [])
+        self.assertFalse(m.called)
+
+    def test_graceful_on_failure(self):
+        corpus = [
+            {"rid": "R1", "text": "a", "survey_id": 1, "session_id": "s1", "week_number": 1},
+            {"rid": "R2", "text": "b", "survey_id": 1, "session_id": "s2", "week_number": 1},
+        ]
+        bullets = [{"text": "x and y", "cited_ids": ["R1", "R2"]}]
+        with patch(
+            "datapipeline.leai_analysis.openai_client.run_structured",
+            side_effect=Exception("boom"),
+        ):
+            results = leai_analysis.check_bullet_coherence(
+                corpus=corpus, bullets=bullets,
+            )
+
+        self.assertEqual(results, [])
