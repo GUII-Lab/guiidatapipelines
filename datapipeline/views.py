@@ -1342,6 +1342,8 @@ def _quicktake_to_dict(qt):
         'gaps': qt.gaps,
         'team_health': qt.team_health,
         'form_sections': qt.form_sections,
+        'actions': qt.actions,
+        'responses_count_at_generation': qt.responses_count_at_generation,
         'verification': qt.verification,
         'system_prompt': qt.system_prompt,
         'user_text': qt.user_text,
@@ -2092,9 +2094,19 @@ def leai_pdf_ingest_start(request):
     except (FeedbackGPT.DoesNotExist, ValueError, TypeError):
         return JsonResponse({'error': 'Survey not found'}, status=404)
 
-    if survey.mode != 'form' or not survey.form_schema_id:
+    # PDF ingest supports two shapes:
+    #   - form survey WITH a bound schema  -> section-mapped responses (existing)
+    #   - general survey (no schema)        -> one whole-PDF response per student
+    # Group mode is not supported yet (needs per-student team assignment).
+    if survey.mode == 'form':
+        if not survey.form_schema_id:
+            return JsonResponse(
+                {'error': 'This Structured Reflection survey has no schema bound.'},
+                status=400,
+            )
+    elif survey.mode != 'general':
         return JsonResponse(
-            {'error': 'PDF ingest is only available for Structured Reflection surveys.'},
+            {'error': 'PDF ingest is available for individual (general) and Structured Reflection surveys.'},
             status=400,
         )
 

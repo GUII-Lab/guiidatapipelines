@@ -63,6 +63,12 @@ MAX_FILES_PER_BATCH = 60
 MAX_BYTES_PER_FILE = 10 * 1024 * 1024  # 10 MB
 MAX_BYTES_PER_BATCH = 50 * 1024 * 1024  # 50 MB
 
+# Sentinel mapping key for schemaless (general-mode) surveys: the whole PDF
+# is stored as a single response under this id instead of being split into
+# per-section answers. The commit step recognises it and writes the raw text
+# without the "Q: ...\n\nA: ..." section wrapper.
+FULLTEXT_PROMPT_ID = "__pdf_fulltext__"
+
 # Above this length, an extracted answer block is treated as suspicious
 # (likely we matched the wrong heading and swept multiple sections).
 ANSWER_BLOCK_SOFT_MAX_CHARS = 8000
@@ -83,13 +89,243 @@ def _normalise_text(text: str) -> str:
 
 
 # PDF extraction -----------------------------------------------------------
+#
+# Two-layer strategy:
+#   1. pdfplumber (table-aware) — detects ruled tables and splices a clean
+#      Markdown pipe table back into the text *at the table's position*, so
+#      roster / Likert-matrix / prompt-response tables in the reflection
+#      templates survive as structure the frontend can render natively
+#      instead of being flattened into jumbled prose.
+#   2. pypdf (flat text) — the original extractor; owns the friendly
+#      encrypted / image-only error messages and is the fallback whenever
+#      pdfplumber is unavailable, errors, or yields nothing.
+# Table support is therefore strictly additive: worst case we get exactly
+# the previous pypdf behaviour.
+
+_PDF_TABLE_MIN_ROWS = 2
+_PDF_TABLE_MIN_COLS = 2
+_WS_RUN_RE = re.compile(r"\s+")
+
+
+class _PdfPlumberUnavailable(Exception):
+    """pdfplumber (or a dependency) isn't importable in this environment."""
+
+
+def _cell_text(value: Any) -> str:
+    """Normalise a pdfplumber cell (may be ``None`` or multi-line) to a
+    single whitespace-collapsed string."""
+    if value is None:
+        return ""
+    return _WS_RUN_RE.sub(" ", str(value)).strip()
+
+
+def _merge_continuation_rows(rows: list[list[str]]) -> list[list[str]]:
+    """Fold rows whose first column is empty up into the previous row.
+
+    A row with an empty leading (label) column but content elsewhere is a
+    wrapped cell that the table finder split onto its own line — e.g. a
+    "Rating / (1–5)" two-line header, or a justification that wrapped. We
+    reattach its cells (column-wise, space-joined) to the row above so the
+    grid stays one logical row per record. A real record always carries its
+    own row label, so this won't swallow genuine data.
+    """
+    if len(rows) <= 1:
+        return rows
+    out: list[list[str]] = [list(rows[0])]
+    for row in rows[1:]:
+        if out and not row[0] and any(row[1:]):
+            prev = out[-1]
+            for i in range(1, len(row)):
+                if row[i]:
+                    prev[i] = f"{prev[i]} {row[i]}".strip() if prev[i] else row[i]
+        else:
+            out.append(list(row))
+    return out
+
+
+def _clean_table(raw: list[list[Any]] | None) -> list[list[str]] | None:
+    """Tidy a raw pdfplumber table into a dense grid for Markdown.
+
+    pdfplumber's ``lines`` strategy routinely emits artifact rows/columns:
+    fully-empty separator rows, a header word landing in a *different*
+    physical column than its body values (because header and body cells are
+    divided by different rulings), and wrapped cells split onto extra rows.
+    This:
+
+    1. stringifies + whitespace-collapses every cell,
+    2. drops fully-empty rows,
+    3. merges adjacent columns whose non-empty cells never collide in the
+       same row — re-uniting a header column with its split-off value
+       column. This is a general structural fix, not template-specific:
+       genuine multi-column data collides constantly and is never merged.
+    4. drops fully-empty columns,
+    5. folds empty-first-column continuation rows up into the prior row
+       (reassembles wrapped cells / two-line headers).
+
+    Returns ``None`` if the result isn't a real >=2x2 table, so a degenerate
+    detection is ignored and its page region stays as plain extracted text.
+    """
+    rows = [[_cell_text(c) for c in (row or [])] for row in (raw or [])]
+    ncols = max((len(r) for r in rows), default=0)
+    if ncols == 0:
+        return None
+    rows = [r + [""] * (ncols - len(r)) for r in rows]   # pad ragged rows
+    rows = [r for r in rows if any(r)]                   # drop empty rows
+    if len(rows) < _PDF_TABLE_MIN_ROWS:
+        return None
+
+    # Greedy left-to-right merge of non-colliding adjacent columns. Invariant:
+    # after each merge, every row has at most one non-empty cell per group, so
+    # collapsing a group loses no data.
+    groups: list[list[int]] = []
+    cur = [0]
+    for j in range(1, ncols):
+        collides = any(
+            any(rows[r][k] for k in cur) and rows[r][j]
+            for r in range(len(rows))
+        )
+        if collides:
+            groups.append(cur)
+            cur = [j]
+        else:
+            cur.append(j)
+    groups.append(cur)
+
+    merged: list[list[str]] = []
+    for r in range(len(rows)):
+        new_row: list[str] = []
+        for grp in groups:
+            vals = [rows[r][k] for k in grp if rows[r][k]]
+            new_row.append(vals[0] if vals else "")
+        merged.append(new_row)
+
+    keep = [c for c in range(len(groups)) if any(row[c] for row in merged)]
+    if len(keep) < _PDF_TABLE_MIN_COLS:
+        return None
+    dense = [[row[c] for c in keep] for row in merged]
+    dense = _merge_continuation_rows(dense)
+    if len(dense) < _PDF_TABLE_MIN_ROWS:
+        return None
+    return dense
+
+
+def _table_to_markdown(table: list[list[str]]) -> str:
+    """Render a cleaned grid as a GitHub-style Markdown pipe table. The first
+    row is treated as the header."""
+    ncols = max(len(r) for r in table)
+
+    def fmt(row: list[str]) -> str:
+        cells = [(row[i] if i < len(row) else "").replace("|", r"\|") for i in range(ncols)]
+        return "| " + " | ".join(cells) + " |"
+
+    lines = [fmt(table[0]), "| " + " | ".join(["---"] * ncols) + " |"]
+    lines.extend(fmt(r) for r in table[1:])
+    return "\n".join(lines)
+
+
+def _extract_page_with_tables(page) -> str:
+    """Extract one page's text in reading order, replacing each ruled table
+    with a Markdown pipe table spliced in at its vertical position.
+
+    Non-table text is pulled from the horizontal bands *between* tables, so
+    table cell text is never double-counted and section headings sitting
+    above/below a table stay with their prose.
+    """
+    try:
+        found = page.find_tables()           # default "lines" strategy
+    except Exception as e:  # pragma: no cover — pdfplumber internal edge
+        logger.info("find_tables failed on a page: %s", e)
+        found = []
+
+    good: list[tuple[float, float, str]] = []  # (top, bottom, markdown)
+    for t in found:
+        try:
+            cleaned = _clean_table(t.extract())
+        except Exception:
+            cleaned = None
+        if cleaned:
+            _x0, top, _x1, bottom = t.bbox
+            good.append((float(top), float(bottom), _table_to_markdown(cleaned)))
+
+    if not good:
+        return page.extract_text() or ""
+
+    good.sort(key=lambda g: g[0])
+    width, height = page.width, page.height
+    parts: list[str] = []
+
+    def _band(top: float, bottom: float) -> None:
+        if bottom - top <= 1:
+            return
+        try:
+            band = page.crop((0, max(0.0, top), width, min(height, bottom)), strict=False)
+            txt = band.extract_text() or ""
+        except Exception:  # pragma: no cover — offset mediabox etc.
+            txt = ""
+        if txt.strip():
+            parts.append(txt)
+
+    prev_bottom = 0.0
+    for top, bottom, md in good:
+        _band(prev_bottom, top)
+        parts.append(md)
+        prev_bottom = max(prev_bottom, bottom)
+    _band(prev_bottom, height)
+    return "\n\n".join(parts)
+
+
+def _extract_with_pdfplumber(blob: bytes) -> str:
+    """Table-aware extraction. Returns ``""`` if nothing is extractable (the
+    caller then falls back to pypdf). Raises ``_PdfPlumberUnavailable`` when
+    the library can't be imported."""
+    try:
+        import pdfplumber
+    except ImportError as e:
+        raise _PdfPlumberUnavailable(str(e)) from e
+
+    pages_text: list[str] = []
+    with pdfplumber.open(io.BytesIO(blob)) as pdf:
+        for page in pdf.pages:
+            try:
+                pages_text.append(_extract_page_with_tables(page))
+            except Exception as e:  # pragma: no cover — per-page resilience
+                logger.info("pdfplumber page extract failed: %s", e)
+                try:
+                    pages_text.append(page.extract_text() or "")
+                except Exception:
+                    pages_text.append("")
+    return _normalise_text("\n\n".join(pages_text))
+
 
 def _extract_pdf_text(blob: bytes) -> str:
-    """Extract concatenated text from a PDF blob.
+    """Extract text from a PDF, with ruled tables rendered as Markdown.
+
+    Tries table-aware pdfplumber extraction first; on any failure (library
+    missing, parse error, or empty result) falls back to the pure-pypdf
+    extractor, which owns the friendly encrypted / image-only error messages.
+
+    Raises ``ValueError`` with a human-friendly message on parse failure.
+    The view layer surfaces the message back to the instructor.
+    """
+    if not blob:
+        raise ValueError("Empty file.")
+    try:
+        text = _extract_with_pdfplumber(blob)
+        if text:
+            return text
+        logger.info("pdfplumber returned no text; falling back to pypdf")
+    except _PdfPlumberUnavailable as e:
+        logger.info("pdfplumber unavailable; using pypdf: %s", e)
+    except Exception as e:
+        logger.info("pdfplumber extraction failed; using pypdf: %s", e)
+    return _extract_pdf_text_pypdf(blob)
+
+
+def _extract_pdf_text_pypdf(blob: bytes) -> str:
+    """Flat-text PDF extraction via pypdf (the original extractor).
 
     Raises ``ValueError`` with a human-friendly message on parse failure
-    (encrypted, corrupted, image-only). The view layer surfaces the
-    message back to the instructor.
+    (encrypted, corrupted, image-only).
     """
     if not blob:
         raise ValueError("Empty file.")
@@ -493,6 +729,22 @@ def start_pdf_ingest_job(
                 }
                 try:
                     text = _extract_pdf_text(blob)
+                    if not prompts:
+                        # Schemaless (general-mode) survey: store the whole PDF
+                        # as a single response. No section mapping, no AI assist,
+                        # nothing for the instructor to review by exception.
+                        item["extracted_text"] = text
+                        item["mapping"] = {FULLTEXT_PROMPT_ID: text}
+                        item["low_conf_prompts"] = []
+                        item["ai_assisted_prompts"] = []
+                        item["preamble"] = ""
+                        item["status"] = "ok"
+                        items.append(item)
+                        LEAIPdfIngestJob.objects.filter(pk=job_pk).update(
+                            items=items,
+                            progress={"processed": idx + 1, "total": len(files_in_memory)},
+                        )
+                        continue
                     mapping, low_conf, preamble = map_text_to_prompts(text, prompts)
                     # Second pass: ask the AI to fill in the gaps the
                     # regex matcher couldn't find. Best-effort — failure
@@ -643,8 +895,12 @@ def commit_pdf_ingest_job(
                 answer = (answer or "").strip()
                 if not answer:
                     continue
-                title = prompt_titles.get(prompt_id, prompt_id)
-                content = f"Q: {title}\n\nA: {answer}"
+                if prompt_id == FULLTEXT_PROMPT_ID:
+                    # Schemaless survey: the whole PDF is one response.
+                    content = answer
+                else:
+                    title = prompt_titles.get(prompt_id, prompt_id)
+                    content = f"Q: {title}\n\nA: {answer}"
                 messages_to_create.append(FeedbackMessage(
                     session_id=session_id,
                     student_id=sid,

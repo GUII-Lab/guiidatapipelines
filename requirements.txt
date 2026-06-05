@@ -16,3 +16,4 @@ requests==2.31.0
 python-dotenv
 openai>=2.11
 pypdf>=4.0
+pdfplumber>=0.11

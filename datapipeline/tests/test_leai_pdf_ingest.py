@@ -80,6 +80,29 @@ def make_partial_pdf() -> bytes:
     ])
 
 
+def make_table_pdf(heading: str, rows: list[list[str]]) -> bytes:
+    """Render a PDF with a heading and a ruled (GRID) table below it.
+
+    The ruling lines are what pdfplumber's default table strategy keys on, so
+    this exercises the table-aware extraction path. (reportlab dev dep.)"""
+    import io
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter)
+    styles = getSampleStyleSheet()
+    table = Table(rows)
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    doc.build([Paragraph(heading, styles["Heading2"]), Spacer(1, 8), table])
+    return buf.getvalue()
+
+
 # Inline-thread shim -------------------------------------------------------
 
 class _InlineThread:
@@ -142,6 +165,65 @@ class ParserTests(TestCase):
         # Every prompt is low-confidence and the preamble contains the text.
         self.assertEqual(set(low), {"1.1", "1.2", "1.3"})
         self.assertIn("unstructured prose", preamble)
+
+    # ── Table-aware extraction (pdfplumber → Markdown) ──────────────────────
+
+    def test_ruled_table_extracted_as_markdown(self):
+        """A ruled table becomes a GitHub-style Markdown pipe table, spliced in
+        at its position so the preceding heading stays attached."""
+        blob = make_table_pdf("Team Health Check", [
+            ["Dimension", "Rating (1-5)", "Brief Justification"],
+            ["We had a clear goal.", "5", "Everyone aligned on the report."],
+            ["We met our deadlines.", "4", "A couple tasks slipped late."],
+        ])
+        text = leai_pdf_ingest._extract_pdf_text(blob)
+        self.assertIn("Team Health Check", text)              # heading preserved
+        self.assertIn("| --- | --- | --- |", text)           # separator row
+        self.assertIn("| Dimension | Rating (1-5) | Brief Justification |", text)
+        self.assertIn("| We had a clear goal. | 5 | Everyone aligned on the report. |", text)
+        # Heading must come before the table (reading order intact).
+        self.assertLess(text.index("Team Health Check"), text.index("| Dimension"))
+
+    def test_clean_table_merges_split_header_and_value_columns(self):
+        """pdfplumber often puts a header word in a different physical column
+        than its body values, padded with empty separator columns. _clean_table
+        re-unites them into a dense grid."""
+        raw = [
+            ["", "", "", ""],
+            ["", "Prompt", "", "Student response"],   # headers in cols 1 and 3
+            ["", "", "", ""],
+            ["What worked", "", "Subgroups helped.", ""],   # values in cols 0 and 2
+            ["What was hard", "", "A call ran long.", ""],
+        ]
+        out = leai_pdf_ingest._clean_table(raw)
+        self.assertEqual(out[0], ["Prompt", "Student response"])
+        self.assertEqual(out[1], ["What worked", "Subgroups helped."])
+        self.assertEqual(out[2], ["What was hard", "A call ran long."])
+        self.assertTrue(all(len(r) == 2 for r in out))
+
+    def test_clean_table_folds_wrapped_continuation_row(self):
+        """A row whose first (label) column is empty is a wrapped cell and folds
+        up into the row above — e.g. a two-line 'Rating / (1-5)' header."""
+        raw = [
+            ["Dimension", "Rating", "Justification"],
+            ["", "(1-5)", ""],                        # continuation of the header
+            ["Clear goal", "5", "Aligned."],
+        ]
+        out = leai_pdf_ingest._clean_table(raw)
+        self.assertEqual(out[0], ["Dimension", "Rating (1-5)", "Justification"])
+        self.assertEqual(out[1], ["Clear goal", "5", "Aligned."])
+
+    def test_clean_table_rejects_degenerate(self):
+        """Single-column or single-row detections are not real tables."""
+        self.assertIsNone(leai_pdf_ingest._clean_table([["only one column"], ["x"]]))
+        self.assertIsNone(leai_pdf_ingest._clean_table([["a", "b"]]))   # header only
+        self.assertIsNone(leai_pdf_ingest._clean_table([]))
+        self.assertIsNone(leai_pdf_ingest._clean_table(None))
+
+    def test_table_markdown_escapes_pipes(self):
+        """A literal pipe inside a cell is escaped so it can't break the row."""
+        md = leai_pdf_ingest._table_to_markdown([["a", "b"], ["x | y", "z"]])
+        self.assertIn(r"x \| y", md)
 
 
 # ─── Worker ──────────────────────────────────────────────────────────────
@@ -225,12 +307,10 @@ class WorkerTests(TestCase):
         self.assertEqual(LEAIPdfIngestJob.objects.filter(survey=self.survey).count(), 1)
 
     def test_worker_survives_schema_with_no_prompts(self):
-        # Defensive: a misconfigured survey whose FormSchema body has no
-        # sections should not crash the worker. Every prompt becomes
-        # low_conf-ish (no mapping possible), and the item flag is 'ok'
-        # because there are no low-confidence prompts to flag — just
-        # nothing to extract. The frontend handles the empty-prompts
-        # case via the schemaEmpty banner before it gets here.
+        # A survey whose FormSchema has no sections has nothing to map by
+        # section, so the worker falls back to whole-PDF capture under the
+        # fulltext sentinel (the same path general-mode surveys use). It must
+        # not crash and the item flag stays 'ok' (no low-confidence prompts).
         empty_schema = FormSchema.objects.create(
             schema_id="empty-schema", title="Empty", body={"sections": []},
         )
@@ -248,8 +328,10 @@ class WorkerTests(TestCase):
         self.assertEqual(job.status, "ready")
         self.assertEqual(len(job.items), 1)
         item = job.items[0]
-        self.assertEqual(item["status"], "ok")  # nothing to flag low_conf
-        self.assertEqual(item["mapping"], {})  # nothing to map
+        self.assertEqual(item["status"], "ok")
+        # No prompts -> whole PDF captured under the fulltext sentinel.
+        self.assertEqual(list(item["mapping"].keys()), [leai_pdf_ingest.FULLTEXT_PROMPT_ID])
+        self.assertIn("Key Concepts", item["mapping"][leai_pdf_ingest.FULLTEXT_PROMPT_ID])
 
     def test_ai_assist_fills_low_conf_prompts(self):
         # When regex misses a section (template heading drift), the
@@ -580,20 +662,43 @@ class ViewLayerTests(TestCase):
         self.assertIn("existing_job", body)
         self.assertEqual(body["existing_job"]["job_id"], str(seed.pk))
 
-    def test_start_rejects_non_form_survey(self):
+    def test_start_rejects_unsupported_survey_mode(self):
+        # form + general are supported; an unsupported mode (group) is rejected.
+        group = FeedbackGPT.objects.create(
+            name="group", instructions="x", public_id="group-1",
+            course=self.course, mode="group",
+        )
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        f = SimpleUploadedFile("a.pdf", make_clean_pdf(), content_type="application/pdf")
+        resp = self.client.post(
+            reverse("leai_pdf_ingest_start"),
+            data={"survey_id": group.id, "attributions": json.dumps({"a.pdf": "a"}),
+                  "files": [f]},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Structured Reflection", resp.json()["error"])
+
+    def test_start_accepts_general_survey(self):
+        # Schemaless general-mode surveys are supported: the whole PDF becomes
+        # one response under the fulltext sentinel.
         general = FeedbackGPT.objects.create(
             name="general", instructions="x", public_id="general-1",
             course=self.course, mode="general",
         )
         from django.core.files.uploadedfile import SimpleUploadedFile
         f = SimpleUploadedFile("a.pdf", make_clean_pdf(), content_type="application/pdf")
-        resp = self.client.post(
-            reverse("leai_pdf_ingest_start"),
-            data={"survey_id": general.id, "attributions": json.dumps({"a.pdf": "a"}),
-                  "files": [f]},
+        with inline_thread_patch():
+            resp = self.client.post(
+                reverse("leai_pdf_ingest_start"),
+                data={"survey_id": general.id, "attributions": json.dumps({"a.pdf": "a"}),
+                      "files": [f]},
+            )
+        self.assertEqual(resp.status_code, 202, resp.content)
+        detail = self.client.get(
+            reverse("leai_pdf_ingest_detail", args=[resp.json()["job_id"]])
         )
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("Structured Reflection", resp.json()["error"])
+        item = detail.json()["items"][0]
+        self.assertEqual(list(item["mapping"].keys()), [leai_pdf_ingest.FULLTEXT_PROMPT_ID])
 
     def test_dedup_check_endpoint(self):
         FeedbackMessage.objects.create(

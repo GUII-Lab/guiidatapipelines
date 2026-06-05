@@ -448,6 +448,9 @@ class QuickTakeTest(TestCase):
             course=self.course,
             scope_key="week:1",
             bullets=[{"text": "Good feedback.", "cited_ids": ["R1"]}],
+            actions=[{"text": "Add an example.", "rationale": "confusion",
+                      "priority": "high", "cited_ids": ["R1"]}],
+            responses_count_at_generation=12,
             verification=[],
             system_prompt="sys",
             user_text="user",
@@ -461,6 +464,10 @@ class QuickTakeTest(TestCase):
         data = resp.json()
         self.assertEqual(data["scope_key"], "week:1")
         self.assertEqual(len(data["bullets"]), 1)
+        # Phase 9: actions + response-count snapshot are serialized.
+        self.assertEqual(len(data["actions"]), 1)
+        self.assertEqual(data["actions"][0]["priority"], "high")
+        self.assertEqual(data["responses_count_at_generation"], 12)
 
     def test_delete_clears_cache(self):
         LEAIQuickTake.objects.create(
