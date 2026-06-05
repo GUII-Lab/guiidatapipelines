@@ -400,6 +400,17 @@ class LEAIQuickTake(models.Model):
     # Phase 8: per-form-section rollup, populated only when the scope
     # contains form-mode (mode='form') survey responses.
     form_sections = models.JSONField(default=list, blank=True)
+    # Phase 9: prescriptive "suggested actions" — instructor-facing
+    # recommendations derived from the feedback (friction to address,
+    # mid-course adjustments). Descriptive fields above say what students
+    # said; this says what the instructor might do about it. Empty when
+    # there's nothing clearly actionable.
+    actions = models.JSONField(default=list, blank=True)
+    # Number of responses in scope at the moment this Quick Take was
+    # generated. The UI compares it against the current response count to
+    # show "N new responses not yet included" so instructors know when a
+    # regenerate is worthwhile. 0 on older rows predating this field.
+    responses_count_at_generation = models.IntegerField(default=0)
     verification = models.JSONField(default=list)
     system_prompt = models.TextField()
     user_text = models.TextField()
