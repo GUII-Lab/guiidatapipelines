@@ -60,14 +60,84 @@ class FeedbackMessage(models.Model):
 
 
 class Course(models.Model):
+    BANNER_DISPLAY_CHOICES = [
+        ('persistent', 'Persistent'),
+        ('timed', 'Auto-dismiss after duration'),
+    ]
+    BANNER_SPLIT_CHOICES = [
+        ('percentage', 'Percentage of students'),
+        ('count', 'Fixed number of students'),
+    ]
+
     course_id = models.SlugField(max_length=50, unique=True)
     course_name = models.CharField(max_length=200)
     instructor_name = models.CharField(max_length=100)
     password = models.CharField(max_length=100)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Course-wide student notification banner. One banner per course; shown on
+    # every student survey (general/group/form) when enabled. Settings travel
+    # with the course, not the survey, so the prompt builder is untouched.
+    banner_enabled = models.BooleanField(default=False)
+    banner_text = models.TextField(
+        blank=True, default='',
+        help_text="Message shown to students. Leave blank to use the default disclaimer.",
+    )
+    banner_dismissible = models.BooleanField(
+        default=False,
+        help_text="Whether students can close the banner.",
+    )
+    banner_display_mode = models.CharField(
+        max_length=16, choices=BANNER_DISPLAY_CHOICES, default='persistent',
+    )
+    banner_duration_seconds = models.PositiveIntegerField(
+        default=10,
+        help_text="Seconds before auto-dismiss when display mode is 'timed'.",
+    )
+
+    # A/B split. When off, every survey viewer sees the banner (subject to
+    # banner_enabled). When on, only an assigned subset sees it and the rest
+    # are the silent control arm; assignment is persisted per anonymous session
+    # in BannerAssignment. Everything is anonymous, so the split is random.
+    banner_split_enabled = models.BooleanField(
+        default=False,
+        help_text="When on, only a random subset of students see the banner (A/B).",
+    )
+    banner_split_mode = models.CharField(
+        max_length=16, choices=BANNER_SPLIT_CHOICES, default='percentage',
+    )
+    banner_split_value = models.PositiveIntegerField(
+        default=50,
+        help_text="Percent (0-100) in percentage mode, or number of students in count mode.",
+    )
+
     def __str__(self):
         return f"{self.course_name} ({self.course_id})"
+
+
+class BannerAssignment(models.Model):
+    """Per-session record of whether the course banner was shown to an
+    anonymous student session.
+
+    Created on first survey load when the A/B split is on. Persisting the
+    assignment keeps it stable across reloads (a student never flips between
+    seeing/not-seeing) and serves as the research exposure log — joinable to
+    FeedbackMessage by session_id to compare the treatment and control arms.
+    """
+
+    course = models.ForeignKey(
+        Course, on_delete=models.CASCADE, related_name='banner_assignments',
+    )
+    session_id = models.CharField(max_length=100)
+    shown = models.BooleanField()
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('course', 'session_id')]
+        indexes = [models.Index(fields=['course', 'session_id'])]
+
+    def __str__(self):
+        return f'{self.course.course_id}/{self.session_id[:8]}… shown={self.shown}'
 
 
 class FeedbackGPT(models.Model):

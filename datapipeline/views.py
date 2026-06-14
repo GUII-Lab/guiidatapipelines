@@ -16,7 +16,8 @@ from datetime import timedelta
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from django.conf import settings
-from django.db import transaction
+from django.db import transaction, IntegrityError
+import hashlib
 import requests
 
 
@@ -221,6 +222,156 @@ def verify_course_password(request):
     return HttpResponse(status=405)
 
 
+# Shown to students when a course enables the banner but leaves the text blank.
+DEFAULT_BANNER_TEXT = (
+    "You're chatting with an AI assistant, not a person. "
+    "It can make mistakes, so use your own judgment."
+)
+
+
+def _course_banner_dict(course):
+    """Serialize a course's banner config for students and instructors.
+
+    `text` is resolved (default substituted when blank) so the student page can
+    render it directly; `text_raw` is what the instructor actually saved, so the
+    editor round-trips an empty field as empty.
+    """
+    raw = course.banner_text or ''
+    return {
+        'enabled': course.banner_enabled,
+        'text': raw if raw.strip() else DEFAULT_BANNER_TEXT,
+        'text_raw': raw,
+        'dismissible': course.banner_dismissible,
+        'display_mode': course.banner_display_mode,
+        'duration_seconds': course.banner_duration_seconds,
+        'default_text': DEFAULT_BANNER_TEXT,
+        # A/B split config (instructor editor round-trip). The resolved per-
+        # session decision is added separately as 'show' on the student payload.
+        'split_enabled': course.banner_split_enabled,
+        'split_mode': course.banner_split_mode,
+        'split_value': course.banner_split_value,
+    }
+
+
+def _resolve_banner_show(course, session_id):
+    """Decide whether THIS anonymous session sees the course banner.
+
+    Split off → every viewer sees it (subject to banner_enabled). Split on →
+    the decision is persisted per session in BannerAssignment, so it's stable
+    across reloads and doubles as the research exposure log. Percentage uses a
+    deterministic hash (race-safe, reproducible); count is first-N-to-open.
+    """
+    if not course.banner_enabled:
+        return False
+    if not course.banner_split_enabled:
+        return True
+    session_id = (session_id or '').strip()
+    if not session_id:
+        # No stable identifier to assign — keep it out of the treatment arm so
+        # an unidentifiable client can't quietly inflate the exposed group.
+        return False
+
+    existing = BannerAssignment.objects.filter(
+        course=course, session_id=session_id).first()
+    if existing:
+        return existing.shown
+
+    value = course.banner_split_value or 0
+    if course.banner_split_mode == 'count':
+        shown_count = BannerAssignment.objects.filter(
+            course=course, shown=True).count()
+        shown = shown_count < value
+    else:  # percentage
+        pct = max(0, min(value, 100))
+        digest = hashlib.sha256(
+            (course.course_id + ':' + session_id).encode()).hexdigest()
+        shown = (int(digest, 16) % 100) < pct
+
+    try:
+        BannerAssignment.objects.create(
+            course=course, session_id=session_id, shown=shown)
+    except IntegrityError:
+        # Concurrent first-load for the same session — defer to the winner.
+        existing = BannerAssignment.objects.filter(
+            course=course, session_id=session_id).first()
+        if existing:
+            return existing.shown
+    return shown
+
+
+@csrf_exempt
+def get_course_banner(request):
+    """GET /get_course_banner/?course_id=... — banner config for a course.
+
+    Public read: the student survey page calls this (indirectly, via the bundled
+    config on get_feedback_gpt_by_public_id) and the instructor panel calls it to
+    populate the editor.
+    """
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    course_id = request.GET.get('course_id', '').strip()
+    if not course_id:
+        return JsonResponse({'error': 'course_id is required'}, status=400)
+    try:
+        course = Course.objects.get(course_id=course_id)
+    except Course.DoesNotExist:
+        return JsonResponse({'error': 'Course not found'}, status=404)
+    return JsonResponse(_course_banner_dict(course))
+
+
+@csrf_exempt
+def update_course_banner(request):
+    """POST /update_course_banner/ — instructor saves the course banner.
+
+    Gated by course sign-in like the other instructor writes (no per-request
+    password). Accepts any subset of the banner fields.
+    """
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+    except Exception:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    course_id = (data.get('course_id') or '').strip()
+    if not course_id:
+        return JsonResponse({'error': 'course_id is required'}, status=400)
+    try:
+        course = Course.objects.get(course_id=course_id)
+    except Course.DoesNotExist:
+        return JsonResponse({'error': 'Course not found'}, status=404)
+
+    if 'enabled' in data:
+        course.banner_enabled = bool(data.get('enabled'))
+    if 'text' in data:
+        course.banner_text = (data.get('text') or '')[:2000]
+    if 'dismissible' in data:
+        course.banner_dismissible = bool(data.get('dismissible'))
+    if 'display_mode' in data:
+        mode = data.get('display_mode')
+        if mode in ('persistent', 'timed'):
+            course.banner_display_mode = mode
+    if 'duration_seconds' in data:
+        try:
+            secs = int(data.get('duration_seconds'))
+            course.banner_duration_seconds = max(1, min(secs, 600))
+        except (TypeError, ValueError):
+            pass
+    if 'split_enabled' in data:
+        course.banner_split_enabled = bool(data.get('split_enabled'))
+    if 'split_mode' in data:
+        sm = data.get('split_mode')
+        if sm in ('percentage', 'count'):
+            course.banner_split_mode = sm
+    if 'split_value' in data:
+        try:
+            sv = int(data.get('split_value'))
+            course.banner_split_value = max(0, min(sv, 100000))
+        except (TypeError, ValueError):
+            pass
+    course.save()
+    return JsonResponse(_course_banner_dict(course))
+
+
 @csrf_exempt
 def create_feedback_gpt(request):
     if request.method == 'POST':
@@ -404,6 +555,13 @@ def get_feedback_gpt_by_public_id(request):
             reason = 'expired'
 
         snap = getattr(gpt, 'team_snapshot', None)
+        course_banner = None
+        if gpt.course:
+            course_banner = _course_banner_dict(gpt.course)
+            # Resolve and persist the per-session A/B decision. session_id is
+            # the anonymous client session; absent for a bare preview load.
+            course_banner['show'] = _resolve_banner_show(
+                gpt.course, request.GET.get('session_id', ''))
         return JsonResponse({
             'id': gpt.id,
             'public_id': gpt.public_id,
@@ -418,6 +576,9 @@ def get_feedback_gpt_by_public_id(request):
             'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
             'anonymity_mode': gpt.anonymity_mode,
             'canvas_integration': gpt.canvas_integration,
+            # Course-wide student banner, inlined so feedback.html renders it on
+            # first paint without a second round-trip. None when no course is set.
+            'course_banner': course_banner,
             'team_snapshot': _survey_snapshot_to_dict(snap) if snap else None,
             'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
             # Inline the schema body so feedback.html doesn't need a second
@@ -554,8 +715,18 @@ def feedback_messages_by_gpt(request):
                 'source': m.source,
                 'pdf_batch_id': str(m.pdf_batch_id) if m.pdf_batch_id else None,
             })
+        # A/B banner exposure for these sessions (empty unless the split is on).
+        gpt_obj = FeedbackGPT.objects.filter(id=gpt_id).first()
+        banner_exposure = {}
+        if gpt_obj and gpt_obj.course_id:
+            banner_exposure = {
+                ba.session_id: ba.shown
+                for ba in BannerAssignment.objects.filter(
+                    course_id=gpt_obj.course_id, session_id__in=list(sessions.keys()))
+            }
         return JsonResponse({
             'sessions': dict(sessions),
+            'banner_exposure': banner_exposure,
             'session_count': len(sessions),
             'message_count': messages.count(),
         })
@@ -573,6 +744,13 @@ def feedback_messages_by_course(request):
         except Course.DoesNotExist:
             return JsonResponse({'error': 'Course not found'}, status=404)
         gpts = FeedbackGPT.objects.filter(course=course).order_by('week_number', 'created_at')
+        # Course-wide A/B exposure log: which anonymous sessions were shown the
+        # banner. Only populated when the split is/was on (no rows otherwise),
+        # so the analyzer self-gates the "Saw banner" chip.
+        banner_map = {
+            ba.session_id: ba.shown
+            for ba in BannerAssignment.objects.filter(course=course)
+        }
         result = []
         for gpt in gpts:
             messages = FeedbackMessage.objects.filter(gpt_id=gpt.id).order_by('created_at')
@@ -585,6 +763,9 @@ def feedback_messages_by_course(request):
                     'source': m.source,
                     'pdf_batch_id': str(m.pdf_batch_id) if m.pdf_batch_id else None,
                 })
+            banner_exposure = {
+                sid: banner_map[sid] for sid in sessions if sid in banner_map
+            }
             session_count = len(sessions)
             msg_count = messages.count()
             avg_turns = round(msg_count / session_count) if session_count else 0
@@ -596,6 +777,7 @@ def feedback_messages_by_course(request):
                 'week_number': gpt.week_number,
                 'survey_label': gpt.survey_label,
                 'sessions': dict(sessions),
+                'banner_exposure': banner_exposure,
                 'session_count': session_count,
                 'avg_turns': avg_turns,
                 'is_closed': gpt.is_closed,
