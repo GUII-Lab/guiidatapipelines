@@ -46,3 +46,6 @@ CLAUDE.md
 # Misc
 *.bak
 *.tmp
+
+# Local DB dumps / fixtures (contain password hashes — keep out of git)
+form_data.json
