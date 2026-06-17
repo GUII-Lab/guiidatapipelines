@@ -49,3 +49,6 @@ CLAUDE.md
 
 # Local DB dumps / fixtures (contain password hashes — keep out of git)
 form_data.json
+
+# Local dev / seed / verification tooling — not part of the app
+/scripts
