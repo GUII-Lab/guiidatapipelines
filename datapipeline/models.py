@@ -111,6 +111,15 @@ class Course(models.Model):
         help_text="Percent (0-100) in percentage mode, or number of students in count mode.",
     )
 
+    # Course-level display name for the AI assistant. Replaces the default
+    # "LEAI" tag on AI message bubbles in the student chat. Travels with the
+    # course (not the survey), so every survey in the course shares it. Blank
+    # falls back to "LEAI".
+    bot_display_name = models.CharField(
+        max_length=100, blank=True, default='',
+        help_text="Name shown on the AI's message tag in student chats. Blank uses the default 'LEAI'.",
+    )
+
     def __str__(self):
         return f"{self.course_name} ({self.course_id})"
 

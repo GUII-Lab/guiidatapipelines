@@ -229,6 +229,37 @@ DEFAULT_BANNER_TEXT = (
 )
 
 
+# Tag shown on AI message bubbles when a course sets no custom name.
+DEFAULT_BOT_NAME = 'LEAI'
+
+
+def _resolve_bot_name(course):
+    """The display name students see on AI message tags for this course.
+
+    Falls back to the default brand mark when the course is unset or the
+    instructor left the field blank.
+    """
+    if not course:
+        return DEFAULT_BOT_NAME
+    raw = (course.bot_display_name or '').strip()
+    return raw if raw else DEFAULT_BOT_NAME
+
+
+def _course_customization_dict(course):
+    """Serialize a course's chat customization for the instructor editor.
+
+    `bot_display_name` is resolved (default substituted when blank) so a reader
+    can render it directly; `bot_display_name_raw` is what the instructor saved,
+    so the editor round-trips an empty field as empty.
+    """
+    raw = course.bot_display_name or ''
+    return {
+        'bot_display_name': raw.strip() if raw.strip() else DEFAULT_BOT_NAME,
+        'bot_display_name_raw': raw,
+        'default_bot_name': DEFAULT_BOT_NAME,
+    }
+
+
 def _course_banner_dict(course):
     """Serialize a course's banner config for students and instructors.
 
@@ -370,6 +401,53 @@ def update_course_banner(request):
             pass
     course.save()
     return JsonResponse(_course_banner_dict(course))
+
+
+@csrf_exempt
+def get_course_customization(request):
+    """GET /get_course_customization/?course_id=... — chat customization.
+
+    Public read: the instructor Customizations panel calls it to populate the
+    editor. The student page receives the resolved name inlined on
+    get_feedback_gpt_by_public_id, so it needs no separate call.
+    """
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    course_id = request.GET.get('course_id', '').strip()
+    if not course_id:
+        return JsonResponse({'error': 'course_id is required'}, status=400)
+    try:
+        course = Course.objects.get(course_id=course_id)
+    except Course.DoesNotExist:
+        return JsonResponse({'error': 'Course not found'}, status=404)
+    return JsonResponse(_course_customization_dict(course))
+
+
+@csrf_exempt
+def update_course_customization(request):
+    """POST /update_course_customization/ — instructor saves the AI's name.
+
+    Gated by course sign-in like the other instructor writes (no per-request
+    password). Trims to the model's 100-char limit.
+    """
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+    except Exception:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    course_id = (data.get('course_id') or '').strip()
+    if not course_id:
+        return JsonResponse({'error': 'course_id is required'}, status=400)
+    try:
+        course = Course.objects.get(course_id=course_id)
+    except Course.DoesNotExist:
+        return JsonResponse({'error': 'Course not found'}, status=404)
+
+    if 'bot_display_name' in data:
+        course.bot_display_name = (data.get('bot_display_name') or '').strip()[:100]
+    course.save()
+    return JsonResponse(_course_customization_dict(course))
 
 
 @csrf_exempt
@@ -579,6 +657,9 @@ def get_feedback_gpt_by_public_id(request):
             # Course-wide student banner, inlined so feedback.html renders it on
             # first paint without a second round-trip. None when no course is set.
             'course_banner': course_banner,
+            # Course-level name for the AI message tag (replaces "LEAI"). Always
+            # resolved to a usable string so feedback.html can use it directly.
+            'bot_display_name': _resolve_bot_name(gpt.course),
             'team_snapshot': _survey_snapshot_to_dict(snap) if snap else None,
             'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
             # Inline the schema body so feedback.html doesn't need a second
