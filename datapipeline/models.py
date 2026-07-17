@@ -120,6 +120,21 @@ class Course(models.Model):
         help_text="Name shown on the AI's message tag in student chats. Blank uses the default 'LEAI'.",
     )
 
+    # POINT TO A HUMAN referral gate. When enabled, the form-mode engine adds a
+    # per-turn gate letting the bot point a struggling student to a human, once
+    # per conversation, without troubleshooting or promising outcomes. Travels
+    # with the course. The destination wording is configurable so a course with
+    # no standing office hours can name another channel; blank falls back to
+    # the engine default ("your instructor or TA during their office hours").
+    referral_enabled = models.BooleanField(
+        default=False,
+        help_text="Let the chat point struggling students to a human, once per conversation.",
+    )
+    referral_text = models.CharField(
+        max_length=200, blank=True, default='',
+        help_text="Where the bot points them. Blank uses the default 'your instructor or TA during their office hours'.",
+    )
+
     def __str__(self):
         return f"{self.course_name} ({self.course_id})"
 

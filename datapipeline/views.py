@@ -232,6 +232,19 @@ DEFAULT_BANNER_TEXT = (
 # Tag shown on AI message bubbles when a course sets no custom name.
 DEFAULT_BOT_NAME = 'LEAI'
 
+# Destination the POINT TO A HUMAN gate names when the instructor leaves the
+# wording blank. Mirrors REFERRAL_TEXT_DEFAULT in LEAI/leai-formmode.js and
+# _REFERRAL_TEXT_DEFAULT in LEAI/scripts/leai_formmode.py — keep in sync.
+DEFAULT_REFERRAL_TEXT = 'your instructor or TA during their office hours'
+
+
+def _resolve_referral_text(course):
+    """The destination phrase the referral gate uses for this course."""
+    if not course:
+        return DEFAULT_REFERRAL_TEXT
+    raw = (course.referral_text or '').strip()
+    return raw if raw else DEFAULT_REFERRAL_TEXT
+
 
 def _resolve_bot_name(course):
     """The display name students see on AI message tags for this course.
@@ -253,10 +266,16 @@ def _course_customization_dict(course):
     so the editor round-trips an empty field as empty.
     """
     raw = course.bot_display_name or ''
+    referral_raw = course.referral_text or ''
     return {
         'bot_display_name': raw.strip() if raw.strip() else DEFAULT_BOT_NAME,
         'bot_display_name_raw': raw,
         'default_bot_name': DEFAULT_BOT_NAME,
+        # POINT TO A HUMAN referral gate (same resolved/raw split as the name).
+        'referral_enabled': course.referral_enabled,
+        'referral_text': _resolve_referral_text(course),
+        'referral_text_raw': referral_raw,
+        'default_referral_text': DEFAULT_REFERRAL_TEXT,
     }
 
 
@@ -446,6 +465,10 @@ def update_course_customization(request):
 
     if 'bot_display_name' in data:
         course.bot_display_name = (data.get('bot_display_name') or '').strip()[:100]
+    if 'referral_enabled' in data:
+        course.referral_enabled = bool(data.get('referral_enabled'))
+    if 'referral_text' in data:
+        course.referral_text = (data.get('referral_text') or '').strip()[:200]
     course.save()
     return JsonResponse(_course_customization_dict(course))
 
@@ -660,6 +683,10 @@ def get_feedback_gpt_by_public_id(request):
             # Course-level name for the AI message tag (replaces "LEAI"). Always
             # resolved to a usable string so feedback.html can use it directly.
             'bot_display_name': _resolve_bot_name(gpt.course),
+            # POINT TO A HUMAN referral gate config. feedback.html overlays
+            # these onto the form schema so the engine's 7th turn gate can arm.
+            'referral_enabled': bool(gpt.course.referral_enabled) if gpt.course else False,
+            'referral_text': _resolve_referral_text(gpt.course),
             'team_snapshot': _survey_snapshot_to_dict(snap) if snap else None,
             'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
             # Inline the schema body so feedback.html doesn't need a second
