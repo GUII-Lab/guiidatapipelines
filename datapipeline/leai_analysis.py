@@ -150,7 +150,19 @@ def default_quicktake_system_prompt() -> str:
         "teams whose members didn't write enough to judge. If the corpus "
         "has no team-tagged responses, return an empty `team_health` "
         "array. Never invent team names; only use the labels shown in "
-        "the prompt."
+        "the prompt.\n\n"
+        "NUDGED RESPONSES — some response lines carry a `[NUDGED]` token "
+        "after the response id. It means the reflection assistant detected "
+        "that this student signalled being stuck, lost, behind, or not "
+        "keeping up, and suggested they talk to a person. It only appears "
+        "when the course enabled that setting. When the token is present: "
+        "(a) never write a bullet, gap, or action about the nudge itself or "
+        "about the assistant's behaviour — the instructor already sees which "
+        "students were nudged; (b) treat those responses as stronger "
+        "evidence of struggle, and cite them in any genuine struggle theme "
+        "they support; (c) when several nudged responses converge on the "
+        "same cause, an `actions` entry naming that cause is appropriate. "
+        "Never infer distress from the absence of the token."
     )
 
 
@@ -190,6 +202,20 @@ def _chat_prompt_mode_addendum(corpus: list[dict]) -> str:
             "*Methods in Practice*, students…\"). Use section context to "
             "pick the most representative quote spans. Sections visible "
             f"in this scope: {', '.join(sections_in_scope)}."
+        )
+    # _rid_line emits [NUDGED] whether or not we explain it, and an
+    # unexplained control token in a prompt is worse than no token.
+    nudged_count = sum(1 for e in corpus if e.get("nudged"))
+    if nudged_count:
+        parts.append(
+            "\n\nNUDGED RESPONSES: a `[NUDGED]` token after a response id "
+            "means the reflection assistant detected that student signalling "
+            "they were stuck, lost, behind, or not keeping up, and suggested "
+            "they talk to a person. Treat those responses as stronger "
+            "evidence of struggle, but never make the nudge itself or the "
+            "assistant's behaviour the subject of an answer, and never infer "
+            "distress from the absence of the token. "
+            f"Nudged responses in this scope: {nudged_count}."
         )
     return "".join(parts)
 
@@ -538,6 +564,9 @@ def build_response_corpus(
         sections      — populated for form-mode surveys (Phase 8):
                         [{title, text}] per FormSchema area the student
                         actually responded to.
+        nudged        — True when the POINT TO A HUMAN referral fired in this
+                        session (the assistant pointed a struggling student at
+                        their instructor or TA).
 
     Scope rules:
         "course"  — all FeedbackGPT surveys for this course
@@ -614,6 +643,16 @@ def build_response_corpus(
         if role == "user":
             sessions[sid]["texts"].append(msg.content)
 
+    # 3b. Sessions where the POINT TO A HUMAN referral fired. The flag lives
+    # on an AI row, and the non-form branch above never fetches those, so ask
+    # for it directly rather than trying to read it off the transcript.
+    nudge_qs = FeedbackMessage.objects.filter(
+        gpt_id__in=survey_ids, referred=True,
+    )
+    if scope_kind == "custom" and scope_session_ids:
+        nudge_qs = nudge_qs.filter(session_id__in=scope_session_ids)
+    nudged_sids = set(nudge_qs.values_list("session_id", flat=True).distinct())
+
     # 4. Sort deterministically: week_number ASC (None last), then session_id lexical ASC
     def sort_key(item):
         sid, data = item
@@ -658,6 +697,7 @@ def build_response_corpus(
             "team_name": team_by_sid.get(sid),
             "text": " | ".join(data["texts"]),
             "sections": sections,
+            "nudged": sid in nudged_sids,
         })
 
     return corpus
@@ -673,12 +713,17 @@ def _rid_line(entry: dict) -> str:
     When the entry has a `team_name` (group-mode survey response), prepend
     the team label. When the entry has `sections` (form-mode response),
     render each section on its own indented line so the model can reason
-    section-by-section instead of as a noisy concatenation.
+    section-by-section instead of as a noisy concatenation. When the POINT
+    TO A HUMAN referral fired, append a `[NUDGED]` token — deliberately its
+    own bracket rather than a third `·` segment, since the prompts tell the
+    model that everything after `·` inside `[Rn · …]` is a team name.
     """
     team = entry.get("team_name")
     prefix = f"[{entry['rid']}]"
     if team:
         prefix = f"[{entry['rid']} · {team}]"
+    if entry.get("nudged"):
+        prefix = f"{prefix} [NUDGED]"
 
     sections = entry.get("sections") or []
     if sections:
@@ -704,6 +749,7 @@ def build_quicktake_user_text(
         for s in (e.get("sections") or [])
         if s.get("title")
     })
+    nudged_count = sum(1 for e in corpus if e.get("nudged"))
     lines = [
         f"Course: {course_name}",
         f"Scope: {scope_label}",
@@ -718,6 +764,8 @@ def build_quicktake_user_text(
             f"Form sections in scope ({len(sections_present)}): "
             + ", ".join(sections_present)
         )
+    if nudged_count:
+        lines.append(f"Nudged responses in scope: {nudged_count}")
     lines += ["", "--- Student Responses ---"]
     for entry in corpus:
         lines.append(_rid_line(entry))
@@ -757,6 +805,12 @@ def build_quicktake_user_text(
             "REQUIRED for `team_health`: produce one entry per team listed "
             "above. Use status='no_response' for teams that did not submit.\n\n"
             if teams_present else ""
+        )
+        + (
+            "CONTEXT for the `[NUDGED]` tokens above: weight those responses "
+            "as described in the system prompt. Do not make the nudge itself "
+            "the subject of a bullet, gap, or action.\n\n"
+            if nudged_count else ""
         )
         + "OPTIONAL: `tensions` for genuine disagreements (both sides need "
         "verbatim quotes). `gaps` for topics noticeably absent. Return empty "
