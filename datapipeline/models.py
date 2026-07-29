@@ -42,6 +42,13 @@ class FeedbackMessage(models.Model):
     # message. When False, the message must NOT be used for any GUII Lab
     # research analysis (Privacy Policy §5).
     research_consent = models.BooleanField(default=False)
+    # True on the ONE AI turn where the POINT TO A HUMAN referral gate fired.
+    # The engine strips the [REFERRED] marker before display and before the
+    # content is persisted, so this flag is the only surviving record that the
+    # nudge happened. Latched per-conversation in engine state; per-message
+    # here, so at most one AI row per session should carry it. Also read back
+    # on resume so the latch survives a refresh.
+    referred = models.BooleanField(default=False)
     # Distinguishes chat-collected responses (default) from instructor-
     # ingested PDF reflections. Frontend renders a 📄 badge when 'pdf'.
     source = models.CharField(

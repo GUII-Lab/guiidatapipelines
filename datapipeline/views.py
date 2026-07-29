@@ -76,6 +76,7 @@ def feedback_message_api(request):
                 gpt_used=data.get('gpt_used'),
                 gpt_id=data.get('gpt_id'),
                 research_consent=bool(data.get('research_consent', False)),
+                referred=bool(data.get('referred', False)),
             )
             feedback_message.save()
             return JsonResponse({'status': 'success', 'message': 'Feedback message saved successfully'})
@@ -125,6 +126,7 @@ def feedback_messages_bulk_api(request):
             gpt_used=m.get('gpt_used') or '',
             gpt_id=m.get('gpt_id'),
             research_consent=bool(m.get('research_consent', False)),
+            referred=bool(m.get('referred', False)),
         ))
 
     try:
@@ -756,7 +758,9 @@ def feedback_session_resume(request):
     - POST body (not query string) so session_id never lands in access logs.
     - source='chat' filter so instructor-uploaded PDF rows can't leak via
       this path.
-    - Returns only sent_by/content/created_at (no student_id, no gpt_used).
+    - Returns only sent_by/content/created_at/referred (no student_id, no
+      gpt_used). `referred` describes the bot's own behavior on that turn, so
+      it carries nothing identifying about the student.
     - Cache-Control: no-store, private so intermediaries can't cache.
     Callers should pair this with a fragment-based URL (#cid=<uuid>) so the
     session_id never reaches the network as a query string.
@@ -781,7 +785,7 @@ def feedback_session_resume(request):
             source=FeedbackMessage.SOURCE_CHAT,
         )
         .order_by('created_at')
-        .values('sent_by', 'content', 'created_at')
+        .values('sent_by', 'content', 'created_at', 'referred')
     )
     messages = [
         {
@@ -790,6 +794,10 @@ def feedback_session_resume(request):
             'created_at': (
                 m['created_at'].isoformat() if m['created_at'] else None
             ),
+            # Lets the engine re-latch its POINT TO A HUMAN gate on replay.
+            # The [REFERRED] marker was stripped before this row was written,
+            # so without this a student who refreshes can be nudged twice.
+            'referred': bool(m['referred']),
         }
         for m in qs
     ]
@@ -822,6 +830,8 @@ def feedback_messages_by_gpt(request):
                 # uploaded PDF (renders 📄 badge + drives Source filter).
                 'source': m.source,
                 'pdf_batch_id': str(m.pdf_batch_id) if m.pdf_batch_id else None,
+                # True on the AI turn that fired the POINT TO A HUMAN nudge.
+                'referred': m.referred,
             })
         # A/B banner exposure for these sessions (empty unless the split is on).
         gpt_obj = FeedbackGPT.objects.filter(id=gpt_id).first()
@@ -870,6 +880,10 @@ def feedback_messages_by_course(request):
                     'created_at': m.created_at.strftime('%Y-%m-%d %H:%M:%S'),
                     'source': m.source,
                     'pdf_batch_id': str(m.pdf_batch_id) if m.pdf_batch_id else None,
+                    # True on the AI turn that fired the POINT TO A HUMAN
+                    # nudge. This serializer returns no per-message id, so the
+                    # analyzer keys its flag off this field directly.
+                    'referred': m.referred,
                 })
             banner_exposure = {
                 sid: banner_map[sid] for sid in sessions if sid in banner_map
