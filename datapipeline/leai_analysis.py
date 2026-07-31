@@ -621,8 +621,11 @@ def build_response_corpus(
                 "gpt_id": msg.gpt_id,
                 "texts": [],
                 "transcript": None,  # non-form sessions skip the transcript
+                "has_pdf": False,
             }
         sessions[sid]["texts"].append(msg.content)
+        if msg.source == FeedbackMessage.SOURCE_PDF:
+            sessions[sid]["has_pdf"] = True
 
     for msg in full_qs:
         sid = msg.session_id
@@ -631,7 +634,10 @@ def build_response_corpus(
                 "gpt_id": msg.gpt_id,
                 "texts": [],
                 "transcript": [],
+                "has_pdf": False,
             }
+        if msg.source == FeedbackMessage.SOURCE_PDF:
+            sessions[sid]["has_pdf"] = True
         role = (
             "user"
             if msg.sent_by in ("user", "user-message")
@@ -652,6 +658,18 @@ def build_response_corpus(
     if scope_kind == "custom" and scope_session_ids:
         nudge_qs = nudge_qs.filter(session_id__in=scope_session_ids)
     nudged_sids = set(nudge_qs.values_list("session_id", flat=True).distinct())
+
+    # 3c. Drop sessions the student never actually said anything in. A student
+    # who opens a survey and closes it still creates a session row, and for
+    # form-mode surveys the opening AI turn lands in `full_qs`, so the session
+    # would otherwise reach the corpus with text="" and burn an R-id on an
+    # empty response. PDF-ingested sessions are kept even with no user turns:
+    # their rows carry sent_by="student", which maps to role="assistant" above,
+    # so `texts` is legitimately empty while the response is real.
+    sessions = {
+        sid: data for sid, data in sessions.items()
+        if data["texts"] or data["has_pdf"]
+    }
 
     # 4. Sort deterministically: week_number ASC (None last), then session_id lexical ASC
     def sort_key(item):

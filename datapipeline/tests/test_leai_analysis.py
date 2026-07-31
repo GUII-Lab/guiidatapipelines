@@ -118,6 +118,49 @@ class BuildResponseCorpusTest(TestCase):
         # Week 1 entries come before week 2
         self.assertEqual(sorted(weeks), weeks)
 
+    def test_session_with_only_ai_turns_is_excluded(self):
+        # A student who opens a form survey and closes it leaves a session
+        # holding just the agent's opening turn. It used to reach the corpus
+        # with text="" and consume an R-id, which shifted every later R-label.
+        form = _make_survey(self.course, week_number=3, survey_label="W3")
+        form.mode = "form"
+        form.save()
+        _make_msg(form, "sess-empty", "Area 1 of 3 — Key Concepts.", sent_by="ai-message")
+
+        corpus = build_response_corpus(self.course, scope_kind="course")
+        self.assertEqual(len(corpus), 3)
+        self.assertNotIn("sess-empty", [e["session_id"] for e in corpus])
+
+    def test_rids_stay_contiguous_when_an_empty_session_is_dropped(self):
+        form = _make_survey(self.course, week_number=3, survey_label="W3")
+        form.mode = "form"
+        form.save()
+        # Lexically first, so a leak would take R1 and shift everything.
+        _make_msg(form, "sess-aaa-empty", "Area 1 of 3 — Key Concepts.",
+                  sent_by="ai-message")
+        _make_msg(form, "sess-zzz-real", "the charter was the useful part")
+
+        corpus = build_response_corpus(self.course, scope_kind="course")
+        self.assertEqual([e["rid"] for e in corpus], ["R1", "R2", "R3", "R4"])
+        real = next(e for e in corpus if e["session_id"] == "sess-zzz-real")
+        self.assertEqual(real["text"], "the charter was the useful part")
+
+    def test_pdf_session_survives_with_no_user_turns(self):
+        # PDF rows are stored sent_by="student", which maps to role="assistant",
+        # so `texts` is empty even though the response is real. Dropping these
+        # would silently delete uploaded reflections from Quick Take.
+        form = _make_survey(self.course, week_number=4, survey_label="W4")
+        form.mode = "form"
+        form.save()
+        FeedbackMessage.objects.create(
+            session_id="sess-pdf", student_id="anon", sent_by="student",
+            content="Rules changed how the group behaved.", gpt_used="test",
+            gpt_id=form.pk, source=FeedbackMessage.SOURCE_PDF,
+        )
+
+        corpus = build_response_corpus(self.course, scope_kind="course")
+        self.assertIn("sess-pdf", [e["session_id"] for e in corpus])
+
     def test_ai_messages_are_excluded(self):
         # Add an AI message to week 1 survey
         _make_msg(self.w1, "sess-a", "AI response here", sent_by="ai")
