@@ -278,6 +278,8 @@ def _course_customization_dict(course):
         'referral_text': _resolve_referral_text(course),
         'referral_text_raw': referral_raw,
         'default_referral_text': DEFAULT_REFERRAL_TEXT,
+        # Silent cross-week tracking toggle (device-signal clustering).
+        'identity_tracking_enabled': course.identity_tracking_enabled,
     }
 
 
@@ -349,6 +351,121 @@ def _resolve_banner_show(course, session_id):
         if existing:
             return existing.shown
     return shown
+
+
+def _course_identity_map(course):
+    """Cluster a course's sessions into per-student groups via device signals.
+
+    Returns {session_id: {'label': 'S3', 'link': 'strong'|'weak', 'device': n}}.
+
+    Rules (device_key is the primary signal):
+    - Sessions sharing a device_key always cluster.
+    - A fingerprint links sessions only when it is NOT promiscuous. A
+      fingerprint spanning >2 distinct device_keys is a shared/lab machine and
+      creates no links (identical hardware+browser produces identical
+      fingerprints, and blind merging would fuse different students).
+    - 'link' says how THIS session attached to its cluster: 'strong' when its
+      device_key was already seen in an earlier session of the cluster (or it
+      opens the cluster); 'weak' when it joined via fingerprint alone.
+    - 'device' is the 1-based first-seen ordinal of the session's device within
+      its cluster, so the analyzer can say "new device" when it exceeds 1.
+    - Clusters are labeled S1..Sn by earliest session, so labels are stable as
+      long as history only grows forward.
+    """
+    rows = list(SessionIdentity.objects.filter(course=course).order_by('created_at', 'id'))
+    if not rows:
+        return {}
+
+    fp_devices = defaultdict(set)
+    for r in rows:
+        if r.fingerprint and r.device_key:
+            fp_devices[r.fingerprint].add(r.device_key)
+    shared_fps = {fp for fp, devs in fp_devices.items() if len(devs) > 2}
+
+    # Union-find over signal tokens; each session's tokens are unioned together.
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    tokens_by_row = {}
+    for r in rows:
+        tokens = []
+        if r.device_key:
+            tokens.append(('d', r.device_key))
+        if r.fingerprint and r.fingerprint not in shared_fps:
+            tokens.append(('f', r.fingerprint))
+        if not tokens:
+            tokens = [('s', r.session_id)]  # unlinkable → singleton cluster
+        for t in tokens[1:]:
+            union(tokens[0], t)
+        tokens_by_row[r.session_id] = tokens
+
+    clusters = defaultdict(list)  # root -> [rows, in created_at order]
+    for r in rows:
+        clusters[find(tokens_by_row[r.session_id][0])].append(r)
+
+    result = {}
+    ordered = sorted(clusters.values(), key=lambda rs: (rs[0].created_at, rs[0].id))
+    for i, cluster_rows in enumerate(ordered):
+        label = f'S{i + 1}'
+        seen_devices = []  # device_keys in first-seen order
+        for r in cluster_rows:
+            dev = r.device_key or f'~{r.session_id}'  # keyless row = own device
+            known = dev in seen_devices
+            if not known:
+                seen_devices.append(dev)
+            result[r.session_id] = {
+                'label': label,
+                'link': 'strong' if (known or len(seen_devices) == 1) else 'weak',
+                'device': seen_devices.index(dev) + 1,
+            }
+    return result
+
+
+@csrf_exempt
+def register_session_identity(request):
+    """POST /register_session_identity/ — silent per-session device signals.
+
+    Fire-and-forget from the student page on survey load. No-op unless the
+    survey's course has identity_tracking_enabled. Idempotent per
+    (course, session_id) like the banner assignment, so reloads don't churn.
+    """
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+    except Exception:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    public_id = (data.get('public_id') or '').strip()
+    session_id = (data.get('session_id') or '').strip()
+    if not public_id or not session_id:
+        return JsonResponse({'error': 'public_id and session_id are required'}, status=400)
+    try:
+        gpt = FeedbackGPT.objects.get(public_id=public_id)
+    except FeedbackGPT.DoesNotExist:
+        return JsonResponse({'error': 'Survey not found'}, status=404)
+    course = gpt.course
+    if not course or not course.identity_tracking_enabled:
+        return JsonResponse({'recorded': False})
+    try:
+        SessionIdentity.objects.get_or_create(
+            course=course, session_id=session_id,
+            defaults={
+                'device_key': (data.get('device_key') or '').strip()[:64],
+                'fingerprint': (data.get('fingerprint') or '').strip()[:64],
+            },
+        )
+    except IntegrityError:
+        pass  # concurrent first-load — the winner's row stands
+    return JsonResponse({'recorded': True})
 
 
 @csrf_exempt
@@ -471,6 +588,8 @@ def update_course_customization(request):
         course.referral_enabled = bool(data.get('referral_enabled'))
     if 'referral_text' in data:
         course.referral_text = (data.get('referral_text') or '').strip()[:200]
+    if 'identity_tracking_enabled' in data:
+        course.identity_tracking_enabled = bool(data.get('identity_tracking_enabled'))
     course.save()
     return JsonResponse(_course_customization_dict(course))
 
@@ -689,6 +808,9 @@ def get_feedback_gpt_by_public_id(request):
             # these onto the form schema so the engine's 7th turn gate can arm.
             'referral_enabled': bool(gpt.course.referral_enabled) if gpt.course else False,
             'referral_text': _resolve_referral_text(gpt.course),
+            # When true, feedback.html silently records device signals for
+            # cross-week clustering (register_session_identity).
+            'identity_tracking_enabled': bool(gpt.course.identity_tracking_enabled) if gpt.course else False,
             'team_snapshot': _survey_snapshot_to_dict(snap) if snap else None,
             'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
             # Inline the schema body so feedback.html doesn't need a second
@@ -869,6 +991,12 @@ def feedback_messages_by_course(request):
             ba.session_id: ba.shown
             for ba in BannerAssignment.objects.filter(course=course)
         }
+        # Course-wide student clustering from device signals. Empty when the
+        # course never tracked (no rows / toggle off), so the analyzer
+        # self-gates the student chips and the Students tab.
+        identity_map = (
+            _course_identity_map(course) if course.identity_tracking_enabled else {}
+        )
         result = []
         for gpt in gpts:
             messages = FeedbackMessage.objects.filter(gpt_id=gpt.id).order_by('created_at')
@@ -888,6 +1016,9 @@ def feedback_messages_by_course(request):
             banner_exposure = {
                 sid: banner_map[sid] for sid in sessions if sid in banner_map
             }
+            identity = {
+                sid: identity_map[sid] for sid in sessions if sid in identity_map
+            }
             session_count = len(sessions)
             msg_count = messages.count()
             avg_turns = round(msg_count / session_count) if session_count else 0
@@ -900,6 +1031,10 @@ def feedback_messages_by_course(request):
                 'survey_label': gpt.survey_label,
                 'sessions': dict(sessions),
                 'banner_exposure': banner_exposure,
+                # {session_id: {label:'S3', link:'strong'|'weak', device:n}} —
+                # cluster labels are course-wide, so the same student carries
+                # the same S-label across every week's survey entry.
+                'identity': identity,
                 'session_count': session_count,
                 'avg_turns': avg_turns,
                 'is_closed': gpt.is_closed,

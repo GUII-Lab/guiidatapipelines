@@ -142,6 +142,16 @@ class Course(models.Model):
         help_text="Where the bot points them. Blank uses the default 'your instructor or TA during their office hours'.",
     )
 
+    # CROSS-WEEK TRACKING. When enabled, the student page silently records
+    # per-session device signals (persistent browser key + fingerprint) in
+    # SessionIdentity so the analyzer can cluster the same student's sessions
+    # across the course's weekly surveys. No name is ever collected; disclosure
+    # lives in the survey terms text. Off by default for every course.
+    identity_tracking_enabled = models.BooleanField(
+        default=False,
+        help_text="Silently link one student's sessions across weeks via device signals.",
+    )
+
     def __str__(self):
         return f"{self.course_name} ({self.course_id})"
 
@@ -169,6 +179,37 @@ class BannerAssignment(models.Model):
 
     def __str__(self):
         return f'{self.course.course_id}/{self.session_id[:8]}… shown={self.shown}'
+
+
+class SessionIdentity(models.Model):
+    """Per-session device signals for cross-week student clustering.
+
+    Written once per anonymous survey session (when the course has
+    identity_tracking_enabled). device_key is a persistent localStorage UUID —
+    stable on one browser, lost on storage clears. fingerprint is a FingerprintJS
+    visitor id — survives storage clears, drifts on browser updates, and can
+    collide on identical lab machines. The analyzer clusters sessions sharing
+    either signal (fingerprint links are demoted when a fingerprint spans many
+    device keys, i.e. a shared machine). Neither value identifies a person.
+    """
+
+    course = models.ForeignKey(
+        Course, on_delete=models.CASCADE, related_name='session_identities',
+    )
+    session_id = models.CharField(max_length=100)
+    device_key = models.CharField(max_length=64, blank=True, default='')
+    fingerprint = models.CharField(max_length=64, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('course', 'session_id')]
+        indexes = [
+            models.Index(fields=['course', 'device_key']),
+            models.Index(fields=['course', 'fingerprint']),
+        ]
+
+    def __str__(self):
+        return f'{self.course.course_id}/{self.session_id[:8]}… dev={self.device_key[:8]}'
 
 
 class FeedbackGPT(models.Model):

@@ -30,6 +30,7 @@ urlpatterns = [
     path('api/update_course_banner/', update_course_banner, name='update_course_banner'),
     path('api/get_course_customization/', get_course_customization, name='get_course_customization'),
     path('api/update_course_customization/', update_course_customization, name='update_course_customization'),
+    path('api/register_session_identity/', register_session_identity, name='register_session_identity'),
     path('api/create_feedback_gpt/', create_feedback_gpt, name='create_feedback_gpt'),
     path('api/feedback_gpts_by_course/', feedback_gpts_by_course, name='feedback_gpts_by_course'),
     path('api/get_feedback_gpt_by_public_id/', get_feedback_gpt_by_public_id, name='get_feedback_gpt_by_public_id'),
