@@ -2,9 +2,16 @@ from django.http import JsonResponse, HttpResponseBadRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.dateparse import parse_datetime
 from django.utils import timezone
+from django.utils.text import slugify
 from django.contrib.auth.hashers import make_password, check_password
 from .models import *  # Ensure this is your custom User model
 from . import openai_client
+from .leai_completion import (
+    eligible_student_message_count,
+    issue_or_get_certificate,
+    normalize_code,
+    render_certificate_pdf,
+)
 import json
 import os
 import secrets
@@ -260,6 +267,26 @@ def _resolve_bot_name(course):
     return raw if raw else DEFAULT_BOT_NAME
 
 
+def _certificate_download_filename(survey):
+    course_name = ''
+    survey_label = ''
+    if survey.course:
+        course_name = slugify(survey.course.course_name)[:40]
+    survey_label = slugify(survey.survey_label or survey.name)[:40]
+    parts = ['guii-lab', 'completion-certificate']
+    if course_name:
+        parts.append(course_name)
+    if survey_label:
+        parts.append(survey_label)
+    return '-'.join(parts) + '.pdf'
+
+
+def _private_json_response(payload, *, status=200):
+    response = JsonResponse(payload, status=status)
+    response['Cache-Control'] = 'no-store, private'
+    return response
+
+
 def _course_customization_dict(course):
     """Serialize a course's chat customization for the instructor editor.
 
@@ -280,6 +307,8 @@ def _course_customization_dict(course):
         'default_referral_text': DEFAULT_REFERRAL_TEXT,
         # Silent cross-week tracking toggle (device-signal clustering).
         'identity_tracking_enabled': course.identity_tracking_enabled,
+        'completion_certificate_enabled': course.completion_certificate_enabled,
+        'parsed_document_download_enabled': course.parsed_document_download_enabled,
     }
 
 
@@ -582,6 +611,14 @@ def update_course_customization(request):
     except Course.DoesNotExist:
         return JsonResponse({'error': 'Course not found'}, status=404)
 
+    strict_download_flags = (
+        'completion_certificate_enabled',
+        'parsed_document_download_enabled',
+    )
+    for key in strict_download_flags:
+        if key in data and not isinstance(data.get(key), bool):
+            return JsonResponse({'error': 'Invalid request body'}, status=400)
+
     if 'bot_display_name' in data:
         course.bot_display_name = (data.get('bot_display_name') or '').strip()[:100]
     if 'referral_enabled' in data:
@@ -590,8 +627,164 @@ def update_course_customization(request):
         course.referral_text = (data.get('referral_text') or '').strip()[:200]
     if 'identity_tracking_enabled' in data:
         course.identity_tracking_enabled = bool(data.get('identity_tracking_enabled'))
+    if 'completion_certificate_enabled' in data:
+        course.completion_certificate_enabled = data.get(
+            'completion_certificate_enabled')
+    if 'parsed_document_download_enabled' in data:
+        course.parsed_document_download_enabled = data.get(
+            'parsed_document_download_enabled')
     course.save()
     return JsonResponse(_course_customization_dict(course))
+
+
+@csrf_exempt
+def issue_completion_certificate(request):
+    if request.method != 'POST':
+        return HttpResponse(status=405, content='Method not allowed')
+    try:
+        data = json.loads(request.body)
+    except ValueError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    if not isinstance(data, dict):
+        return JsonResponse({'error': 'Invalid request body'}, status=400)
+
+    public_id = data.get('public_id')
+    session_id = data.get('session_id')
+    public_id_max = FeedbackGPT._meta.get_field('public_id').max_length
+    session_id_max = SurveyCompletionCertificate._meta.get_field('session_id').max_length
+    if (
+        not isinstance(public_id, str)
+        or not isinstance(session_id, str)
+        or not public_id.strip()
+        or not session_id.strip()
+        or len(public_id.strip()) > public_id_max
+        or len(session_id.strip()) > session_id_max
+    ):
+        return JsonResponse(
+            {'error': 'public_id and session_id are required'},
+            status=400,
+        )
+
+    progress_snapshot = data.get('progress_snapshot', {})
+    if progress_snapshot is not None and not isinstance(progress_snapshot, dict):
+        return JsonResponse({'error': 'progress_snapshot must be an object'}, status=400)
+
+    public_id = public_id.strip()
+    session_id = session_id.strip()
+    try:
+        survey = FeedbackGPT.objects.select_related('course').get(public_id=public_id)
+    except FeedbackGPT.DoesNotExist:
+        return JsonResponse({'error': 'Survey not found'}, status=404)
+
+    course = survey.course
+    if not course or not course.completion_certificate_enabled:
+        return JsonResponse(
+            {'error': 'Completion certificates are not enabled for this course'},
+            status=403,
+        )
+
+    certificate = SurveyCompletionCertificate.objects.filter(
+        survey=survey,
+        session_id=session_id,
+    ).select_related('survey', 'survey__course').first()
+    if not certificate and eligible_student_message_count(survey.pk, session_id) < 1:
+        return JsonResponse(
+            {'error': 'No persisted student response found for this session'},
+            status=409,
+        )
+
+    try:
+        certificate = certificate or issue_or_get_certificate(
+            survey,
+            session_id,
+            progress_snapshot,
+        )
+        pdf_bytes = render_certificate_pdf(certificate)
+    except Exception:
+        return JsonResponse(
+            {'error': 'Unable to issue completion certificate'},
+            status=500,
+        )
+
+    response = HttpResponse(pdf_bytes, content_type='application/pdf')
+    response['Content-Disposition'] = (
+        f'attachment; filename="{_certificate_download_filename(certificate.survey)}"'
+    )
+    response['Cache-Control'] = 'no-store, private'
+    return response
+
+
+@csrf_exempt
+def verify_completion_certificates(request):
+    if request.method != 'POST':
+        response = HttpResponse(status=405, content='Method not allowed')
+        response['Cache-Control'] = 'no-store, private'
+        return response
+
+    try:
+        data = json.loads(request.body)
+    except ValueError:
+        return _private_json_response({'error': 'Invalid JSON'}, status=400)
+
+    if not isinstance(data, dict):
+        return _private_json_response({'error': 'Invalid request body'}, status=400)
+
+    course_id = data.get('course_id')
+    survey_id = data.get('survey_id')
+    codes = data.get('codes')
+    if (
+        not isinstance(course_id, str)
+        or not course_id.strip()
+        or isinstance(survey_id, bool)
+        or not isinstance(survey_id, int)
+        or not isinstance(codes, list)
+        or any(not isinstance(code, str) for code in codes)
+    ):
+        return _private_json_response(
+            {'error': 'course_id, survey_id, and codes are required'},
+            status=400,
+        )
+
+    if len(codes) > 100:
+        return _private_json_response(
+            {'error': 'codes must contain at most 100 entries'},
+            status=400,
+        )
+
+    selected_survey = FeedbackGPT.objects.filter(
+        id=survey_id,
+        course__course_id=course_id.strip(),
+    ).only('id').first()
+
+    normalized_codes = []
+    normalized_lookup_codes = set()
+    for raw_code in codes:
+        try:
+            normalized_code = normalize_code(raw_code)
+        except ValueError:
+            normalized_code = raw_code
+        else:
+            normalized_lookup_codes.add(normalized_code)
+        normalized_codes.append(normalized_code)
+
+    matching_codes = set()
+    if selected_survey and normalized_lookup_codes:
+        matching_codes = set(
+            SurveyCompletionCertificate.objects.filter(
+                survey=selected_survey,
+                code__in=normalized_lookup_codes,
+            ).values_list('code', flat=True)
+        )
+
+    return _private_json_response({
+        'results': [
+            {
+                'code': code,
+                'status': 'valid' if code in matching_codes else 'not_found',
+            }
+            for code in normalized_codes
+        ]
+    })
 
 
 @csrf_exempt
@@ -671,7 +864,6 @@ def create_feedback_gpt(request):
                     is_closed=False,
                     anonymity_mode=data.get('anonymity_mode', 'anonymous'),
                     reporting_structure=data.get('reporting_structure', ''),
-                    canvas_integration=data.get('canvas_integration', False),
                     mode=mode,
                     form_schema=form_schema,
                 )
@@ -797,7 +989,6 @@ def get_feedback_gpt_by_public_id(request):
             'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
             'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
             'anonymity_mode': gpt.anonymity_mode,
-            'canvas_integration': gpt.canvas_integration,
             # Course-wide student banner, inlined so feedback.html renders it on
             # first paint without a second round-trip. None when no course is set.
             'course_banner': course_banner,
@@ -811,6 +1002,8 @@ def get_feedback_gpt_by_public_id(request):
             # When true, feedback.html silently records device signals for
             # cross-week clustering (register_session_identity).
             'identity_tracking_enabled': bool(gpt.course.identity_tracking_enabled) if gpt.course else False,
+            'completion_certificate_enabled': bool(gpt.course.completion_certificate_enabled) if gpt.course else False,
+            'parsed_document_download_enabled': bool(gpt.course.parsed_document_download_enabled) if gpt.course else False,
             'team_snapshot': _survey_snapshot_to_dict(snap) if snap else None,
             'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
             # Inline the schema body so feedback.html doesn't need a second
@@ -1040,7 +1233,6 @@ def feedback_messages_by_course(request):
                 'is_closed': gpt.is_closed,
                 'expires_at': gpt.expires_at.isoformat() if gpt.expires_at else None,
                 'opens_at': gpt.opens_at.isoformat() if gpt.opens_at else None,
-                'canvas_integration': gpt.canvas_integration,
                 'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
             })
         return JsonResponse(result, safe=False)
@@ -1092,7 +1284,7 @@ def update_survey(request):
                 return JsonResponse({'error': 'Survey not found'}, status=404)
 
             updatable = ['name', 'survey_label', 'week_number', 'instructions',
-                         'anonymity_mode', 'reporting_structure', 'canvas_integration']
+                         'anonymity_mode', 'reporting_structure']
             for field in updatable:
                 if field in data:
                     setattr(gpt, field, data[field])
@@ -1279,35 +1471,6 @@ def clone_survey(request):
     return HttpResponse(status=405)
 
 
-def _session_to_code(session_id):
-    """Mirror the client-side JS hash to produce a completion code from a session ID.
-
-    JS original:
-        var hash = 0;
-        for (var i = 0; i < sid.length; i++) {
-            hash = ((hash << 5) - hash) + sid.charCodeAt(i);
-            hash |= 0;  // 32-bit signed int
-        }
-        Math.abs(hash).toString(36).toUpperCase().padStart(6,'0').slice(0,6)
-    """
-    h = 0
-    for ch in session_id:
-        h = ((h << 5) - h) + ord(ch)
-        # Emulate JS `|= 0` — clamp to signed 32-bit
-        h &= 0xFFFFFFFF
-        if h >= 0x80000000:
-            h -= 0x100000000
-    n = abs(h)
-    if n == 0:
-        return '000000'
-    digits = '0123456789abcdefghijklmnopqrstuvwxyz'
-    result = ''
-    while n:
-        result = digits[n % 36] + result
-        n //= 36
-    return result.upper().zfill(6)[:6]
-
-
 @csrf_exempt
 def export_survey_responses(request):
     """Return CSV of all responses for a survey."""
@@ -1323,9 +1486,9 @@ def export_survey_responses(request):
         messages = FeedbackMessage.objects.filter(gpt_id=gpt.id).order_by('session_id', 'created_at')
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(['completion_code', 'session_id', 'sent_by', 'content', 'created_at'])
+        writer.writerow(['session_id', 'sent_by', 'content', 'created_at'])
         for m in messages:
-            writer.writerow([_session_to_code(m.session_id), m.session_id, m.sent_by, m.content, m.created_at.strftime('%Y-%m-%d %H:%M:%S')])
+            writer.writerow([m.session_id, m.sent_by, m.content, m.created_at.strftime('%Y-%m-%d %H:%M:%S')])
 
         filename = f'survey_{gpt.id}_responses.csv'
         response = HttpResponse(buf.getvalue(), content_type='text/csv')

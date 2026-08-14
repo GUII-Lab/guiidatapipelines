@@ -152,6 +152,9 @@ class Course(models.Model):
         help_text="Silently link one student's sessions across weeks via device signals.",
     )
 
+    completion_certificate_enabled = models.BooleanField(default=False)
+    parsed_document_download_enabled = models.BooleanField(default=False)
+
     def __str__(self):
         return f"{self.course_name} ({self.course_id})"
 
@@ -260,6 +263,28 @@ class FeedbackGPT(models.Model):
     def __str__(self):
         return self.name
 
+
+class SurveyCompletionCertificate(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    survey = models.ForeignKey(
+        FeedbackGPT,
+        on_delete=models.CASCADE,
+        related_name='completion_certificates',
+    )
+    session_id = models.CharField(max_length=100)
+    code = models.CharField(max_length=19, unique=True)
+    issued_at = models.DateTimeField(auto_now_add=True)
+    progress_snapshot = models.JSONField(default=dict)
+    display_snapshot = models.JSONField(default=dict)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['survey', 'session_id'],
+                name='unique_completion_certificate_per_survey_session',
+            ),
+        ]
+        indexes = [models.Index(fields=['survey', 'code'])]
 
 class FormSchema(models.Model):
     """A structured-reflection schema (sections, prompts, probes, fields).
