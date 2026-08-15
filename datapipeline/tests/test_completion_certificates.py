@@ -717,7 +717,8 @@ class CompletionServiceTest(TestCase):
         pdf_bytes = render_certificate_pdf(certificate)
         text = _pdf_text(pdf_bytes)
 
-        self.assertIn("GUII Lab Completion Certificate", text)
+        self.assertIn("LEAI Completion Certificate", text)
+        self.assertNotIn("GUII Lab", text)
         self.assertIn("CMPM 101", text)
         self.assertIn("Week 1 Reflection", text)
         self.assertIn("Week 1", text)

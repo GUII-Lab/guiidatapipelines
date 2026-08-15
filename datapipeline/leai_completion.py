@@ -264,8 +264,8 @@ def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
 
     buffer = BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter, invariant=1)
-    pdf.setTitle("GUII Lab Completion Certificate")
-    pdf.setAuthor("GUII Lab Learning Experience AI")
+    pdf.setTitle("LEAI Completion Certificate")
+    pdf.setAuthor("Learning Experience AI (LEAI)")
     pdf.setSubject("Anonymous survey participation certificate")
 
     page_width, page_height = letter
@@ -286,7 +286,7 @@ def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
 
     pdf.setFillColor(ink)
     pdf.setFont("Helvetica-Bold", 8.5)
-    pdf.drawString(58, 735, "GUII LAB  /  LEARNING EXPERIENCE AI")
+    pdf.drawString(58, 735, "LEARNING EXPERIENCE AI (LEAI)")
     pdf.setFont("Helvetica", 7.5)
     pdf.setFillColor(muted)
     pdf.drawRightString(554, 735, "ANONYMOUS PARTICIPATION RECORD")
@@ -305,7 +305,7 @@ def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
     pdf.drawCentredString(526, 663, "CODED")
 
     pdf.setFont("Times-Bold", 26)
-    pdf.drawCentredString(page_width / 2, 665, "GUII Lab Completion Certificate")
+    pdf.drawCentredString(page_width / 2, 665, "LEAI Completion Certificate")
     pdf.setFillColor(accent)
     pdf.setFont("Helvetica-Bold", 8.5)
     pdf.drawCentredString(page_width / 2, 640, "A UNIQUE CODED RECORD FOR INSTRUCTOR VERIFICATION")
@@ -385,7 +385,7 @@ def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
     pdf.drawString(72, 126, display["canvas_guidance"])
     pdf.setFillColor(muted)
     pdf.setFont("Helvetica", 7.5)
-    pdf.drawString(72, 108, "Issued by Learning Experience AI (LEAI)  /  GUII Lab")
+    pdf.drawString(72, 108, "Issued by Learning Experience AI (LEAI)")
     if issued_on:
         pdf.drawRightString(540, 108, f"Code issued {issued_on}")
 
