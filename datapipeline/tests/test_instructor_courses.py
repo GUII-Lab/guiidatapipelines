@@ -1,7 +1,9 @@
 import json
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import is_password_usable, make_password
+from django.core.exceptions import ValidationError
 from django.test import Client, TestCase
 
 from datapipeline.models import (
@@ -10,6 +12,7 @@ from datapipeline.models import (
     Institution,
     InstitutionMembership,
     InstructorAccount,
+    InstructorAuditEvent,
 )
 
 
@@ -134,6 +137,14 @@ class InstructorCourseApiTests(TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json(), {'error': 'institution_access_denied'})
         self.assertFalse(Course.objects.filter(course_id='other-course').exists())
+        event = InstructorAuditEvent.objects.get(
+            action=InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED,
+        )
+        self.assertEqual(event.actor, self.account)
+        self.assertEqual(event.outcome, InstructorAuditEvent.OUTCOME_DENIED)
+        self.assertEqual(event.metadata, {
+            'reason_code': 'institution_access_denied',
+        })
 
     def test_course_create_atomically_creates_owner_without_shared_password(self):
         token = self.ready_token()
@@ -158,6 +169,38 @@ class InstructorCourseApiTests(TestCase):
         self.assertFalse(is_password_usable(course.password))
         self.assertEqual(owner.role, CourseMembership.ROLE_OWNER)
         self.assertEqual(owner.institution_membership, self.institution_membership)
+        event = InstructorAuditEvent.objects.get(
+            action=InstructorAuditEvent.ACTION_COURSE_CREATED,
+        )
+        self.assertEqual(event.actor, self.account)
+        self.assertEqual(event.course, course)
+        self.assertEqual(event.target_type, 'course')
+        self.assertEqual(event.target_id, course.course_id)
+        self.assertEqual(event.metadata, {'institution_slug': 'ucsc'})
+
+    def test_course_create_rolls_back_when_audit_write_fails(self):
+        token = self.ready_token()
+
+        with patch(
+            'datapipeline.instructor_views.record_instructor_event',
+            side_effect=ValidationError('audit failed'),
+        ):
+            with self.assertRaises(ValidationError):
+                self.post_json(
+                    '/datapipeline/api/instructor_courses/',
+                    {
+                        'course_id': 'rollback-course',
+                        'course_name': 'Rollback Course',
+                        'instructor_name': 'Prof. Test',
+                        'institution_slug': self.institution.slug,
+                    },
+                    token=token,
+                )
+
+        self.assertFalse(Course.objects.filter(
+            course_id='rollback-course',
+        ).exists())
+        self.assertFalse(CourseMembership.objects.exists())
 
     def test_duplicate_course_id_returns_conflict_without_extra_membership(self):
         Course.objects.create(
@@ -184,6 +227,9 @@ class InstructorCourseApiTests(TestCase):
         self.assertEqual(response.json(), {'error': 'course_id_taken'})
         self.assertEqual(Course.objects.filter(course_id='existing').count(), 1)
         self.assertEqual(CourseMembership.objects.count(), 0)
+        self.assertFalse(InstructorAuditEvent.objects.filter(
+            action=InstructorAuditEvent.ACTION_COURSE_CREATED,
+        ).exists())
 
     def test_membership_owned_course_rejects_legacy_password_login(self):
         course = Course.objects.create(

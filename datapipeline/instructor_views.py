@@ -9,6 +9,7 @@ from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
+from .instructor_audit import record_instructor_event
 from .instructor_auth import (
     authenticate_instructor_request,
     issue_instructor_session,
@@ -19,6 +20,7 @@ from .models import (
     CourseMembership,
     InstitutionMembership,
     InstructorAccount,
+    InstructorAuditEvent,
     InstructorSession,
 )
 
@@ -121,9 +123,21 @@ def instructor_sessions(request):
         .first()
     )
     if account is None or not isinstance(password, str) or not account.user.check_password(password):
+        record_instructor_event(
+            action=InstructorAuditEvent.ACTION_LOGIN_DENIED,
+            outcome=InstructorAuditEvent.OUTCOME_DENIED,
+            actor=account,
+        )
         return _json_response({'error': 'invalid_credentials'}, status=401)
 
-    raw_token, session = issue_instructor_session(account)
+    with transaction.atomic():
+        raw_token, session = issue_instructor_session(account)
+        record_instructor_event(
+            action=InstructorAuditEvent.ACTION_LOGIN_SUCCEEDED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=account,
+            session=session,
+        )
     return _json_response({
         'token': raw_token,
         'expires_at': session.expires_at.isoformat(),
@@ -138,19 +152,56 @@ def instructor_current_session(request):
     account, session = authenticate_instructor_request(request)
     if account is None:
         return _authentication_required()
-    session.revoked_at = timezone.now()
-    session.save(update_fields=['revoked_at'])
+    with transaction.atomic():
+        session.revoked_at = timezone.now()
+        session.save(update_fields=['revoked_at'])
+        record_instructor_event(
+            action=InstructorAuditEvent.ACTION_LOGOUT,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=account,
+            session=session,
+        )
     response = HttpResponse(status=204)
     response['Cache-Control'] = 'no-store, private'
     return response
 
 
+@csrf_exempt
 def instructor_me(request):
-    if request.method != 'GET':
+    if request.method not in {'GET', 'PATCH'}:
         return HttpResponse(status=405)
-    account, _session = authenticate_instructor_request(request)
-    if account is None:
-        return _authentication_required()
+
+    if request.method == 'GET':
+        account, _session = authenticate_instructor_request(request)
+        if account is None:
+            return _authentication_required()
+        return _json_response(_serialize_account(account))
+
+    account, session, error_response = _authenticated_account(request)
+    if error_response is not None:
+        return error_response
+    payload = _json_object(request)
+    if payload is None:
+        return _json_response({'error': 'invalid_json'}, status=400)
+    if set(payload) != {'display_name'}:
+        return _json_response({'error': 'invalid_profile'}, status=400)
+    display_name = payload['display_name']
+    if not isinstance(display_name, str):
+        return _json_response({'error': 'invalid_profile'}, status=400)
+    display_name = display_name.strip()
+    if not display_name or len(display_name) > 100:
+        return _json_response({'error': 'invalid_profile'}, status=400)
+
+    with transaction.atomic():
+        account.display_name = display_name
+        account.save(update_fields=['display_name', 'updated_at'])
+        record_instructor_event(
+            action=InstructorAuditEvent.ACTION_PROFILE_UPDATED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=account,
+            session=session,
+            metadata={'changed_field': 'display_name'},
+        )
     return _json_response(_serialize_account(account))
 
 
@@ -190,6 +241,12 @@ def instructor_password(request):
             instructor=account,
             revoked_at__isnull=True,
         ).exclude(pk=current_session.pk).update(revoked_at=now)
+        record_instructor_event(
+            action=InstructorAuditEvent.ACTION_PASSWORD_CHANGED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=account,
+            session=current_session,
+        )
 
     return _json_response({'status': 'password_changed'})
 
@@ -260,6 +317,13 @@ def instructor_courses(request):
         .first()
     )
     if institution_membership is None:
+        record_instructor_event(
+            action=InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED,
+            outcome=InstructorAuditEvent.OUTCOME_DENIED,
+            actor=account,
+            session=_session,
+            metadata={'reason_code': 'institution_access_denied'},
+        )
         return _json_response({'error': 'institution_access_denied'}, status=403)
 
     try:
@@ -278,6 +342,18 @@ def instructor_courses(request):
                 course=course,
                 institution_membership=institution_membership,
                 role=CourseMembership.ROLE_OWNER,
+            )
+            record_instructor_event(
+                action=InstructorAuditEvent.ACTION_COURSE_CREATED,
+                outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                actor=account,
+                session=_session,
+                course=course,
+                target_type='course',
+                target_id=course.course_id,
+                metadata={
+                    'institution_slug': institution_membership.institution.slug,
+                },
             )
     except IntegrityError:
         return _json_response({'error': 'course_id_taken'}, status=409)
