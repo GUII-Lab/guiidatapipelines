@@ -61,6 +61,16 @@ class FeedbackMessage(models.Model):
         'LEAIPdfIngestBatch', on_delete=models.SET_NULL,
         null=True, blank=True, related_name='messages',
     )
+    # Exact Form Mode question attribution. These fields are nullable so
+    # historical chat/PDF rows remain valid. The student's original content
+    # stays authoritative; this metadata only identifies which schema field
+    # was on screen when they wrote it.
+    form_schema_id = models.CharField(max_length=100, null=True, blank=True)
+    form_schema_version = models.CharField(max_length=40, null=True, blank=True)
+    form_section_id = models.CharField(max_length=100, null=True, blank=True)
+    form_field_id = models.CharField(max_length=100, null=True, blank=True)
+    form_field_label = models.TextField(null=True, blank=True)
+    form_response_phase = models.CharField(max_length=16, null=True, blank=True)
 
     def __str__(self):
         return f"{self.student_id} used {self.gpt_used}"

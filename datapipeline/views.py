@@ -28,6 +28,43 @@ import hashlib
 import requests
 
 
+FORM_RESPONSE_PHASES = {'primary', 'probe', 'revision'}
+
+
+def _form_attribution_kwargs(data):
+    """Return only validated, nullable Form Mode attribution fields."""
+    phase = data.get('form_response_phase')
+    if phase not in FORM_RESPONSE_PHASES:
+        phase = None
+
+    def optional_text(name):
+        value = data.get(name)
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    return {
+        'form_schema_id': optional_text('form_schema_id'),
+        'form_schema_version': optional_text('form_schema_version'),
+        'form_section_id': optional_text('form_section_id'),
+        'form_field_id': optional_text('form_field_id'),
+        'form_field_label': optional_text('form_field_label'),
+        'form_response_phase': phase,
+    }
+
+
+def _serialize_form_attribution(message):
+    return {
+        'form_schema_id': message.form_schema_id,
+        'form_schema_version': message.form_schema_version,
+        'form_section_id': message.form_section_id,
+        'form_field_id': message.form_field_id,
+        'form_field_label': message.form_field_label,
+        'form_response_phase': message.form_response_phase,
+    }
+
+
 def _generate_public_id(length=12):
     """Generate a unique random alphanumeric public_id for FeedbackGPT."""
     alphabet = string.ascii_letters + string.digits
@@ -84,6 +121,7 @@ def feedback_message_api(request):
                 gpt_id=data.get('gpt_id'),
                 research_consent=bool(data.get('research_consent', False)),
                 referred=bool(data.get('referred', False)),
+                **_form_attribution_kwargs(data),
             )
             feedback_message.save()
             return JsonResponse({'status': 'success', 'message': 'Feedback message saved successfully'})
@@ -134,6 +172,7 @@ def feedback_messages_bulk_api(request):
             gpt_id=m.get('gpt_id'),
             research_consent=bool(m.get('research_consent', False)),
             referred=bool(m.get('referred', False)),
+            **_form_attribution_kwargs(m),
         ))
 
     try:
@@ -1100,7 +1139,11 @@ def feedback_session_resume(request):
             source=FeedbackMessage.SOURCE_CHAT,
         )
         .order_by('created_at')
-        .values('sent_by', 'content', 'created_at', 'referred')
+        .values(
+            'sent_by', 'content', 'created_at', 'referred',
+            'form_schema_id', 'form_schema_version', 'form_section_id',
+            'form_field_id', 'form_field_label', 'form_response_phase',
+        )
     )
     messages = [
         {
@@ -1113,6 +1156,12 @@ def feedback_session_resume(request):
             # The [REFERRED] marker was stripped before this row was written,
             # so without this a student who refreshes can be nudged twice.
             'referred': bool(m['referred']),
+            'form_schema_id': m['form_schema_id'],
+            'form_schema_version': m['form_schema_version'],
+            'form_section_id': m['form_section_id'],
+            'form_field_id': m['form_field_id'],
+            'form_field_label': m['form_field_label'],
+            'form_response_phase': m['form_response_phase'],
         }
         for m in qs
     ]
@@ -1147,6 +1196,7 @@ def feedback_messages_by_gpt(request):
                 'pdf_batch_id': str(m.pdf_batch_id) if m.pdf_batch_id else None,
                 # True on the AI turn that fired the POINT TO A HUMAN nudge.
                 'referred': m.referred,
+                **_serialize_form_attribution(m),
             })
         # A/B banner exposure for these sessions (empty unless the split is on).
         gpt_obj = FeedbackGPT.objects.filter(id=gpt_id).first()
@@ -1205,6 +1255,7 @@ def feedback_messages_by_course(request):
                     # nudge. This serializer returns no per-message id, so the
                     # analyzer keys its flag off this field directly.
                     'referred': m.referred,
+                    **_serialize_form_attribution(m),
                 })
             banner_exposure = {
                 sid: banner_map[sid] for sid in sessions if sid in banner_map
