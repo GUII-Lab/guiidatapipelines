@@ -304,6 +304,126 @@ class Course(models.Model):
         return f"{self.course_name} ({self.course_id})"
 
 
+class InstructorAuditEvent(models.Model):
+    ACTION_LOGIN_SUCCEEDED = 'auth.login_succeeded'
+    ACTION_LOGIN_DENIED = 'auth.login_denied'
+    ACTION_LOGOUT = 'auth.logout'
+    ACTION_PASSWORD_CHANGED = 'account.password_changed'
+    ACTION_PROFILE_UPDATED = 'account.profile_updated'
+    ACTION_COURSE_CREATED = 'course.created'
+    ACTION_COURSE_BANNER_UPDATED = 'course.banner_updated'
+    ACTION_COURSE_CUSTOMIZATION_UPDATED = 'course.customization_updated'
+    ACTION_SURVEY_CREATED = 'survey.created'
+    ACTION_SURVEY_UPDATED = 'survey.updated'
+    ACTION_SURVEY_STATUS_CHANGED = 'survey.status_changed'
+    ACTION_SURVEY_CLONED = 'survey.cloned'
+    ACTION_SURVEY_DELETED = 'survey.deleted'
+    ACTION_SURVEY_RESPONSES_EXPORTED = 'survey.responses_exported'
+    ACTION_ANALYSIS_SESSION_CREATED = 'analysis.session_created'
+    ACTION_ANALYSIS_SESSION_UPDATED = 'analysis.session_updated'
+    ACTION_ANALYSIS_SESSION_DELETED = 'analysis.session_deleted'
+    ACTION_ANALYSIS_TURN_STARTED = 'analysis.turn_started'
+    ACTION_ANALYSIS_QUICKTAKE_GENERATED = 'analysis.quicktake_generated'
+    ACTION_ANALYSIS_QUICKTAKE_DELETED = 'analysis.quicktake_deleted'
+    ACTION_TEAM_CONFIGURATION_CREATED = 'team_configuration.created'
+    ACTION_TEAM_CONFIGURATION_UPDATED = 'team_configuration.updated'
+    ACTION_TEAM_CONFIGURATION_ARCHIVED = 'team_configuration.archived'
+    ACTION_TEAM_CONFIGURATION_DELETED = 'team_configuration.deleted'
+    ACTION_PDF_INGEST_STARTED = 'pdf_ingest.started'
+    ACTION_PDF_INGEST_ABANDONED = 'pdf_ingest.abandoned'
+    ACTION_PDF_INGEST_COMMITTED = 'pdf_ingest.committed'
+    ACTION_PDF_INGEST_REVERTED = 'pdf_ingest.reverted'
+    ACTION_AUTHORIZATION_DENIED = 'authorization.denied'
+
+    ACTION_CHOICES = [
+        (ACTION_LOGIN_SUCCEEDED, 'Login succeeded'),
+        (ACTION_LOGIN_DENIED, 'Login denied'),
+        (ACTION_LOGOUT, 'Logout'),
+        (ACTION_PASSWORD_CHANGED, 'Password changed'),
+        (ACTION_PROFILE_UPDATED, 'Profile updated'),
+        (ACTION_COURSE_CREATED, 'Course created'),
+        (ACTION_COURSE_BANNER_UPDATED, 'Course banner updated'),
+        (ACTION_COURSE_CUSTOMIZATION_UPDATED, 'Course customization updated'),
+        (ACTION_SURVEY_CREATED, 'Survey created'),
+        (ACTION_SURVEY_UPDATED, 'Survey updated'),
+        (ACTION_SURVEY_STATUS_CHANGED, 'Survey status changed'),
+        (ACTION_SURVEY_CLONED, 'Survey cloned'),
+        (ACTION_SURVEY_DELETED, 'Survey deleted'),
+        (ACTION_SURVEY_RESPONSES_EXPORTED, 'Survey responses exported'),
+        (ACTION_ANALYSIS_SESSION_CREATED, 'Analysis session created'),
+        (ACTION_ANALYSIS_SESSION_UPDATED, 'Analysis session updated'),
+        (ACTION_ANALYSIS_SESSION_DELETED, 'Analysis session deleted'),
+        (ACTION_ANALYSIS_TURN_STARTED, 'Analysis turn started'),
+        (ACTION_ANALYSIS_QUICKTAKE_GENERATED, 'Analysis quick take generated'),
+        (ACTION_ANALYSIS_QUICKTAKE_DELETED, 'Analysis quick take deleted'),
+        (ACTION_TEAM_CONFIGURATION_CREATED, 'Team configuration created'),
+        (ACTION_TEAM_CONFIGURATION_UPDATED, 'Team configuration updated'),
+        (ACTION_TEAM_CONFIGURATION_ARCHIVED, 'Team configuration archived'),
+        (ACTION_TEAM_CONFIGURATION_DELETED, 'Team configuration deleted'),
+        (ACTION_PDF_INGEST_STARTED, 'PDF ingest started'),
+        (ACTION_PDF_INGEST_ABANDONED, 'PDF ingest abandoned'),
+        (ACTION_PDF_INGEST_COMMITTED, 'PDF ingest committed'),
+        (ACTION_PDF_INGEST_REVERTED, 'PDF ingest reverted'),
+        (ACTION_AUTHORIZATION_DENIED, 'Authorization denied'),
+    ]
+
+    OUTCOME_SUCCESS = 'success'
+    OUTCOME_DENIED = 'denied'
+    OUTCOME_FAILED = 'failed'
+    OUTCOME_CHOICES = [
+        (OUTCOME_SUCCESS, 'Success'),
+        (OUTCOME_DENIED, 'Denied'),
+        (OUTCOME_FAILED, 'Failed'),
+    ]
+
+    event_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    occurred_at = models.DateTimeField(auto_now_add=True)
+    actor = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='audit_events',
+    )
+    session = models.ForeignKey(
+        InstructorSession,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='audit_events',
+    )
+    course = models.ForeignKey(
+        Course,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='instructor_audit_events',
+    )
+    course_id_snapshot = models.CharField(max_length=50, blank=True, default='')
+    action = models.CharField(max_length=64, choices=ACTION_CHOICES)
+    outcome = models.CharField(max_length=16, choices=OUTCOME_CHOICES)
+    target_type = models.CharField(max_length=32, blank=True, default='')
+    target_id = models.CharField(max_length=100, blank=True, default='')
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['-occurred_at', '-id']
+        indexes = [
+            models.Index(
+                fields=['actor', '-occurred_at'],
+                name='leai_audit_actor_time',
+            ),
+            models.Index(
+                fields=['course', '-occurred_at'],
+                name='leai_audit_course_time',
+            ),
+            models.Index(
+                fields=['action', 'outcome', '-occurred_at'],
+                name='leai_audit_action_time',
+            ),
+        ]
+
+
 class CourseMembership(models.Model):
     ROLE_OWNER = 'owner'
     ROLE_INSTRUCTOR = 'instructor'
