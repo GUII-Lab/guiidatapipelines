@@ -4,9 +4,10 @@ import secrets
 from datetime import timedelta
 
 from django.db import transaction
+from django.http import JsonResponse
 from django.utils import timezone
 
-from .models import InstructorSession
+from .models import CourseMembership, InstructorSession
 
 
 DEFAULT_SESSION_HOURS = 12
@@ -58,3 +59,74 @@ def authenticate_instructor_request(request):
     InstructorSession.objects.filter(pk=session.pk).update(last_used_at=now)
     session.last_used_at = now
     return session.instructor, session
+
+
+def _authorization_error(code, status):
+    response = JsonResponse({'error': code}, status=status)
+    response['Cache-Control'] = 'no-store, private'
+    return response
+
+
+def membership_allows(membership, capability):
+    if membership is None:
+        return False
+    if capability is None:
+        return True
+    if capability not in {'publish', 'export'}:
+        return False
+    if membership.role == CourseMembership.ROLE_OWNER:
+        return True
+    if capability == 'publish':
+        return membership.can_publish
+    return membership.can_export
+
+
+def authorize_instructor_course(request, course, *, capability=None):
+    account, session = authenticate_instructor_request(request)
+    if account is None:
+        return (
+            None,
+            None,
+            None,
+            _authorization_error('authentication_required', 401),
+        )
+    if account.must_change_password:
+        return (
+            account,
+            session,
+            None,
+            _authorization_error('password_change_required', 403),
+        )
+
+    membership = (
+        CourseMembership.objects
+        .select_related(
+            'course',
+            'institution_membership',
+            'institution_membership__institution',
+        )
+        .filter(
+            course=course,
+            is_active=True,
+            institution_membership__instructor=account,
+            institution_membership__is_active=True,
+            institution_membership__institution__is_active=True,
+            institution_membership__institution=course.institution,
+        )
+        .first()
+    )
+    if membership is None:
+        return (
+            account,
+            session,
+            None,
+            _authorization_error('course_access_denied', 403),
+        )
+    if not membership_allows(membership, capability):
+        return (
+            account,
+            session,
+            membership,
+            _authorization_error('capability_denied', 403),
+        )
+    return account, session, membership, None
