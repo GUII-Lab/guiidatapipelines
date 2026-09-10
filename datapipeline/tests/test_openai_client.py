@@ -13,6 +13,7 @@ import openai  # for error-class references in tests
 from datapipeline import openai_client
 from datapipeline.openai_client import (
     DEFAULT_MODEL,
+    FALLBACK_CHAT_MODEL,
     OpenAIClientError,
     OpenAIConfigError,
     OpenAIRefusalError,
@@ -25,6 +26,9 @@ class TestModuleSurface(unittest.TestCase):
     def test_default_model_is_nonempty_string(self):
         self.assertIsInstance(DEFAULT_MODEL, str)
         self.assertTrue(DEFAULT_MODEL)
+
+    def test_fallback_chat_model_is_luna(self):
+        self.assertEqual(FALLBACK_CHAT_MODEL, "gpt-5.6-luna")
 
     def test_exception_hierarchy(self):
         self.assertTrue(issubclass(OpenAIRefusalError, OpenAIClientError))
