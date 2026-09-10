@@ -13,6 +13,7 @@ from datapipeline.instructor_audit import (
 )
 from datapipeline.models import (
     Course,
+    Institution,
     InstructorAccount,
     InstructorAuditEvent,
     InstructorSession,
@@ -140,11 +141,16 @@ class InstructorAuditWriterTests(TestCase):
             email='writer@example.edu',
             display_name='Prof. Writer',
         )
+        self.institution = Institution.objects.create(
+            slug='ucsc',
+            name='UC Santa Cruz',
+        )
         self.course = Course.objects.create(
             course_id='cmpm80k-sm26',
             course_name='CMPM 80K',
             instructor_name='Prof. Writer',
             password='legacy-password',
+            institution=self.institution,
         )
 
     def test_writer_exposes_allow_list_for_every_declared_action(self):
@@ -219,11 +225,11 @@ class InstructorAuditWriterTests(TestCase):
         event = record_instructor_event(
             action=InstructorAuditEvent.ACTION_SURVEY_UPDATED,
             outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
-            metadata={'changed_fields': ['title', 'survey_status']},
+            metadata={'changed_fields': ['name', 'survey_label']},
         )
 
         self.assertEqual(event.metadata, {
-            'changed_fields': ['title', 'survey_status'],
+            'changed_fields': ['name', 'survey_label'],
         })
 
     def test_writer_rejects_non_field_names_in_changed_fields(self):
@@ -269,3 +275,267 @@ class InstructorAuditWriterTests(TestCase):
                     record_instructor_event(action=action, outcome=outcome)
 
         self.assertFalse(InstructorAuditEvent.objects.exists())
+
+    def test_writer_rejects_unrestricted_text_through_allowed_scalar_keys(self):
+        invalid_cases = [
+            (
+                InstructorAuditEvent.ACTION_COURSE_CREATED,
+                {'institution_slug': 'Bearer raw-token'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_COURSE_CREATED,
+                {'institution_slug': 'other-institution'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_CREATED,
+                {'mode': 'student feedback excerpt'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_CLONED,
+                {'source_survey_id': 'TemporaryPass123!'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_DELETED,
+                {'responses_deleted': 'analysis output'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_ANALYSIS_QUICKTAKE_GENERATED,
+                {'scope_kind': 'system prompt'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED,
+                {'reason_code': 'Authorization: Bearer secret'},
+            ),
+        ]
+
+        for action, metadata in invalid_cases:
+            with self.subTest(action=action, metadata=metadata):
+                with self.assertRaises(ValidationError):
+                    record_instructor_event(
+                        action=action,
+                        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                        course=self.course,
+                        metadata=metadata,
+                    )
+
+        self.assertFalse(InstructorAuditEvent.objects.exists())
+
+    def test_writer_rejects_unrestricted_or_mismatched_targets(self):
+        invalid_targets = [
+            (
+                InstructorAuditEvent.ACTION_SURVEY_UPDATED,
+                'prompt',
+                'student feedback excerpt',
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_UPDATED,
+                'survey',
+                'Bearer raw-token',
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_UPDATED,
+                'survey',
+                '42',
+            ),
+            (
+                InstructorAuditEvent.ACTION_COURSE_CREATED,
+                'course',
+                'another-course',
+            ),
+            (
+                InstructorAuditEvent.ACTION_ANALYSIS_SESSION_CREATED,
+                'analysis_session',
+                '58df1de8-264d-4c35-a0bf-3e90d75ee16c',
+            ),
+            (
+                InstructorAuditEvent.ACTION_LOGIN_SUCCEEDED,
+                '',
+                'raw-token',
+            ),
+        ]
+
+        for action, target_type, target_id in invalid_targets:
+            with self.subTest(
+                action=action,
+                target_type=target_type,
+                target_id=target_id,
+            ):
+                with self.assertRaises(ValidationError):
+                    record_instructor_event(
+                        action=action,
+                        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                        course=self.course,
+                        target_type=target_type,
+                        target_id=target_id,
+                    )
+
+        self.assertFalse(InstructorAuditEvent.objects.exists())
+
+    def test_writer_accepts_typed_fixed_scalar_and_target_values(self):
+        course_event = record_instructor_event(
+            action=InstructorAuditEvent.ACTION_COURSE_CREATED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            course=self.course,
+            target_type='course',
+            target_id=self.course.course_id,
+            metadata={'institution_slug': self.institution.slug},
+        )
+        survey_event = record_instructor_event(
+            action=InstructorAuditEvent.ACTION_SURVEY_CLONED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            course=self.course,
+            target_type='survey',
+            target_id=42,
+            metadata={'source_survey_id': 41},
+        )
+        analysis_event = record_instructor_event(
+            action=InstructorAuditEvent.ACTION_ANALYSIS_SESSION_CREATED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            course=self.course,
+            target_type='analysis_session',
+            target_id=uuid.UUID('58df1de8-264d-4c35-a0bf-3e90d75ee16c'),
+        )
+
+        self.assertEqual(course_event.target_id, self.course.course_id)
+        self.assertEqual(survey_event.target_id, '42')
+        self.assertEqual(
+            analysis_event.target_id,
+            '58df1de8-264d-4c35-a0bf-3e90d75ee16c',
+        )
+
+    def test_writer_accepts_fixed_scalar_domains(self):
+        valid_cases = [
+            (
+                InstructorAuditEvent.ACTION_PROFILE_UPDATED,
+                {'changed_field': 'display_name'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_CREATED,
+                {'mode': 'general'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_STATUS_CHANGED,
+                {'status': 'closed'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_DELETED,
+                {'responses_deleted': 0},
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_RESPONSES_EXPORTED,
+                {'row_count': 1},
+            ),
+            (
+                InstructorAuditEvent.ACTION_ANALYSIS_QUICKTAKE_GENERATED,
+                {'scope_kind': 'week'},
+            ),
+            (
+                InstructorAuditEvent.ACTION_PDF_INGEST_STARTED,
+                {'file_count': 2},
+            ),
+            (
+                InstructorAuditEvent.ACTION_PDF_INGEST_COMMITTED,
+                {'student_count': 3, 'message_count': 4},
+            ),
+            (
+                InstructorAuditEvent.ACTION_PDF_INGEST_REVERTED,
+                {'deleted_count': 5},
+            ),
+            (
+                InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED,
+                {'reason_code': 'course_access_denied'},
+            ),
+        ]
+
+        for action, metadata in valid_cases:
+            with self.subTest(action=action, metadata=metadata):
+                record_instructor_event(
+                    action=action,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    metadata=metadata,
+                )
+
+        self.assertEqual(InstructorAuditEvent.objects.count(), len(valid_cases))
+
+    def test_writer_rejects_boolean_or_negative_counts(self):
+        invalid_counts = [True, -1]
+
+        for value in invalid_counts:
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    record_instructor_event(
+                        action=InstructorAuditEvent.ACTION_SURVEY_DELETED,
+                        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                        metadata={'responses_deleted': value},
+                    )
+
+        self.assertFalse(InstructorAuditEvent.objects.exists())
+
+    def test_writer_rejects_well_formed_changed_fields_for_the_wrong_action(self):
+        invalid_cases = [
+            (
+                InstructorAuditEvent.ACTION_COURSE_BANNER_UPDATED,
+                'survey_label',
+            ),
+            (
+                InstructorAuditEvent.ACTION_COURSE_CUSTOMIZATION_UPDATED,
+                'banner_enabled',
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_UPDATED,
+                'banner_enabled',
+            ),
+            (
+                InstructorAuditEvent.ACTION_ANALYSIS_SESSION_UPDATED,
+                'name',
+            ),
+            (
+                InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_UPDATED,
+                'title',
+            ),
+        ]
+
+        for action, field_name in invalid_cases:
+            with self.subTest(action=action, field_name=field_name):
+                with self.assertRaises(ValidationError):
+                    record_instructor_event(
+                        action=action,
+                        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                        metadata={'changed_fields': [field_name]},
+                    )
+
+        self.assertFalse(InstructorAuditEvent.objects.exists())
+
+    def test_writer_accepts_action_specific_changed_fields(self):
+        valid_cases = [
+            (
+                InstructorAuditEvent.ACTION_COURSE_BANNER_UPDATED,
+                'banner_enabled',
+            ),
+            (
+                InstructorAuditEvent.ACTION_COURSE_CUSTOMIZATION_UPDATED,
+                'bot_display_name',
+            ),
+            (
+                InstructorAuditEvent.ACTION_SURVEY_UPDATED,
+                'survey_label',
+            ),
+            (
+                InstructorAuditEvent.ACTION_ANALYSIS_SESSION_UPDATED,
+                'scope_kind',
+            ),
+            (
+                InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_UPDATED,
+                'teams',
+            ),
+        ]
+
+        for action, field_name in valid_cases:
+            with self.subTest(action=action, field_name=field_name):
+                record_instructor_event(
+                    action=action,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    metadata={'changed_fields': [field_name]},
+                )
+
+        self.assertEqual(InstructorAuditEvent.objects.count(), len(valid_cases))
