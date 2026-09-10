@@ -1729,7 +1729,7 @@ def openai_chat(request):
 
     Contract (unchanged from the legacy Chat Completions implementation):
         POST body: {chat_history: [...], user_text: str, model?: str}
-        200 body:  {status: "success", response: str, usage: {...}}
+        200 body:  {status: "success", response: str, usage: {...}, model: str}
 
     All SDK calls go through datapipeline.openai_client — this view is a
     thin adapter that parses the request, catches typed client errors, and
@@ -1760,6 +1760,7 @@ def openai_chat(request):
         'status': 'success',
         'response': result['response'],
         'usage': result['usage'],
+        'model': result['model'],
     })
 
 

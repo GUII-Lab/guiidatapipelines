@@ -37,6 +37,7 @@ class TestOpenAIChatView(TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["status"], "success")
+        self.assertEqual(body["model"], "gpt-5.1")
         self.assertEqual(body["response"], "hello back")
         self.assertEqual(
             body["usage"],
