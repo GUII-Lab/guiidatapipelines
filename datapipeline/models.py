@@ -1,5 +1,7 @@
 import uuid
 
+from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 
@@ -76,6 +78,131 @@ class FeedbackMessage(models.Model):
         return f"{self.student_id} used {self.gpt_used}"
 
 
+class Institution(models.Model):
+    slug = models.SlugField(max_length=100, unique=True)
+    name = models.CharField(max_length=200)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name', 'slug']
+
+    def save(self, *args, **kwargs):
+        self.slug = (self.slug or '').strip().lower()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
+
+class InstructorAccount(models.Model):
+    AUTH_MANUAL = 'manual'
+    AUTH_COGNITO = 'cognito'
+    AUTH_PROVIDER_CHOICES = [
+        (AUTH_MANUAL, 'Manual'),
+        (AUTH_COGNITO, 'Amazon Cognito'),
+    ]
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name='leai_instructor_account',
+    )
+    email = models.EmailField(unique=True)
+    display_name = models.CharField(max_length=200)
+    auth_provider = models.CharField(
+        max_length=20,
+        choices=AUTH_PROVIDER_CHOICES,
+        default=AUTH_MANUAL,
+    )
+    external_subject = models.CharField(
+        max_length=255,
+        unique=True,
+        null=True,
+        blank=True,
+    )
+    email_verified_at = models.DateTimeField(null=True, blank=True)
+    must_change_password = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['email']
+
+    def save(self, *args, **kwargs):
+        self.email = (self.email or '').strip().lower()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.email
+
+
+class InstitutionMembership(models.Model):
+    ROLE_MEMBER = 'member'
+    ROLE_ADMIN = 'admin'
+    ROLE_CHOICES = [
+        (ROLE_MEMBER, 'Member'),
+        (ROLE_ADMIN, 'Institution administrator'),
+    ]
+
+    institution = models.ForeignKey(
+        Institution,
+        on_delete=models.PROTECT,
+        related_name='memberships',
+    )
+    instructor = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        related_name='institution_memberships',
+    )
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default=ROLE_MEMBER)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['institution', 'instructor'],
+                name='leai_unique_institution_instructor',
+            ),
+        ]
+        ordering = ['institution__name', 'instructor__email']
+
+    def __str__(self):
+        return f'{self.instructor.email} at {self.institution.name}'
+
+
+class InstructorSession(models.Model):
+    instructor = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.CASCADE,
+        related_name='sessions',
+    )
+    token_digest = models.CharField(max_length=64, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['instructor', 'revoked_at', 'expires_at']),
+        ]
+
+    @property
+    def is_valid(self):
+        return (
+            self.revoked_at is None
+            and self.expires_at > timezone.now()
+            and self.instructor.is_active
+            and self.instructor.user.is_active
+        )
+
+
 class Course(models.Model):
     BANNER_DISPLAY_CHOICES = [
         ('persistent', 'Persistent'),
@@ -90,6 +217,14 @@ class Course(models.Model):
     course_name = models.CharField(max_length=200)
     instructor_name = models.CharField(max_length=100)
     password = models.CharField(max_length=100)
+    institution = models.ForeignKey(
+        Institution,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='courses',
+    )
+    legacy_password_login_enabled = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     # Course-wide student notification banner. One banner per course; shown on
@@ -167,6 +302,110 @@ class Course(models.Model):
 
     def __str__(self):
         return f"{self.course_name} ({self.course_id})"
+
+
+class CourseMembership(models.Model):
+    ROLE_OWNER = 'owner'
+    ROLE_INSTRUCTOR = 'instructor'
+    ROLE_TA = 'ta'
+    ROLE_CHOICES = [
+        (ROLE_OWNER, 'Owner'),
+        (ROLE_INSTRUCTOR, 'Instructor'),
+        (ROLE_TA, 'Teaching assistant'),
+    ]
+
+    course = models.ForeignKey(
+        Course,
+        on_delete=models.CASCADE,
+        related_name='memberships',
+    )
+    institution_membership = models.ForeignKey(
+        InstitutionMembership,
+        on_delete=models.PROTECT,
+        related_name='course_memberships',
+    )
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES)
+    can_publish = models.BooleanField(default=False)
+    can_export = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['course', 'institution_membership'],
+                name='leai_unique_course_institution_membership',
+            ),
+            models.UniqueConstraint(
+                fields=['course'],
+                condition=models.Q(role='owner', is_active=True),
+                name='leai_one_active_course_owner',
+            ),
+        ]
+        ordering = ['course__course_id', 'role', 'institution_membership_id']
+
+    def clean(self):
+        super().clean()
+        if not self.course_id or not self.institution_membership_id:
+            return
+        if self.course.institution_id is None:
+            raise ValidationError({'course': 'Course must belong to an institution.'})
+        if self.course.institution_id != self.institution_membership.institution_id:
+            raise ValidationError({
+                'institution_membership': (
+                    'Course membership must belong to the course institution.'
+                ),
+            })
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.institution_membership.instructor.email}: {self.course.course_id} ({self.role})'
+
+
+class LegacyCourseOwnershipReview(models.Model):
+    STATE_LINKED = 'linked'
+    STATE_AMBIGUOUS = 'ambiguous'
+    STATE_UNRESOLVED = 'unresolved'
+    STATE_CHOICES = [
+        (STATE_LINKED, 'Linked'),
+        (STATE_AMBIGUOUS, 'Ambiguous'),
+        (STATE_UNRESOLVED, 'Unresolved'),
+    ]
+
+    course = models.OneToOneField(
+        Course,
+        on_delete=models.CASCADE,
+        related_name='ownership_review',
+    )
+    state = models.CharField(max_length=20, choices=STATE_CHOICES)
+    linked_membership = models.ForeignKey(
+        CourseMembership,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='legacy_ownership_reviews',
+    )
+    notes = models.TextField(blank=True, default='')
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def clean(self):
+        super().clean()
+        if self.state == self.STATE_LINKED and self.linked_membership_id is None:
+            raise ValidationError({'linked_membership': 'Linked reviews require a membership.'})
+        if self.linked_membership_id and self.linked_membership.course_id != self.course_id:
+            raise ValidationError({
+                'linked_membership': 'Ownership membership must belong to the reviewed course.',
+            })
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
 
 
 class BannerAssignment(models.Model):

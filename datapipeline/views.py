@@ -240,6 +240,7 @@ def create_course(request):
                 course_name=data.get('course_name', ''),
                 instructor_name=data.get('instructor_name', ''),
                 password=make_password(data.get('password', '')),
+                legacy_password_login_enabled=True,
             )
             return JsonResponse({'status': 'success', 'id': course.id, 'course_id': course.course_id})
         except Exception as e:
@@ -258,6 +259,11 @@ def verify_course_password(request):
                 course = Course.objects.get(course_id=course_id)
             except Course.DoesNotExist:
                 return JsonResponse({'valid': False, 'error': 'Course not found'}, status=404)
+            if not course.legacy_password_login_enabled:
+                return JsonResponse({
+                    'valid': False,
+                    'error': 'legacy_password_login_disabled',
+                }, status=403)
             if check_password(password, course.password):
                 return JsonResponse({
                     'valid': True,

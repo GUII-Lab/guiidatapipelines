@@ -1,6 +1,7 @@
 from django.urls import path
 
 from . import views
+from . import instructor_views
 from .views import *
 
 urlpatterns = [
@@ -26,6 +27,11 @@ urlpatterns = [
     # LEAI course management
     path('api/create_course/', create_course, name='create_course'),
     path('api/verify_course_password/', verify_course_password, name='verify_course_password'),
+    path('api/instructor_sessions/', instructor_views.instructor_sessions, name='instructor_sessions'),
+    path('api/instructor_sessions/current/', instructor_views.instructor_current_session, name='instructor_current_session'),
+    path('api/instructor_me/', instructor_views.instructor_me, name='instructor_me'),
+    path('api/instructor_password/', instructor_views.instructor_password, name='instructor_password'),
+    path('api/instructor_courses/', instructor_views.instructor_courses, name='instructor_courses'),
     path('api/get_course_banner/', get_course_banner, name='get_course_banner'),
     path('api/update_course_banner/', update_course_banner, name='update_course_banner'),
     path('api/get_course_customization/', get_course_customization, name='get_course_customization'),
