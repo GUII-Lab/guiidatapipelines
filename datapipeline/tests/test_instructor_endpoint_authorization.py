@@ -1,6 +1,7 @@
 import json
 from datetime import timedelta
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
@@ -22,6 +23,9 @@ from datapipeline.models import (
     InstructorAccount,
     InstructorAuditEvent,
     InstructorSession,
+    LEAIChatMessage,
+    LEAIChatSession,
+    LEAIQuickTake,
 )
 
 
@@ -534,4 +538,369 @@ class CourseAndSurveyEndpointMatrixTests(TestCase):
                 self.assertEqual(self.survey.survey_label, before['survey_label'])
 
         self.assertEqual(FeedbackGPT.objects.count(), original_survey_count)
+        self.assertFalse(InstructorAuditEvent.objects.exists())
+
+
+class AnalysisEndpointMatrixTests(CourseAndSurveyEndpointMatrixTests):
+    test_managed_endpoints_reject_missing_and_wrong_course_tokens = None
+    test_owner_can_use_all_endpoints_and_writes_exact_events = None
+    test_legacy_course_endpoints_remain_compatible_without_actor = None
+    test_course_and_survey_mutations_roll_back_when_audit_fails = None
+
+    def setUp(self):
+        super().setUp()
+        for index in range(1, 5):
+            FeedbackMessage.objects.create(
+                session_id=f'student-session-{index}',
+                student_id='anonymous',
+                sent_by='user-message',
+                content=f'Student response {index}',
+                gpt_used=self.survey.name,
+                gpt_id=self.survey.pk,
+            )
+        self.chat_session = LEAIChatSession.objects.create(
+            course=self.course,
+            title='Existing analysis',
+        )
+        self.chat_message = LEAIChatMessage.objects.create(
+            session=self.chat_session,
+            role='assistant',
+            text='Existing answer',
+        )
+        self.quicktake = LEAIQuickTake.objects.create(
+            course=self.course,
+            scope_key='course',
+            bullets=[],
+            verification=[],
+            system_prompt='',
+            user_text='',
+            model_name='',
+            status=LEAIQuickTake.STATUS_READY,
+        )
+
+        self.legacy_chat_session = LEAIChatSession.objects.create(
+            course=self.legacy_course,
+            title='Legacy analysis',
+        )
+        self.legacy_chat_message = LEAIChatMessage.objects.create(
+            session=self.legacy_chat_session,
+            role='assistant',
+            text='Legacy answer',
+        )
+        self.legacy_quicktake = LEAIQuickTake.objects.create(
+            course=self.legacy_course,
+            scope_key='course',
+            bullets=[],
+            verification=[],
+            system_prompt='',
+            user_text='',
+            model_name='',
+            status=LEAIQuickTake.STATUS_READY,
+        )
+        for index in range(5):
+            FeedbackMessage.objects.create(
+                session_id=f'legacy-student-{index}',
+                student_id='anonymous',
+                sent_by='user-message',
+                content=f'Legacy response {index}',
+                gpt_used=self.legacy_survey.name,
+                gpt_id=self.legacy_survey.pk,
+            )
+
+    def analysis_cases(self, *, course=None, chat_session=None,
+                       chat_message=None, quicktake=None):
+        course = course or self.course
+        chat_session = chat_session or self.chat_session
+        chat_message = chat_message or self.chat_message
+        quicktake = quicktake or self.quicktake
+        return [
+            ('session_list', 'get', '/datapipeline/api/leai_chat_sessions/', {
+                'course_id': course.course_id,
+            }),
+            ('session_create', 'post', '/datapipeline/api/leai_chat_sessions/', {
+                'course_id': course.course_id,
+                'title': 'New analysis',
+                'scope': {'kind': 'course'},
+            }),
+            ('session_detail', 'get', (
+                f'/datapipeline/api/leai_chat_sessions/{chat_session.pk}/'
+            ), {}),
+            ('session_update', 'patch', (
+                f'/datapipeline/api/leai_chat_sessions/{chat_session.pk}/'
+            ), {'title': 'Renamed analysis'}),
+            ('session_delete', 'delete', (
+                f'/datapipeline/api/leai_chat_sessions/{chat_session.pk}/'
+            ), {}),
+            ('turn', 'post', (
+                f'/datapipeline/api/leai_chat_sessions/{chat_session.pk}/turn/'
+            ), {'user_text': 'What themes stand out?'}),
+            ('message', 'get', (
+                f'/datapipeline/api/leai_chat_sessions/{chat_session.pk}/'
+                f'messages/{chat_message.pk}/'
+            ), {}),
+            ('quicktake_get', 'get', '/datapipeline/api/leai_quicktake/', {
+                'course_id': course.course_id,
+                'scope_key': quicktake.scope_key,
+            }),
+            ('quicktake_delete', 'delete', '/datapipeline/api/leai_quicktake/', {
+                'course_id': course.course_id,
+                'scope_key': quicktake.scope_key,
+            }),
+            ('quicktake_generate', 'post', (
+                '/datapipeline/api/leai_quicktake/generate/'
+            ), {
+                'course_id': course.course_id,
+                'scope_key': quicktake.scope_key,
+                'scope': {'kind': 'course'},
+            }),
+        ]
+
+    def call_endpoint(self, method, path, data, token=None):
+        headers = {}
+        if token:
+            headers['HTTP_AUTHORIZATION'] = f'Bearer {token}'
+        if method == 'get':
+            return self.client.get(path, data=data, **headers)
+        if method == 'delete':
+            if data:
+                path = f'{path}?{urlencode(data)}'
+            return self.client.delete(path, **headers)
+        if method == 'patch':
+            return self.client.patch(
+                path,
+                data=json.dumps(data),
+                content_type='application/json',
+                **headers,
+            )
+        return self.client.post(
+            path,
+            data=json.dumps(data),
+            content_type='application/json',
+            **headers,
+        )
+
+    def test_analysis_methods_reject_missing_and_wrong_course_tokens(self):
+        for name, method, path, data in self.analysis_cases():
+            with self.subTest(name=name, token='missing'):
+                response = self.call_endpoint(method, path, data)
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json(), {
+                    'error': 'authentication_required',
+                })
+            with self.subTest(name=name, token='wrong-course'):
+                response = self.call_endpoint(
+                    method,
+                    path,
+                    data,
+                    token=self.other_token,
+                )
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(response.json(), {
+                    'error': 'course_access_denied',
+                })
+
+        self.assertEqual(
+            InstructorAuditEvent.objects.filter(
+                action=InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED,
+            ).count(),
+            6,
+        )
+
+    def test_owner_analysis_flow_emits_write_events_and_no_read_events(self):
+        with patch('datapipeline.leai_analysis.threading.Thread.start'):
+            listed = self.call_endpoint(
+                'get',
+                '/datapipeline/api/leai_chat_sessions/',
+                {'course_id': self.course.course_id},
+                token=self.token,
+            )
+            created = self.call_endpoint(
+                'post',
+                '/datapipeline/api/leai_chat_sessions/',
+                {
+                    'course_id': self.course.course_id,
+                    'title': 'New analysis',
+                    'scope': {'kind': 'course'},
+                },
+                token=self.token,
+            )
+            detail = self.call_endpoint(
+                'get',
+                f'/datapipeline/api/leai_chat_sessions/{self.chat_session.pk}/',
+                {},
+                token=self.token,
+            )
+            updated = self.call_endpoint(
+                'patch',
+                f'/datapipeline/api/leai_chat_sessions/{self.chat_session.pk}/',
+                {'title': 'Renamed analysis'},
+                token=self.token,
+            )
+            message = self.call_endpoint(
+                'get',
+                (
+                    f'/datapipeline/api/leai_chat_sessions/{self.chat_session.pk}/'
+                    f'messages/{self.chat_message.pk}/'
+                ),
+                {},
+                token=self.token,
+            )
+            turn = self.call_endpoint(
+                'post',
+                f'/datapipeline/api/leai_chat_sessions/{self.chat_session.pk}/turn/',
+                {'user_text': 'What themes stand out?'},
+                token=self.token,
+            )
+            quicktake_get = self.call_endpoint(
+                'get',
+                '/datapipeline/api/leai_quicktake/',
+                {'course_id': self.course.course_id, 'scope_key': 'course'},
+                token=self.token,
+            )
+            quicktake_generate = self.call_endpoint(
+                'post',
+                '/datapipeline/api/leai_quicktake/generate/',
+                {
+                    'course_id': self.course.course_id,
+                    'scope_key': 'course',
+                    'scope': {'kind': 'course'},
+                },
+                token=self.token,
+            )
+            quicktake_delete = self.call_endpoint(
+                'delete',
+                '/datapipeline/api/leai_quicktake/',
+                {'course_id': self.course.course_id, 'scope_key': 'course'},
+                token=self.token,
+            )
+            session_delete = self.call_endpoint(
+                'delete',
+                f'/datapipeline/api/leai_chat_sessions/{self.chat_session.pk}/',
+                {},
+                token=self.token,
+            )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(message.status_code, 200)
+        self.assertEqual(turn.status_code, 202)
+        self.assertEqual(quicktake_get.status_code, 200)
+        self.assertEqual(quicktake_generate.status_code, 202)
+        self.assertEqual(quicktake_delete.status_code, 204)
+        self.assertEqual(session_delete.status_code, 204)
+
+        expected_actions = {
+            InstructorAuditEvent.ACTION_ANALYSIS_SESSION_CREATED,
+            InstructorAuditEvent.ACTION_ANALYSIS_SESSION_UPDATED,
+            InstructorAuditEvent.ACTION_ANALYSIS_SESSION_DELETED,
+            InstructorAuditEvent.ACTION_ANALYSIS_TURN_STARTED,
+            InstructorAuditEvent.ACTION_ANALYSIS_QUICKTAKE_GENERATED,
+            InstructorAuditEvent.ACTION_ANALYSIS_QUICKTAKE_DELETED,
+        }
+        events = InstructorAuditEvent.objects.filter(
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+        )
+        self.assertEqual(events.count(), len(expected_actions))
+        self.assertEqual(set(events.values_list('action', flat=True)), expected_actions)
+        self.assertEqual(
+            events.get(
+                action=InstructorAuditEvent.ACTION_ANALYSIS_SESSION_UPDATED,
+            ).metadata,
+            {'changed_fields': ['title']},
+        )
+        self.assertEqual(
+            events.get(
+                action=(
+                    InstructorAuditEvent.ACTION_ANALYSIS_QUICKTAKE_GENERATED
+                ),
+            ).metadata,
+            {'scope_kind': 'course'},
+        )
+
+    def test_legacy_analysis_methods_remain_compatible_without_actor(self):
+        cases = self.analysis_cases(
+            course=self.legacy_course,
+            chat_session=self.legacy_chat_session,
+            chat_message=self.legacy_chat_message,
+            quicktake=self.legacy_quicktake,
+        )
+        destructive = {'session_delete', 'quicktake_delete'}
+        ordered = [case for case in cases if case[0] not in destructive]
+        ordered += [case for case in cases if case[0] in destructive]
+
+        with patch('datapipeline.leai_analysis.threading.Thread.start'):
+            for name, method, path, data in ordered:
+                with self.subTest(name=name):
+                    response = self.call_endpoint(method, path, data)
+                    self.assertIn(response.status_code, {200, 201, 202, 204})
+
+        self.assertFalse(InstructorAuditEvent.objects.exists())
+
+    def test_analysis_mutations_roll_back_when_audit_fails(self):
+        cases = [
+            ('session_create', 'post', '/datapipeline/api/leai_chat_sessions/', {
+                'course_id': self.course.course_id,
+                'title': 'Should roll back',
+                'scope': {'kind': 'course'},
+            }),
+            ('session_update', 'patch', (
+                f'/datapipeline/api/leai_chat_sessions/{self.chat_session.pk}/'
+            ), {'title': 'Should roll back'}),
+            ('turn', 'post', (
+                f'/datapipeline/api/leai_chat_sessions/{self.chat_session.pk}/turn/'
+            ), {'user_text': 'Should roll back'}),
+            ('quicktake_generate', 'post', (
+                '/datapipeline/api/leai_quicktake/generate/'
+            ), {
+                'course_id': self.course.course_id,
+                'scope_key': 'course',
+                'scope': {'kind': 'course'},
+            }),
+            ('quicktake_delete', 'delete', '/datapipeline/api/leai_quicktake/', {
+                'course_id': self.course.course_id,
+                'scope_key': 'course',
+            }),
+            ('session_delete', 'delete', (
+                f'/datapipeline/api/leai_chat_sessions/{self.chat_session.pk}/'
+            ), {}),
+        ]
+
+        for name, method, path, data in cases:
+            before_sessions = LEAIChatSession.objects.count()
+            before_messages = LEAIChatMessage.objects.count()
+            before_quicktakes = LEAIQuickTake.objects.count()
+            before_quicktake_status = LEAIQuickTake.objects.get(
+                pk=self.quicktake.pk,
+            ).status
+            before_title = LEAIChatSession.objects.get(
+                pk=self.chat_session.pk,
+            ).title
+            with self.subTest(name=name):
+                with patch(
+                    'datapipeline.views.record_instructor_event',
+                    side_effect=ValidationError('audit failed'),
+                ), patch('datapipeline.leai_analysis.threading.Thread.start'):
+                    self.client.raise_request_exception = False
+                    response = self.call_endpoint(
+                        method,
+                        path,
+                        data,
+                        token=self.token,
+                    )
+                    self.client.raise_request_exception = True
+                self.assertIn(response.status_code, {400, 500})
+                self.assertEqual(LEAIChatSession.objects.count(), before_sessions)
+                self.assertEqual(LEAIChatMessage.objects.count(), before_messages)
+                self.assertEqual(LEAIQuickTake.objects.count(), before_quicktakes)
+                self.assertEqual(
+                    LEAIQuickTake.objects.get(pk=self.quicktake.pk).status,
+                    before_quicktake_status,
+                )
+                self.assertEqual(
+                    LEAIChatSession.objects.get(pk=self.chat_session.pk).title,
+                    before_title,
+                )
+
         self.assertFalse(InstructorAuditEvent.objects.exists())

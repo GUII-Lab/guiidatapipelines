@@ -16,7 +16,7 @@ import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Callable, Optional
 
 from django.db import connection, transaction
 from django.db.models import Q
@@ -1747,6 +1747,7 @@ def start_quicktake_job(
     scope_week_number: Optional[int] = None,
     scope_survey_ids: Optional[list] = None,
     scope_session_ids: Optional[list] = None,
+    audit_callback: Optional[Callable[[LEAIQuickTake], None]] = None,
 ) -> tuple[LEAIQuickTake, bool]:
     """Mark the row pending and spawn a daemon thread to run generate_quicktake.
 
@@ -1798,6 +1799,8 @@ def start_quicktake_job(
             qt.error = ""
             qt.job_started_at = now
             qt.save(update_fields=["status", "error", "job_started_at", "updated_at"])
+        if audit_callback is not None:
+            audit_callback(qt)
 
     def _worker(qt_pk: int, course_pk: int) -> None:
         # Each thread gets its own Django DB connection; close at end
@@ -2204,6 +2207,9 @@ def run_chat_turn(
 def start_chat_turn_job(
     session: LEAIChatSession,
     user_text: str,
+    audit_callback: Optional[
+        Callable[[LEAIChatMessage, LEAIChatMessage], None]
+    ] = None,
 ) -> tuple[LEAIChatMessage, LEAIChatMessage]:
     """Async chat turn: save user msg + pending assistant placeholder, spawn
     a worker thread, return both rows immediately.
@@ -2237,6 +2243,8 @@ def start_chat_turn_job(
             status=LEAIChatMessage.STATUS_PENDING,
             job_started_at=now,
         )
+        if audit_callback is not None:
+            audit_callback(user_msg, assistant_msg)
 
     def _worker(session_pk, user_msg_pk, assistant_msg_pk, user_text_local):
         try:

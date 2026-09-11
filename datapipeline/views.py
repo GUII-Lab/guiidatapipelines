@@ -2346,6 +2346,13 @@ def leai_chat_sessions_list(request):
         except Course.DoesNotExist:
             return JsonResponse({'error': 'Course not found'}, status=404)
 
+        _account, _session, _membership, error = _authorize_course_endpoint(
+            request,
+            course,
+        )
+        if error is not None:
+            return error
+
         sessions = LEAIChatSession.objects.filter(course=course).order_by('-updated_at')
         session_list = []
         for s in sessions:
@@ -2378,41 +2385,60 @@ def leai_chat_sessions_list(request):
         except Course.DoesNotExist:
             return JsonResponse({'error': 'Course not found'}, status=404)
 
-        scope = data.get('scope', {})
-        session = LEAIChatSession.objects.create(
-            course=course,
-            title=data.get('title', 'New chat'),
-            scope_kind=scope.get('kind', 'course'),
-            scope_week_number=scope.get('week_number'),
-            scope_survey_ids=scope.get('survey_ids') or [],
-            scope_session_ids=scope.get('session_ids') or [],
-            system_prompt_override=data.get('system_prompt_override'),
+        account, instructor_session, _membership, error = (
+            _authorize_course_endpoint(
+                request,
+                course,
+                audit_denial=True,
+            )
         )
+        if error is not None:
+            return error
 
-        seed = data.get('seed_system_message')
-        if seed:
-            LEAIChatMessage.objects.create(
-                session=session,
-                role='system',
-                text=seed,
-                cited=[],
+        scope = data.get('scope', {})
+        with transaction.atomic():
+            session = LEAIChatSession.objects.create(
+                course=course,
+                title=data.get('title', 'New chat'),
+                scope_kind=scope.get('kind', 'course'),
+                scope_week_number=scope.get('week_number'),
+                scope_survey_ids=scope.get('survey_ids') or [],
+                scope_session_ids=scope.get('session_ids') or [],
+                system_prompt_override=data.get('system_prompt_override'),
             )
 
-        # Optional: seed a visible assistant message (e.g. a Quick Take handoff)
-        # with its own citation array. Must be a dict with `text` and
-        # `cited` (list of {rid, pill_index, verdict?}).
-        seed_assistant = data.get('seed_assistant_message')
-        if seed_assistant and isinstance(seed_assistant, dict):
-            text = seed_assistant.get('text') or ''
-            cited = seed_assistant.get('cited') or []
-            if not isinstance(cited, list):
-                cited = []
-            if text:
+            seed = data.get('seed_system_message')
+            if seed:
                 LEAIChatMessage.objects.create(
                     session=session,
-                    role='assistant',
-                    text=text,
-                    cited=cited,
+                    role='system',
+                    text=seed,
+                    cited=[],
+                )
+
+            # Optional visible assistant seed, such as a Quick Take handoff.
+            seed_assistant = data.get('seed_assistant_message')
+            if seed_assistant and isinstance(seed_assistant, dict):
+                text = seed_assistant.get('text') or ''
+                cited = seed_assistant.get('cited') or []
+                if not isinstance(cited, list):
+                    cited = []
+                if text:
+                    LEAIChatMessage.objects.create(
+                        session=session,
+                        role='assistant',
+                        text=text,
+                        cited=cited,
+                    )
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_ANALYSIS_SESSION_CREATED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=instructor_session,
+                    course=course,
+                    target_type='analysis_session',
+                    target_id=session.pk,
                 )
 
         return _session_detail_response(session, status=201)
@@ -2428,9 +2454,21 @@ def leai_chat_sessions_list(request):
 def leai_chat_session_detail(request, session_id):
     """GET/PATCH/DELETE /api/leai_chat_sessions/<uuid>/"""
     try:
-        session = LEAIChatSession.objects.get(pk=session_id)
+        session = LEAIChatSession.objects.select_related('course').get(
+            pk=session_id,
+        )
     except LEAIChatSession.DoesNotExist:
         return JsonResponse({'error': 'Session not found'}, status=404)
+
+    account, instructor_session, _membership, error = (
+        _authorize_course_endpoint(
+            request,
+            session.course,
+            audit_denial=request.method in {'PATCH', 'DELETE'},
+        )
+    )
+    if error is not None:
+        return error
 
     if request.method == 'GET':
         return _session_detail_response(session)
@@ -2441,21 +2479,40 @@ def leai_chat_session_detail(request, session_id):
         except (json.JSONDecodeError, ValueError):
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
 
-        if 'title' in data:
-            session.title = data['title']
-        if 'system_prompt_override' in data:
-            session.system_prompt_override = data['system_prompt_override']
-        if 'scope' in data:
-            scope = data['scope']
-            if 'kind' in scope:
-                session.scope_kind = scope['kind']
-            if 'week_number' in scope:
-                session.scope_week_number = scope['week_number']
-            if 'survey_ids' in scope:
-                session.scope_survey_ids = scope['survey_ids']
-            if 'session_ids' in scope:
-                session.scope_session_ids = scope['session_ids']
-        session.save()
+        changed_fields = []
+        with transaction.atomic():
+            if 'title' in data:
+                session.title = data['title']
+                changed_fields.append('title')
+            if 'system_prompt_override' in data:
+                session.system_prompt_override = data['system_prompt_override']
+                changed_fields.append('system_prompt_override')
+            if 'scope' in data:
+                scope = data['scope']
+                if 'kind' in scope:
+                    session.scope_kind = scope['kind']
+                    changed_fields.append('scope_kind')
+                if 'week_number' in scope:
+                    session.scope_week_number = scope['week_number']
+                    changed_fields.append('scope_week_number')
+                if 'survey_ids' in scope:
+                    session.scope_survey_ids = scope['survey_ids']
+                    changed_fields.append('scope_survey_ids')
+                if 'session_ids' in scope:
+                    session.scope_session_ids = scope['session_ids']
+                    changed_fields.append('scope_session_ids')
+            session.save()
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_ANALYSIS_SESSION_UPDATED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=instructor_session,
+                    course=session.course,
+                    target_type='analysis_session',
+                    target_id=session.pk,
+                    metadata={'changed_fields': changed_fields},
+                )
 
         return JsonResponse({
             'id': str(session.pk),
@@ -2473,7 +2530,20 @@ def leai_chat_session_detail(request, session_id):
         })
 
     if request.method == 'DELETE':
-        session.delete()
+        target_id = session.pk
+        course = session.course
+        with transaction.atomic():
+            session.delete()
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_ANALYSIS_SESSION_DELETED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=instructor_session,
+                    course=course,
+                    target_type='analysis_session',
+                    target_id=target_id,
+                )
         return HttpResponse(status=204)
 
     return JsonResponse({'error': 'Method not allowed'}, status=405)
@@ -2500,9 +2570,21 @@ def leai_chat_session_turn(request, session_id):
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
     try:
-        session = LEAIChatSession.objects.get(pk=session_id)
+        session = LEAIChatSession.objects.select_related('course').get(
+            pk=session_id,
+        )
     except LEAIChatSession.DoesNotExist:
         return JsonResponse({'error': 'Session not found'}, status=404)
+
+    account, instructor_session, _membership, error = (
+        _authorize_course_endpoint(
+            request,
+            session.course,
+            audit_denial=True,
+        )
+    )
+    if error is not None:
+        return error
 
     try:
         data = json.loads(request.body)
@@ -2515,8 +2597,23 @@ def leai_chat_session_turn(request, session_id):
 
     from . import leai_analysis
     try:
+        audit_callback = None
+        if account is not None:
+            audit_callback = lambda _user_msg, _assistant_msg: (
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_ANALYSIS_TURN_STARTED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=instructor_session,
+                    course=session.course,
+                    target_type='analysis_session',
+                    target_id=session.pk,
+                )
+            )
         user_msg, assistant_msg = leai_analysis.start_chat_turn_job(
-            session=session, user_text=user_text,
+            session=session,
+            user_text=user_text,
+            audit_callback=audit_callback,
         )
     except ValueError as e:
         return JsonResponse({'error': str(e)}, status=400)
@@ -2542,9 +2639,19 @@ def leai_chat_message_detail(request, session_id, message_id):
         return JsonResponse({'error': 'Method not allowed'}, status=405)
 
     try:
-        msg = LEAIChatMessage.objects.get(pk=message_id, session_id=session_id)
+        msg = LEAIChatMessage.objects.select_related('session__course').get(
+            pk=message_id,
+            session_id=session_id,
+        )
     except LEAIChatMessage.DoesNotExist:
         return JsonResponse({'error': 'Message not found'}, status=404)
+
+    _account, _session, _membership, error = _authorize_course_endpoint(
+        request,
+        msg.session.course,
+    )
+    if error is not None:
+        return error
 
     from . import leai_analysis
     if leai_analysis._is_chat_message_stale(msg):
@@ -2575,6 +2682,16 @@ def leai_quicktake_fetch_or_delete(request):
     except Course.DoesNotExist:
         return JsonResponse({'error': 'Course not found'}, status=404)
 
+    account, instructor_session, _membership, error = (
+        _authorize_course_endpoint(
+            request,
+            course,
+            audit_denial=request.method == 'DELETE',
+        )
+    )
+    if error is not None:
+        return error
+
     try:
         qt = LEAIQuickTake.objects.get(course=course, scope_key=scope_key)
     except LEAIQuickTake.DoesNotExist:
@@ -2593,7 +2710,21 @@ def leai_quicktake_fetch_or_delete(request):
         return JsonResponse(_quicktake_to_dict(qt))
 
     if request.method == 'DELETE':
-        qt.delete()
+        target_id = qt.pk
+        with transaction.atomic():
+            qt.delete()
+            if account is not None:
+                record_instructor_event(
+                    action=(
+                        InstructorAuditEvent.ACTION_ANALYSIS_QUICKTAKE_DELETED
+                    ),
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=instructor_session,
+                    course=course,
+                    target_type='quicktake',
+                    target_id=target_id,
+                )
         return HttpResponse(status=204)
 
     return JsonResponse({'error': 'Method not allowed'}, status=405)
@@ -2633,8 +2764,32 @@ def leai_quicktake_generate(request):
     except Course.DoesNotExist:
         return JsonResponse({'error': 'Course not found'}, status=404)
 
+    account, instructor_session, _membership, error = (
+        _authorize_course_endpoint(
+            request,
+            course,
+            audit_denial=True,
+        )
+    )
+    if error is not None:
+        return error
+
     from . import leai_analysis
     try:
+        audit_callback = None
+        if account is not None:
+            audit_callback = lambda quicktake: record_instructor_event(
+                action=(
+                    InstructorAuditEvent.ACTION_ANALYSIS_QUICKTAKE_GENERATED
+                ),
+                outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                actor=account,
+                session=instructor_session,
+                course=course,
+                target_type='quicktake',
+                target_id=quicktake.pk,
+                metadata={'scope_kind': scope.get('kind', 'course')},
+            )
         qt, _started = leai_analysis.start_quicktake_job(
             course=course,
             scope_key=scope_key,
@@ -2642,6 +2797,7 @@ def leai_quicktake_generate(request):
             scope_week_number=scope.get('week_number'),
             scope_survey_ids=scope.get('survey_ids'),
             scope_session_ids=scope.get('session_ids'),
+            audit_callback=audit_callback,
         )
     except ValueError as e:
         return JsonResponse({'error': str(e)}, status=400)
