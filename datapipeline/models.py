@@ -73,6 +73,30 @@ class FeedbackMessage(models.Model):
     form_field_id = models.CharField(max_length=100, null=True, blank=True)
     form_field_label = models.TextField(null=True, blank=True)
     form_response_phase = models.CharField(max_length=16, null=True, blank=True)
+    response_session = models.ForeignKey(
+        'ResponseSession',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='messages',
+    )
+    sequence = models.PositiveIntegerField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(response_session__isnull=True, sequence__isnull=True)
+                    | models.Q(response_session__isnull=False, sequence__isnull=False)
+                ),
+                name='leai_message_session_sequence_pair',
+            ),
+            models.UniqueConstraint(
+                fields=['response_session', 'sequence'],
+                condition=models.Q(response_session__isnull=False),
+                name='leai_unique_session_message_sequence',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.student_id} used {self.gpt_used}"
@@ -631,6 +655,62 @@ class FeedbackGPT(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class ResponseSession(models.Model):
+    SOURCE_STUDENT = 'student'
+    SOURCE_PDF = 'pdf'
+    SOURCE_CHOICES = [
+        (SOURCE_STUDENT, 'Student chat'),
+        (SOURCE_PDF, 'PDF import'),
+    ]
+
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    course = models.ForeignKey(
+        Course,
+        on_delete=models.PROTECT,
+        related_name='response_sessions',
+    )
+    survey = models.ForeignKey(
+        FeedbackGPT,
+        on_delete=models.CASCADE,
+        related_name='response_sessions',
+    )
+    client_session_id = models.CharField(max_length=100)
+    source = models.CharField(
+        max_length=16,
+        choices=SOURCE_CHOICES,
+        default=SOURCE_STUDENT,
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    next_message_sequence = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['survey', 'client_session_id'],
+                name='leai_unique_survey_client_session',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['course', '-started_at'],
+                name='leai_response_course_time',
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if not self.course_id or not self.survey_id:
+            return
+        if self.survey.course_id != self.course_id:
+            raise ValidationError({
+                'course': 'Response session course must match the survey course.',
+            })
+
+    def __str__(self):
+        return f'{self.survey_id}/{self.client_session_id[:8]}…'
 
 
 class SurveyCompletionCertificate(models.Model):

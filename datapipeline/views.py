@@ -14,6 +14,10 @@ from .leai_completion import (
 )
 from .instructor_audit import record_instructor_event
 from .instructor_auth import authorize_instructor_course
+from .response_sessions import (
+    ResponseWriteValidationError,
+    persist_feedback_messages,
+)
 import json
 import os
 import secrets
@@ -28,9 +32,6 @@ from django.conf import settings
 from django.db import transaction, IntegrityError
 import hashlib
 import requests
-
-
-FORM_RESPONSE_PHASES = {'primary', 'probe', 'revision'}
 
 
 def _course_requires_account_authorization(course):
@@ -76,29 +77,6 @@ def _authorize_course_endpoint(
                 metadata={'reason_code': reason_code},
             )
     return account, session, membership, error
-
-
-def _form_attribution_kwargs(data):
-    """Return only validated, nullable Form Mode attribution fields."""
-    phase = data.get('form_response_phase')
-    if phase not in FORM_RESPONSE_PHASES:
-        phase = None
-
-    def optional_text(name):
-        value = data.get(name)
-        if value is None:
-            return None
-        value = str(value).strip()
-        return value or None
-
-    return {
-        'form_schema_id': optional_text('form_schema_id'),
-        'form_schema_version': optional_text('form_schema_version'),
-        'form_section_id': optional_text('form_section_id'),
-        'form_field_id': optional_text('form_field_id'),
-        'form_field_label': optional_text('form_field_label'),
-        'form_response_phase': phase,
-    }
 
 
 def _serialize_form_attribution(message):
@@ -156,24 +134,41 @@ def message_create(request):
 
 @csrf_exempt
 def feedback_message_api(request):
-    if request.method == 'POST':
-        try:
-            data = json.loads(request.body)
-            feedback_message = FeedbackMessage(
-                session_id=data.get('session_id'),
-                student_id=data.get('student_id'),
-                sent_by=data.get('sent_by'),
-                content=data.get('content'),
-                gpt_used=data.get('gpt_used'),
-                gpt_id=data.get('gpt_id'),
-                research_consent=bool(data.get('research_consent', False)),
-                referred=bool(data.get('referred', False)),
-                **_form_attribution_kwargs(data),
-            )
-            feedback_message.save()
-            return JsonResponse({'status': 'success', 'message': 'Feedback message saved successfully'})
-        except Exception as e:
-            return JsonResponse({'status': 'error', 'message': str(e)})
+    if request.method != 'POST':
+        return HttpResponse(status=405, content='Method not allowed')
+    try:
+        data = json.loads(request.body)
+    except (TypeError, ValueError):
+        return JsonResponse({
+            'status': 'error',
+            'code': 'invalid_json',
+            'message': 'Invalid JSON',
+        }, status=400)
+
+    try:
+        feedback_message = persist_feedback_messages([data])[0]
+    except ResponseWriteValidationError as error:
+        body = {
+            'status': 'error',
+            'code': error.code,
+            'message': str(error),
+        }
+        if error.index is not None:
+            body['index'] = error.index
+        return JsonResponse(body, status=400)
+    except Exception:
+        return JsonResponse({
+            'status': 'error',
+            'code': 'persistence_failed',
+            'message': 'Feedback message could not be saved',
+        }, status=500)
+
+    return JsonResponse({
+        'status': 'success',
+        'message': 'Feedback message saved successfully',
+        'response_session_id': str(feedback_message.response_session.public_id),
+        'sequence': feedback_message.sequence,
+    })
 
 
 @csrf_exempt
@@ -191,44 +186,49 @@ def feedback_messages_bulk_api(request):
         data = json.loads(request.body)
     except ValueError as e:
         return JsonResponse({'status': 'error', 'message': 'Invalid JSON: ' + str(e)}, status=400)
-
-    messages = data.get('messages')
-    if not isinstance(messages, list):
-        return JsonResponse({'status': 'error', 'message': 'messages must be a list'}, status=400)
-    if not messages:
-        return JsonResponse({'status': 'error', 'message': 'messages list is empty'}, status=400)
-
-    required = ('session_id', 'student_id', 'sent_by', 'content')
-    objs = []
-    for idx, m in enumerate(messages):
-        if not isinstance(m, dict):
-            return JsonResponse({'status': 'error', 'message': 'message must be an object', 'index': idx}, status=400)
-        missing = [k for k in required if not m.get(k)]
-        if missing:
-            return JsonResponse({
-                'status': 'error',
-                'message': 'missing fields: ' + ', '.join(missing),
-                'index': idx,
-            }, status=400)
-        objs.append(FeedbackMessage(
-            session_id=m.get('session_id'),
-            student_id=m.get('student_id'),
-            sent_by=m.get('sent_by'),
-            content=m.get('content'),
-            gpt_used=m.get('gpt_used') or '',
-            gpt_id=m.get('gpt_id'),
-            research_consent=bool(m.get('research_consent', False)),
-            referred=bool(m.get('referred', False)),
-            **_form_attribution_kwargs(m),
-        ))
+    if not isinstance(data, dict):
+        return JsonResponse({
+            'status': 'error',
+            'code': 'invalid_body',
+            'message': 'request body must be an object',
+        }, status=400)
 
     try:
-        with transaction.atomic():
-            FeedbackMessage.objects.bulk_create(objs)
-    except Exception as e:
-        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+        messages = persist_feedback_messages(data.get('messages'))
+    except ResponseWriteValidationError as error:
+        body = {
+            'status': 'error',
+            'code': error.code,
+            'message': str(error),
+        }
+        if error.index is not None:
+            body['index'] = error.index
+        return JsonResponse(body, status=400)
+    except Exception:
+        return JsonResponse({
+            'status': 'error',
+            'code': 'persistence_failed',
+            'message': 'Feedback messages could not be saved',
+        }, status=500)
 
-    return JsonResponse({'status': 'success', 'saved': len(objs)})
+    response_sessions = []
+    seen_sessions = set()
+    for message in messages:
+        session = message.response_session
+        if session.pk in seen_sessions:
+            continue
+        seen_sessions.add(session.pk)
+        response_sessions.append({
+            'public_id': str(session.public_id),
+            'gpt_id': session.survey_id,
+            'session_id': session.client_session_id,
+        })
+
+    return JsonResponse({
+        'status': 'success',
+        'saved': len(messages),
+        'response_sessions': response_sessions,
+    })
 
 
 @csrf_exempt  # For simplicity, but handle CSRF properly in production

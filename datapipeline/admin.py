@@ -11,6 +11,39 @@ admin.site.register(FeedbackGPT)
 admin.site.register(Image)
 
 
+@admin.register(ResponseSession)
+class ResponseSessionAdmin(admin.ModelAdmin):
+    list_display = (
+        'public_id',
+        'course',
+        'survey',
+        'client_session_id',
+        'source',
+        'started_at',
+        'completed_at',
+    )
+    list_filter = ('source', 'course', 'started_at', 'completed_at')
+    search_fields = (
+        '=public_id',
+        'client_session_id',
+        'course__course_id',
+        'survey__name',
+    )
+    list_select_related = ('course', 'survey')
+
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
 @admin.register(Institution)
 class InstitutionAdmin(admin.ModelAdmin):
     list_display = ('slug', 'name', 'is_active', 'created_at', 'updated_at')
