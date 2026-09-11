@@ -17,15 +17,13 @@ from datapipeline.models import (
 
 
 class ProvisionInstructorCommandTests(TestCase):
-    def run_command(self, *course_ids):
+    def run_command(self, *course_ids, **overrides):
         stdout = io.StringIO()
         options = {
-            'email': 'teacher@example.edu',
-            'display_name': 'Prof. Test',
-            'institution_slug': 'ucsc',
-            'institution_name': 'UC Santa Cruz',
+            'email': 'teacher@ucsc.edu',
             'stdout': stdout,
         }
+        options.update(overrides)
         if course_ids:
             options['course_id'] = list(course_ids)
         call_command('provision_leai_instructor', **options)
@@ -34,7 +32,7 @@ class ProvisionInstructorCommandTests(TestCase):
     def test_command_creates_manual_account_and_prints_temporary_password_once(self):
         output = self.run_command()
 
-        account = InstructorAccount.objects.get(email='teacher@example.edu')
+        account = InstructorAccount.objects.get(email='teacher@ucsc.edu')
         self.assertTrue(account.user.check_password(
             output.split('Temporary password: ', 1)[1].splitlines()[0],
         ))
@@ -42,9 +40,27 @@ class ProvisionInstructorCommandTests(TestCase):
         self.assertTrue(account.must_change_password)
         self.assertIsNone(account.email_verified_at)
         self.assertEqual(account.auth_provider, InstructorAccount.AUTH_MANUAL)
+        self.assertEqual(account.display_name, 'teacher')
         membership = InstitutionMembership.objects.get(instructor=account)
         self.assertEqual(membership.institution.slug, 'ucsc')
-        self.assertEqual(membership.institution.name, 'UC Santa Cruz')
+        self.assertEqual(
+            membership.institution.name,
+            'University of California, Santa Cruz',
+        )
+
+    def test_command_keeps_an_explicit_display_name(self):
+        self.run_command(display_name='Professor Rivera')
+
+        account = InstructorAccount.objects.get(email='teacher@ucsc.edu')
+        self.assertEqual(account.display_name, 'Professor Rivera')
+
+    def test_command_rejects_non_ucsc_email_without_creating_rows(self):
+        with self.assertRaises(CommandError) as error:
+            self.run_command(email='teacher@example.edu')
+
+        self.assertIn('@ucsc.edu', str(error.exception))
+        self.assertFalse(InstructorAccount.objects.exists())
+        self.assertFalse(Institution.objects.exists())
 
     def test_command_links_reviewed_legacy_course_to_owner(self):
         course = Course.objects.create(
@@ -62,7 +78,7 @@ class ProvisionInstructorCommandTests(TestCase):
         review = LegacyCourseOwnershipReview.objects.get(course=course)
         self.assertEqual(course.institution.slug, 'ucsc')
         self.assertEqual(owner.role, CourseMembership.ROLE_OWNER)
-        self.assertEqual(owner.institution_membership.instructor.email, 'teacher@example.edu')
+        self.assertEqual(owner.institution_membership.instructor.email, 'teacher@ucsc.edu')
         self.assertEqual(review.state, LegacyCourseOwnershipReview.STATE_LINKED)
         self.assertEqual(review.linked_membership, owner)
         self.assertIsNotNone(review.reviewed_at)
@@ -101,13 +117,13 @@ class ProvisionInstructorCommandTests(TestCase):
 
     def test_existing_email_fails_without_resetting_existing_password(self):
         user = get_user_model().objects.create_user(
-            username='teacher@example.edu',
-            email='teacher@example.edu',
+            username='teacher@ucsc.edu',
+            email='teacher@ucsc.edu',
             password='ExistingPass123!',
         )
         InstructorAccount.objects.create(
             user=user,
-            email='teacher@example.edu',
+            email='teacher@ucsc.edu',
             display_name='Existing Instructor',
         )
 

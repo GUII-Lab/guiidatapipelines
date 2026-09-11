@@ -168,7 +168,7 @@ Expected: all session tests pass.
 - Create: `datapipeline/tests/test_instructor_provisioning.py`
 
 **Interfaces:**
-- Produces command `provision_leai_instructor --email --display-name --institution-slug --institution-name [--course-id ...]`.
+- Produces command `provision_leai_instructor --email [--display-name ...] [--course-id ...]`; the first UCSC rollout defaults institution slug/name and derives an omitted display name from the email prefix.
 
 - [x] **Step 1: Write failing command tests**
 
@@ -190,7 +190,7 @@ Expected: command lookup failure.
 
 - [x] **Step 4: Implement the command**
 
-Normalize and validate the email, create a random 20-character temporary password, create the Django user with `create_user`, and perform every database write inside one `transaction.atomic()`. Never auto-link an existing account by matching an unverified email. Existing-account or ownership conflicts fail explicitly.
+Normalize and validate the exact `ucsc.edu` email domain, derive an omitted display name from the email prefix, create a random 20-character temporary password, create the Django user with `create_user`, and perform every database write inside one `transaction.atomic()`. Never auto-link an existing account by matching an unverified email. Existing-account or ownership conflicts fail explicitly.
 
 - [x] **Step 5: Verify GREEN**
 

@@ -12,6 +12,7 @@ from django.views.decorators.csrf import csrf_exempt
 from .instructor_audit import record_instructor_event
 from .instructor_auth import (
     authenticate_instructor_request,
+    is_allowed_instructor_email,
     issue_instructor_session,
     normalize_instructor_email,
 )
@@ -183,25 +184,54 @@ def instructor_me(request):
     payload = _json_object(request)
     if payload is None:
         return _json_response({'error': 'invalid_json'}, status=400)
-    if set(payload) != {'display_name'}:
+    allowed_fields = {'display_name', 'email'}
+    if not payload or not set(payload).issubset(allowed_fields):
         return _json_response({'error': 'invalid_profile'}, status=400)
-    display_name = payload['display_name']
-    if not isinstance(display_name, str):
-        return _json_response({'error': 'invalid_profile'}, status=400)
-    display_name = display_name.strip()
-    if not display_name or len(display_name) > 100:
-        return _json_response({'error': 'invalid_profile'}, status=400)
+    display_name = account.display_name
+    if 'display_name' in payload:
+        if not isinstance(payload['display_name'], str):
+            return _json_response({'error': 'invalid_profile'}, status=400)
+        display_name = payload['display_name'].strip()
+        if not display_name or len(display_name) > 100:
+            return _json_response({'error': 'invalid_profile'}, status=400)
 
-    with transaction.atomic():
-        account.display_name = display_name
-        account.save(update_fields=['display_name', 'updated_at'])
-        record_instructor_event(
-            action=InstructorAuditEvent.ACTION_PROFILE_UPDATED,
-            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
-            actor=account,
-            session=session,
-            metadata={'changed_field': 'display_name'},
-        )
+    email = account.email
+    if 'email' in payload:
+        if not isinstance(payload['email'], str):
+            return _json_response({'error': 'invalid_email'}, status=400)
+        email = normalize_instructor_email(payload['email'])
+        if not is_allowed_instructor_email(email):
+            return _json_response({'error': 'invalid_email'}, status=400)
+        if InstructorAccount.objects.exclude(pk=account.pk).filter(email=email).exists():
+            return _json_response({'error': 'email_in_use'}, status=409)
+
+    changed_fields = []
+    if display_name != account.display_name:
+        changed_fields.append('display_name')
+    if email != account.email:
+        changed_fields.append('email')
+
+    try:
+        with transaction.atomic():
+            if changed_fields:
+                account.display_name = display_name
+                account.email = email
+                update_fields = ['display_name', 'email', 'updated_at']
+                if 'email' in changed_fields:
+                    account.email_verified_at = None
+                    update_fields.append('email_verified_at')
+                    account.user.email = email
+                    account.user.save(update_fields=['email'])
+                account.save(update_fields=update_fields)
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_PROFILE_UPDATED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=session,
+                    metadata={'changed_fields': changed_fields},
+                )
+    except IntegrityError:
+        return _json_response({'error': 'email_in_use'}, status=409)
     return _json_response(_serialize_account(account))
 
 

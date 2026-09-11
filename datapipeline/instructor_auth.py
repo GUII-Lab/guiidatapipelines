@@ -3,6 +3,8 @@ import os
 import secrets
 from datetime import timedelta
 
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.db import transaction
 from django.http import JsonResponse
 from django.utils import timezone
@@ -15,6 +17,16 @@ DEFAULT_SESSION_HOURS = 12
 
 def normalize_instructor_email(value):
     return str(value or '').strip().lower()
+
+
+def is_allowed_instructor_email(value):
+    email = normalize_instructor_email(value)
+    try:
+        validate_email(email)
+    except ValidationError:
+        return False
+    local_part, separator, domain = email.rpartition('@')
+    return bool(separator and local_part and domain == 'ucsc.edu')
 
 
 def token_digest(raw_token):

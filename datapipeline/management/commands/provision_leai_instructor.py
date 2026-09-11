@@ -10,7 +10,10 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.text import slugify
 
-from datapipeline.instructor_auth import normalize_instructor_email
+from datapipeline.instructor_auth import (
+    is_allowed_instructor_email,
+    normalize_instructor_email,
+)
 from datapipeline.models import (
     Course,
     CourseMembership,
@@ -40,14 +43,17 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument('--email', required=True)
-        parser.add_argument('--display-name', required=True)
-        parser.add_argument('--institution-slug', required=True)
-        parser.add_argument('--institution-name', required=True)
+        parser.add_argument('--display-name', default='')
+        parser.add_argument('--institution-slug', default='ucsc')
+        parser.add_argument(
+            '--institution-name',
+            default='University of California, Santa Cruz',
+        )
         parser.add_argument('--course-id', action='append', default=[])
 
     def handle(self, *args, **options):
         email = normalize_instructor_email(options['email'])
-        display_name = str(options['display_name'] or '').strip()
+        display_name = str(options['display_name'] or '').strip() or email.partition('@')[0]
         institution_slug = slugify(options['institution_slug'] or '')
         institution_name = str(options['institution_name'] or '').strip()
         course_ids = list(dict.fromkeys(
@@ -59,6 +65,8 @@ class Command(BaseCommand):
             validate_email(email)
         except ValidationError as exc:
             raise CommandError('A valid instructor email is required.') from exc
+        if not is_allowed_instructor_email(email):
+            raise CommandError('A valid @ucsc.edu instructor email is required.')
         if not display_name:
             raise CommandError('A display name is required.')
         if not institution_slug or not institution_name:

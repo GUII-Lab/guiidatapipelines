@@ -102,6 +102,8 @@ The additive migration sets `legacy_password_login_enabled=True` for every exist
 
 `python manage.py provision_leai_instructor` creates an account and institution membership atomically, generates a temporary password, and prints it once. Optional repeated `--course-id` arguments attach reviewed legacy courses. A course already attached to another institution or already holding a different active owner causes the entire command to fail without partial writes.
 
+For the first UCSC rollout, provisioning requires an exact `@ucsc.edu` address, defaults the institution to `University of California, Santa Cruz`, and defaults an omitted display name to the email prefix. The authenticated profile endpoint may change display name or UCSC login email. An email change updates `InstructorAccount.email` and the linked Django user's email atomically, takes effect for the next login immediately, and produces an audit event containing only changed field names. This remains account administration without email-ownership or university verification.
+
 ## API boundary
 
 - `POST /datapipeline/api/instructor_sessions/`

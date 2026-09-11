@@ -15,7 +15,7 @@ ALLOWED_METADATA_KEYS = {
     InstructorAuditEvent.ACTION_LOGIN_DENIED: frozenset(),
     InstructorAuditEvent.ACTION_LOGOUT: frozenset(),
     InstructorAuditEvent.ACTION_PASSWORD_CHANGED: frozenset(),
-    InstructorAuditEvent.ACTION_PROFILE_UPDATED: frozenset({'changed_field'}),
+    InstructorAuditEvent.ACTION_PROFILE_UPDATED: frozenset({'changed_fields'}),
     InstructorAuditEvent.ACTION_COURSE_CREATED: frozenset({'institution_slug'}),
     InstructorAuditEvent.ACTION_COURSE_BANNER_UPDATED: frozenset({'changed_fields'}),
     InstructorAuditEvent.ACTION_COURSE_CUSTOMIZATION_UPDATED: frozenset({'changed_fields'}),
@@ -46,6 +46,10 @@ ALLOWED_METADATA_KEYS = {
 }
 
 ALLOWED_CHANGED_FIELDS = {
+    InstructorAuditEvent.ACTION_PROFILE_UPDATED: frozenset({
+        'display_name',
+        'email',
+    }),
     InstructorAuditEvent.ACTION_COURSE_BANNER_UPDATED: frozenset({
         'banner_enabled',
         'banner_text',
@@ -172,10 +176,6 @@ def _validate_count(value):
 
 
 METADATA_VALUE_VALIDATORS = {
-    'changed_field': lambda value: _validate_fixed_string(
-        value,
-        frozenset({'display_name'}),
-    ),
     'institution_slug': _validate_institution_slug,
     'mode': lambda value: _validate_fixed_string(value, SURVEY_MODES),
     'status': lambda value: _validate_fixed_string(value, SURVEY_STATUSES),

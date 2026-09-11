@@ -18,7 +18,7 @@ from datapipeline.models import (
 
 
 class InstructorSessionApiTests(TestCase):
-    email = 'teacher@example.edu'
+    email = 'teacher@ucsc.edu'
     temporary_password = 'TemporaryPass123!'
 
     def setUp(self):
@@ -341,7 +341,7 @@ class InstructorSessionApiTests(TestCase):
         self.account.save(update_fields=['must_change_password'])
         token = self.login().json()['token']
         invalid_payloads = [
-            {'display_name': 'Prof. Updated', 'email': 'other@example.edu'},
+            {'display_name': 'Prof. Updated', 'unknown': 'value'},
             {'display_name': '   '},
             {'display_name': 'x' * 101},
         ]
@@ -362,6 +362,94 @@ class InstructorSessionApiTests(TestCase):
         self.assertFalse(InstructorAuditEvent.objects.filter(
             action=InstructorAuditEvent.ACTION_PROFILE_UPDATED,
         ).exists())
+
+    def test_profile_patch_changes_normalized_ucsc_login_email(self):
+        self.account.must_change_password = False
+        self.account.save(update_fields=['must_change_password'])
+        token = self.login().json()['token']
+
+        response = self.client.patch(
+            '/datapipeline/api/instructor_me/',
+            data=json.dumps({'email': '  New.Address@UCSC.EDU  '}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {token}',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['email'], 'new.address@ucsc.edu')
+        self.account.refresh_from_db()
+        self.user.refresh_from_db()
+        self.assertEqual(self.account.email, 'new.address@ucsc.edu')
+        self.assertEqual(self.user.email, 'new.address@ucsc.edu')
+        old_login = self.post_json('/datapipeline/api/instructor_sessions/', {
+            'email': self.email,
+            'password': self.temporary_password,
+        })
+        new_login = self.post_json('/datapipeline/api/instructor_sessions/', {
+            'email': 'new.address@ucsc.edu',
+            'password': self.temporary_password,
+        })
+        self.assertEqual(old_login.status_code, 401)
+        self.assertEqual(new_login.status_code, 201)
+
+    def test_profile_patch_rejects_non_ucsc_and_duplicate_email(self):
+        self.account.must_change_password = False
+        self.account.save(update_fields=['must_change_password'])
+        token = self.login().json()['token']
+        other_user = get_user_model().objects.create_user(
+            username='other-user',
+            email='other@ucsc.edu',
+            password='OtherPass123!',
+        )
+        InstructorAccount.objects.create(
+            user=other_user,
+            email='other@ucsc.edu',
+            display_name='Other',
+        )
+
+        outside = self.client.patch(
+            '/datapipeline/api/instructor_me/',
+            data=json.dumps({'email': 'teacher@example.edu'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {token}',
+        )
+        duplicate = self.client.patch(
+            '/datapipeline/api/instructor_me/',
+            data=json.dumps({'email': 'other@ucsc.edu'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {token}',
+        )
+
+        self.assertEqual(outside.status_code, 400)
+        self.assertEqual(outside.json(), {'error': 'invalid_email'})
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.json(), {'error': 'email_in_use'})
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.email, self.email)
+
+    def test_profile_patch_audits_all_changed_fields_without_email_value(self):
+        self.account.must_change_password = False
+        self.account.save(update_fields=['must_change_password'])
+        token = self.login().json()['token']
+
+        response = self.client.patch(
+            '/datapipeline/api/instructor_me/',
+            data=json.dumps({
+                'display_name': '  Professor Rivera  ',
+                'email': 'rivera@ucsc.edu',
+            }),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {token}',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        event = InstructorAuditEvent.objects.get(
+            action=InstructorAuditEvent.ACTION_PROFILE_UPDATED,
+        )
+        self.assertEqual(event.metadata, {
+            'changed_fields': ['display_name', 'email'],
+        })
+        self.assertNotIn('rivera@ucsc.edu', str(event.metadata))
 
     def test_profile_patch_trims_name_audits_and_preserves_course_snapshot(self):
         self.account.must_change_password = False
@@ -391,7 +479,7 @@ class InstructorSessionApiTests(TestCase):
             action=InstructorAuditEvent.ACTION_PROFILE_UPDATED,
         )
         self.assertEqual(event.actor, self.account)
-        self.assertEqual(event.metadata, {'changed_field': 'display_name'})
+        self.assertEqual(event.metadata, {'changed_fields': ['display_name']})
 
     def test_profile_patch_rolls_back_when_audit_write_fails(self):
         self.account.must_change_password = False
@@ -405,10 +493,16 @@ class InstructorSessionApiTests(TestCase):
             with self.assertRaises(ValidationError):
                 self.client.patch(
                     '/datapipeline/api/instructor_me/',
-                    data=json.dumps({'display_name': 'Prof. Updated'}),
+                    data=json.dumps({
+                        'display_name': 'Prof. Updated',
+                        'email': 'updated@ucsc.edu',
+                    }),
                     content_type='application/json',
                     HTTP_AUTHORIZATION=f'Bearer {token}',
                 )
 
         self.account.refresh_from_db()
+        self.user.refresh_from_db()
         self.assertEqual(self.account.display_name, 'Prof. Test')
+        self.assertEqual(self.account.email, self.email)
+        self.assertEqual(self.user.email, self.email)

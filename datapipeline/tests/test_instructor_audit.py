@@ -406,10 +406,6 @@ class InstructorAuditWriterTests(TestCase):
     def test_writer_accepts_fixed_scalar_domains(self):
         valid_cases = [
             (
-                InstructorAuditEvent.ACTION_PROFILE_UPDATED,
-                {'changed_field': 'display_name'},
-            ),
-            (
                 InstructorAuditEvent.ACTION_SURVEY_CREATED,
                 {'mode': 'general'},
             ),
@@ -508,6 +504,10 @@ class InstructorAuditWriterTests(TestCase):
 
     def test_writer_accepts_action_specific_changed_fields(self):
         valid_cases = [
+            (
+                InstructorAuditEvent.ACTION_PROFILE_UPDATED,
+                'email',
+            ),
             (
                 InstructorAuditEvent.ACTION_COURSE_BANNER_UPDATED,
                 'banner_enabled',
