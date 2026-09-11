@@ -12,6 +12,8 @@ from .leai_completion import (
     normalize_code,
     render_certificate_pdf,
 )
+from .instructor_audit import record_instructor_event
+from .instructor_auth import authorize_instructor_course
 import json
 import os
 import secrets
@@ -29,6 +31,51 @@ import requests
 
 
 FORM_RESPONSE_PHASES = {'primary', 'probe', 'revision'}
+
+
+def _course_requires_account_authorization(course):
+    return (
+        course is not None
+        and not course.legacy_password_login_enabled
+        and course.institution_id is not None
+    )
+
+
+def _authorize_course_endpoint(
+    request,
+    course,
+    *,
+    capability=None,
+    audit_denial=False,
+):
+    if not _course_requires_account_authorization(course):
+        return None, None, None, None
+
+    account, session, membership, error = authorize_instructor_course(
+        request,
+        course,
+        capability=capability,
+    )
+    if error is not None and audit_denial and account is not None:
+        try:
+            reason_code = json.loads(error.content).get('error')
+        except (TypeError, ValueError, UnicodeDecodeError):
+            reason_code = None
+        if reason_code in {
+            'course_access_denied',
+            'capability_denied',
+        }:
+            record_instructor_event(
+                action=InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED,
+                outcome=InstructorAuditEvent.OUTCOME_DENIED,
+                actor=account,
+                session=session,
+                course=course,
+                target_type='course',
+                target_id=course.course_id,
+                metadata={'reason_code': reason_code},
+            )
+    return account, session, membership, error
 
 
 def _form_attribution_kwargs(data):
@@ -583,35 +630,65 @@ def update_course_banner(request):
     except Course.DoesNotExist:
         return JsonResponse({'error': 'Course not found'}, status=404)
 
-    if 'enabled' in data:
-        course.banner_enabled = bool(data.get('enabled'))
-    if 'text' in data:
-        course.banner_text = (data.get('text') or '')[:2000]
-    if 'dismissible' in data:
-        course.banner_dismissible = bool(data.get('dismissible'))
-    if 'display_mode' in data:
-        mode = data.get('display_mode')
-        if mode in ('persistent', 'timed'):
-            course.banner_display_mode = mode
-    if 'duration_seconds' in data:
-        try:
-            secs = int(data.get('duration_seconds'))
-            course.banner_duration_seconds = max(1, min(secs, 600))
-        except (TypeError, ValueError):
-            pass
-    if 'split_enabled' in data:
-        course.banner_split_enabled = bool(data.get('split_enabled'))
-    if 'split_mode' in data:
-        sm = data.get('split_mode')
-        if sm in ('percentage', 'count'):
-            course.banner_split_mode = sm
-    if 'split_value' in data:
-        try:
-            sv = int(data.get('split_value'))
-            course.banner_split_value = max(0, min(sv, 100000))
-        except (TypeError, ValueError):
-            pass
-    course.save()
+    account, session, _membership, error = _authorize_course_endpoint(
+        request,
+        course,
+        capability='publish',
+        audit_denial=True,
+    )
+    if error is not None:
+        return error
+
+    changed_fields = []
+    with transaction.atomic():
+        if 'enabled' in data:
+            course.banner_enabled = bool(data.get('enabled'))
+            changed_fields.append('banner_enabled')
+        if 'text' in data:
+            course.banner_text = (data.get('text') or '')[:2000]
+            changed_fields.append('banner_text')
+        if 'dismissible' in data:
+            course.banner_dismissible = bool(data.get('dismissible'))
+            changed_fields.append('banner_dismissible')
+        if 'display_mode' in data:
+            mode = data.get('display_mode')
+            if mode in ('persistent', 'timed'):
+                course.banner_display_mode = mode
+                changed_fields.append('banner_display_mode')
+        if 'duration_seconds' in data:
+            try:
+                secs = int(data.get('duration_seconds'))
+                course.banner_duration_seconds = max(1, min(secs, 600))
+                changed_fields.append('banner_duration_seconds')
+            except (TypeError, ValueError):
+                pass
+        if 'split_enabled' in data:
+            course.banner_split_enabled = bool(data.get('split_enabled'))
+            changed_fields.append('banner_split_enabled')
+        if 'split_mode' in data:
+            sm = data.get('split_mode')
+            if sm in ('percentage', 'count'):
+                course.banner_split_mode = sm
+                changed_fields.append('banner_split_mode')
+        if 'split_value' in data:
+            try:
+                sv = int(data.get('split_value'))
+                course.banner_split_value = max(0, min(sv, 100000))
+                changed_fields.append('banner_split_value')
+            except (TypeError, ValueError):
+                pass
+        course.save()
+        if account is not None:
+            record_instructor_event(
+                action=InstructorAuditEvent.ACTION_COURSE_BANNER_UPDATED,
+                outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                actor=account,
+                session=session,
+                course=course,
+                target_type='course',
+                target_id=course.course_id,
+                metadata={'changed_fields': changed_fields},
+            )
     return JsonResponse(_course_banner_dict(course))
 
 
@@ -632,6 +709,7 @@ def get_course_customization(request):
         course = Course.objects.get(course_id=course_id)
     except Course.DoesNotExist:
         return JsonResponse({'error': 'Course not found'}, status=404)
+
     return JsonResponse(_course_customization_dict(course))
 
 
@@ -656,6 +734,15 @@ def update_course_customization(request):
     except Course.DoesNotExist:
         return JsonResponse({'error': 'Course not found'}, status=404)
 
+    account, session, _membership, error = _authorize_course_endpoint(
+        request,
+        course,
+        capability='publish',
+        audit_denial=True,
+    )
+    if error is not None:
+        return error
+
     strict_download_flags = (
         'completion_certificate_enabled',
         'parsed_document_download_enabled',
@@ -664,21 +751,40 @@ def update_course_customization(request):
         if key in data and not isinstance(data.get(key), bool):
             return JsonResponse({'error': 'Invalid request body'}, status=400)
 
-    if 'bot_display_name' in data:
-        course.bot_display_name = (data.get('bot_display_name') or '').strip()[:100]
-    if 'referral_enabled' in data:
-        course.referral_enabled = bool(data.get('referral_enabled'))
-    if 'referral_text' in data:
-        course.referral_text = (data.get('referral_text') or '').strip()[:200]
-    if 'identity_tracking_enabled' in data:
-        course.identity_tracking_enabled = bool(data.get('identity_tracking_enabled'))
-    if 'completion_certificate_enabled' in data:
-        course.completion_certificate_enabled = data.get(
-            'completion_certificate_enabled')
-    if 'parsed_document_download_enabled' in data:
-        course.parsed_document_download_enabled = data.get(
-            'parsed_document_download_enabled')
-    course.save()
+    changed_fields = []
+    with transaction.atomic():
+        if 'bot_display_name' in data:
+            course.bot_display_name = (data.get('bot_display_name') or '').strip()[:100]
+            changed_fields.append('bot_display_name')
+        if 'referral_enabled' in data:
+            course.referral_enabled = bool(data.get('referral_enabled'))
+            changed_fields.append('referral_enabled')
+        if 'referral_text' in data:
+            course.referral_text = (data.get('referral_text') or '').strip()[:200]
+            changed_fields.append('referral_text')
+        if 'identity_tracking_enabled' in data:
+            course.identity_tracking_enabled = bool(data.get('identity_tracking_enabled'))
+            changed_fields.append('identity_tracking_enabled')
+        if 'completion_certificate_enabled' in data:
+            course.completion_certificate_enabled = data.get(
+                'completion_certificate_enabled')
+            changed_fields.append('completion_certificate_enabled')
+        if 'parsed_document_download_enabled' in data:
+            course.parsed_document_download_enabled = data.get(
+                'parsed_document_download_enabled')
+            changed_fields.append('parsed_document_download_enabled')
+        course.save()
+        if account is not None:
+            record_instructor_event(
+                action=InstructorAuditEvent.ACTION_COURSE_CUSTOMIZATION_UPDATED,
+                outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                actor=account,
+                session=session,
+                course=course,
+                target_type='course',
+                target_id=course.course_id,
+                metadata={'changed_fields': changed_fields},
+            )
     return JsonResponse(_course_customization_dict(course))
 
 
@@ -845,6 +951,15 @@ def create_feedback_gpt(request):
                 except Course.DoesNotExist:
                     return JsonResponse({'error': 'Course not found'}, status=404)
 
+            account, session, _membership, error = _authorize_course_endpoint(
+                request,
+                course,
+                capability='publish',
+                audit_denial=True,
+            )
+            if error is not None:
+                return error
+
             # Default expiry: 14 days from now
             raw_expires = data.get('expires_at')
             if raw_expires:
@@ -927,6 +1042,17 @@ def create_feedback_gpt(request):
                             display_name=t.display_name,
                         )
                     snapshot_payload = _survey_snapshot_to_dict(snap)
+                if account is not None:
+                    record_instructor_event(
+                        action=InstructorAuditEvent.ACTION_SURVEY_CREATED,
+                        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                        actor=account,
+                        session=session,
+                        course=course,
+                        target_type='survey',
+                        target_id=gpt.pk,
+                        metadata={'mode': mode},
+                    )
 
             resp = {
                 'status': 'success',
@@ -955,6 +1081,12 @@ def feedback_gpts_by_course(request):
             course = Course.objects.get(course_id=course_id)
         except Course.DoesNotExist:
             return JsonResponse({'error': 'Course not found'}, status=404)
+        _account, _session, _membership, error = _authorize_course_endpoint(
+            request,
+            course,
+        )
+        if error is not None:
+            return error
         gpts = FeedbackGPT.objects.filter(course=course).order_by('week_number', 'created_at')
         result = []
         for gpt in gpts:
@@ -1187,6 +1319,16 @@ def feedback_messages_by_gpt(request):
         gpt_id = request.GET.get('gpt_id')
         if not gpt_id:
             return JsonResponse({'error': 'gpt_id parameter is required'}, status=400)
+        try:
+            gpt_obj = FeedbackGPT.objects.select_related('course').get(id=gpt_id)
+        except (FeedbackGPT.DoesNotExist, TypeError, ValueError):
+            return JsonResponse({'error': 'Survey not found'}, status=404)
+        _account, _session, _membership, error = _authorize_course_endpoint(
+            request,
+            gpt_obj.course,
+        )
+        if error is not None:
+            return error
         messages = FeedbackMessage.objects.filter(gpt_id=gpt_id).order_by('created_at')
         sessions = defaultdict(list)
         for m in messages:
@@ -1205,7 +1347,6 @@ def feedback_messages_by_gpt(request):
                 **_serialize_form_attribution(m),
             })
         # A/B banner exposure for these sessions (empty unless the split is on).
-        gpt_obj = FeedbackGPT.objects.filter(id=gpt_id).first()
         banner_exposure = {}
         if gpt_obj and gpt_obj.course_id:
             banner_exposure = {
@@ -1232,6 +1373,12 @@ def feedback_messages_by_course(request):
             course = Course.objects.get(course_id=course_id)
         except Course.DoesNotExist:
             return JsonResponse({'error': 'Course not found'}, status=404)
+        _account, _session, _membership, error = _authorize_course_endpoint(
+            request,
+            course,
+        )
+        if error is not None:
+            return error
         gpts = FeedbackGPT.objects.filter(course=course).order_by('week_number', 'created_at')
         # Course-wide A/B exposure log: which anonymous sessions were shown the
         # banner. Only populated when the split is/was on (no rows otherwise),
@@ -1307,15 +1454,37 @@ def set_survey_status(request):
             if not survey_id or action not in ('close', 'reopen'):
                 return JsonResponse({'error': 'survey_id and action (close|reopen) required'}, status=400)
             try:
-                gpt = FeedbackGPT.objects.get(id=survey_id)
+                gpt = FeedbackGPT.objects.select_related('course').get(id=survey_id)
             except FeedbackGPT.DoesNotExist:
                 return JsonResponse({'error': 'Survey not found'}, status=404)
-            if action == 'close':
-                gpt.is_closed = True
-            else:
-                gpt.is_closed = False
-                gpt.expires_at = timezone.now() + timedelta(days=14)
-            gpt.save()
+            account, session, _membership, error = _authorize_course_endpoint(
+                request,
+                gpt.course,
+                capability='publish',
+                audit_denial=True,
+            )
+            if error is not None:
+                return error
+            with transaction.atomic():
+                if action == 'close':
+                    gpt.is_closed = True
+                    status = 'closed'
+                else:
+                    gpt.is_closed = False
+                    gpt.expires_at = timezone.now() + timedelta(days=14)
+                    status = 'open'
+                gpt.save()
+                if account is not None:
+                    record_instructor_event(
+                        action=InstructorAuditEvent.ACTION_SURVEY_STATUS_CHANGED,
+                        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                        actor=account,
+                        session=session,
+                        course=gpt.course,
+                        target_type='survey',
+                        target_id=gpt.pk,
+                        metadata={'status': status},
+                    )
             return JsonResponse({
                 'status': 'success',
                 'is_closed': gpt.is_closed,
@@ -1329,111 +1498,181 @@ def set_survey_status(request):
 @csrf_exempt
 def update_survey(request):
     """Update editable fields on an existing survey."""
-    if request.method == 'POST':
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        data = json.loads(request.body)
+        survey_id = data.get('survey_id')
+        if not survey_id:
+            return JsonResponse({'error': 'survey_id required'}, status=400)
         try:
-            data = json.loads(request.body)
-            survey_id = data.get('survey_id')
-            if not survey_id:
-                return JsonResponse({'error': 'survey_id required'}, status=400)
+            gpt = FeedbackGPT.objects.select_related('course').get(id=survey_id)
+        except FeedbackGPT.DoesNotExist:
+            return JsonResponse({'error': 'Survey not found'}, status=404)
+
+        account, session, _membership, error = _authorize_course_endpoint(
+            request,
+            gpt.course,
+            capability='publish',
+            audit_denial=True,
+        )
+        if error is not None:
+            return error
+
+        updatable = [
+            'name',
+            'survey_label',
+            'week_number',
+            'instructions',
+            'anonymity_mode',
+            'reporting_structure',
+        ]
+        scalar_updates = {
+            field: data[field] for field in updatable if field in data
+        }
+        date_updates = {}
+        for field in ('expires_at', 'opens_at'):
+            if field in data:
+                date_updates[field] = (
+                    parse_datetime(data[field]) if data[field] else None
+                )
+
+        current_snap = getattr(gpt, 'team_snapshot', None)
+        new_cfg = None
+        switch_team_configuration = False
+        if 'team_configuration_id' in data and gpt.mode == 'group':
             try:
-                gpt = FeedbackGPT.objects.get(id=survey_id)
-            except FeedbackGPT.DoesNotExist:
-                return JsonResponse({'error': 'Survey not found'}, status=404)
-
-            updatable = ['name', 'survey_label', 'week_number', 'instructions',
-                         'anonymity_mode', 'reporting_structure']
-            for field in updatable:
-                if field in data:
-                    setattr(gpt, field, data[field])
-
-            if 'expires_at' in data:
-                gpt.expires_at = parse_datetime(data['expires_at']) if data['expires_at'] else None
-            if 'opens_at' in data:
-                gpt.opens_at = parse_datetime(data['opens_at']) if data['opens_at'] else None
-
-            # Swap team configuration for an existing group-mode survey. Only
-            # allowed when no student has self-assigned to a team yet — once
-            # assignments exist, switching would orphan their picks. In that
-            # case instructors should duplicate the survey instead.
-            new_cfg_id = data.get('team_configuration_id')
-            snapshot_payload = None
-            if new_cfg_id is not None and gpt.mode == 'group':
+                new_cfg_id = int(data['team_configuration_id'])
+            except (TypeError, ValueError):
+                return JsonResponse({
+                    'error': 'team_configuration_id must be an integer',
+                }, status=400)
+            current_source_id = (
+                current_snap.source_configuration_id if current_snap else None
+            )
+            switch_team_configuration = new_cfg_id != current_source_id
+            if switch_team_configuration:
                 try:
-                    new_cfg_id = int(new_cfg_id)
-                except (TypeError, ValueError):
-                    return JsonResponse({'error': 'team_configuration_id must be an integer'}, status=400)
-                current_snap = getattr(gpt, 'team_snapshot', None)
-                current_source_id = current_snap.source_configuration_id if current_snap else None
-                if new_cfg_id != current_source_id:
-                    try:
-                        new_cfg = TeamConfiguration.objects.get(id=new_cfg_id)
-                    except TeamConfiguration.DoesNotExist:
-                        return JsonResponse({'error': 'team_configuration not found'}, status=404)
-                    if new_cfg.archived:
-                        return JsonResponse({
-                            'error': 'team_configuration is archived; unarchive before using',
-                        }, status=400)
-                    if gpt.course_id and new_cfg.course_id != gpt.course_id:
-                        return JsonResponse({
-                            'error': 'team_configuration belongs to a different course',
-                        }, status=400)
-                    if current_snap and SessionTeamAssignment.objects.filter(
-                        survey_team__snapshot=current_snap
-                    ).exists():
-                        return JsonResponse({
-                            'error': "Can't switch team configuration: students have already picked teams in this survey. Duplicate the survey instead so existing responses keep their team picks.",
-                        }, status=400)
-                    with transaction.atomic():
-                        if current_snap:
-                            current_snap.delete()
-                        snap = SurveyTeamSnapshot.objects.create(
-                            survey=gpt,
-                            source_configuration=new_cfg,
-                            name=new_cfg.name,
-                            label_prefix=new_cfg.label_prefix,
-                            color=new_cfg.color,
-                        )
-                        for t in new_cfg.teams.all():
-                            SurveyTeam.objects.create(
-                                snapshot=snap, number=t.number, size=t.size,
-                                display_name=t.display_name,
-                            )
-                        snapshot_payload = _survey_snapshot_to_dict(snap)
+                    new_cfg = TeamConfiguration.objects.get(id=new_cfg_id)
+                except TeamConfiguration.DoesNotExist:
+                    return JsonResponse({
+                        'error': 'team_configuration not found',
+                    }, status=404)
+                if new_cfg.archived:
+                    return JsonResponse({
+                        'error': (
+                            'team_configuration is archived; '
+                            'unarchive before using'
+                        ),
+                    }, status=400)
+                if gpt.course_id and new_cfg.course_id != gpt.course_id:
+                    return JsonResponse({
+                        'error': (
+                            'team_configuration belongs to a different course'
+                        ),
+                    }, status=400)
+                if current_snap and SessionTeamAssignment.objects.filter(
+                    survey_team__snapshot=current_snap,
+                ).exists():
+                    return JsonResponse({
+                        'error': (
+                            "Can't switch team configuration: students have "
+                            'already picked teams in this survey. Duplicate the '
+                            'survey instead so existing responses keep their '
+                            'team picks.'
+                        ),
+                    }, status=400)
 
-            # Bind/unbind the FormSchema. Required when mode='form' (cannot
-            # unbind), optional when mode='group' (engine layers coverage on
-            # top of the team-aware prompt when set), forbidden when
-            # mode='general'.
-            if 'form_schema_id' in data:
-                raw = data.get('form_schema_id')
-                new_schema_id = (raw or '').strip() if isinstance(raw, str) else ''
-                if not new_schema_id:
-                    if gpt.mode == 'form':
-                        return JsonResponse({
-                            'error': "form_schema_id is required for mode='form' surveys",
-                        }, status=400)
-                    gpt.form_schema = None
-                else:
-                    if gpt.mode == 'general':
-                        return JsonResponse({
-                            'error': "form_schema_id is only valid for mode='form' or mode='group'",
-                        }, status=400)
-                    try:
-                        gpt.form_schema = FormSchema.objects.get(
-                            schema_id=new_schema_id, is_active=True,
-                        )
-                    except FormSchema.DoesNotExist:
-                        return JsonResponse({'error': 'form_schema not found or inactive'}, status=404)
+        schema_was_supplied = 'form_schema_id' in data
+        new_form_schema = gpt.form_schema
+        if schema_was_supplied:
+            raw = data.get('form_schema_id')
+            new_schema_id = (
+                (raw or '').strip() if isinstance(raw, str) else ''
+            )
+            if not new_schema_id:
+                if gpt.mode == 'form':
+                    return JsonResponse({
+                        'error': (
+                            "form_schema_id is required for mode='form' surveys"
+                        ),
+                    }, status=400)
+                new_form_schema = None
+            else:
+                if gpt.mode == 'general':
+                    return JsonResponse({
+                        'error': (
+                            "form_schema_id is only valid for mode='form' or "
+                            "mode='group'"
+                        ),
+                    }, status=400)
+                try:
+                    new_form_schema = FormSchema.objects.get(
+                        schema_id=new_schema_id,
+                        is_active=True,
+                    )
+                except FormSchema.DoesNotExist:
+                    return JsonResponse({
+                        'error': 'form_schema not found or inactive',
+                    }, status=404)
 
+        changed_fields = list(scalar_updates) + list(date_updates)
+        if 'team_configuration_id' in data and gpt.mode == 'group':
+            changed_fields.append('team_configuration_id')
+        if schema_was_supplied:
+            changed_fields.append('form_schema_id')
+
+        snapshot_payload = None
+        with transaction.atomic():
+            for field, value in scalar_updates.items():
+                setattr(gpt, field, value)
+            for field, value in date_updates.items():
+                setattr(gpt, field, value)
+            if switch_team_configuration:
+                if current_snap:
+                    current_snap.delete()
+                snap = SurveyTeamSnapshot.objects.create(
+                    survey=gpt,
+                    source_configuration=new_cfg,
+                    name=new_cfg.name,
+                    label_prefix=new_cfg.label_prefix,
+                    color=new_cfg.color,
+                )
+                for team in new_cfg.teams.all():
+                    SurveyTeam.objects.create(
+                        snapshot=snap,
+                        number=team.number,
+                        size=team.size,
+                        display_name=team.display_name,
+                    )
+                snapshot_payload = _survey_snapshot_to_dict(snap)
+            if schema_was_supplied:
+                gpt.form_schema = new_form_schema
             gpt.save()
-            resp = {'status': 'success', 'id': gpt.id,
-                    'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None}
-            if snapshot_payload is not None:
-                resp['team_snapshot'] = snapshot_payload
-            return JsonResponse(resp)
-        except Exception as e:
-            return JsonResponse({'error': str(e)}, status=400)
-    return HttpResponse(status=405)
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_SURVEY_UPDATED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=session,
+                    course=gpt.course,
+                    target_type='survey',
+                    target_id=gpt.pk,
+                    metadata={'changed_fields': changed_fields},
+                )
+
+        resp = {
+            'status': 'success',
+            'id': gpt.id,
+            'form_schema_id': (
+                gpt.form_schema.schema_id if gpt.form_schema_id else None
+            ),
+        }
+        if snapshot_payload is not None:
+            resp['team_snapshot'] = snapshot_payload
+        return JsonResponse(resp)
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=400)
 
 
 @csrf_exempt
@@ -1451,11 +1690,35 @@ def delete_survey(request):
             if not survey_id:
                 return JsonResponse({'error': 'survey_id required'}, status=400)
             try:
-                gpt = FeedbackGPT.objects.get(id=survey_id)
+                gpt = FeedbackGPT.objects.select_related('course').get(id=survey_id)
             except FeedbackGPT.DoesNotExist:
                 return JsonResponse({'error': 'Survey not found'}, status=404)
-            messages_deleted, _ = FeedbackMessage.objects.filter(gpt_id=gpt.id).delete()
-            gpt.delete()
+            account, session, _membership, error = _authorize_course_endpoint(
+                request,
+                gpt.course,
+                capability='publish',
+                audit_denial=True,
+            )
+            if error is not None:
+                return error
+            target_id = gpt.pk
+            course = gpt.course
+            with transaction.atomic():
+                messages_deleted, _ = FeedbackMessage.objects.filter(
+                    gpt_id=target_id,
+                ).delete()
+                gpt.delete()
+                if account is not None:
+                    record_instructor_event(
+                        action=InstructorAuditEvent.ACTION_SURVEY_DELETED,
+                        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                        actor=account,
+                        session=session,
+                        course=course,
+                        target_type='survey',
+                        target_id=target_id,
+                        metadata={'responses_deleted': messages_deleted},
+                    )
             return JsonResponse({
                 'status': 'success',
                 'survey_id': survey_id,
@@ -1476,9 +1739,18 @@ def clone_survey(request):
             if not survey_id:
                 return JsonResponse({'error': 'survey_id required'}, status=400)
             try:
-                src = FeedbackGPT.objects.get(id=survey_id)
+                src = FeedbackGPT.objects.select_related('course').get(id=survey_id)
             except FeedbackGPT.DoesNotExist:
                 return JsonResponse({'error': 'Survey not found'}, status=404)
+
+            account, session, _membership, error = _authorize_course_endpoint(
+                request,
+                src.course,
+                capability='publish',
+                audit_denial=True,
+            )
+            if error is not None:
+                return error
 
             with transaction.atomic():
                 clone = FeedbackGPT.objects.create(
@@ -1514,6 +1786,17 @@ def clone_survey(request):
                             snapshot=new_snap, number=t.number, size=t.size,
                             display_name=t.display_name,
                         )
+                if account is not None:
+                    record_instructor_event(
+                        action=InstructorAuditEvent.ACTION_SURVEY_CLONED,
+                        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                        actor=account,
+                        session=session,
+                        course=src.course,
+                        target_type='survey',
+                        target_id=clone.pk,
+                        metadata={'source_survey_id': src.pk},
+                    )
 
             return JsonResponse({
                 'status': 'success',
@@ -1536,20 +1819,49 @@ def export_survey_responses(request):
         if not survey_id:
             return JsonResponse({'error': 'survey_id required'}, status=400)
         try:
-            gpt = FeedbackGPT.objects.get(id=survey_id)
+            gpt = FeedbackGPT.objects.select_related('course').get(id=survey_id)
         except FeedbackGPT.DoesNotExist:
             return JsonResponse({'error': 'Survey not found'}, status=404)
 
-        messages = FeedbackMessage.objects.filter(gpt_id=gpt.id).order_by('session_id', 'created_at')
+        account, session, _membership, error = _authorize_course_endpoint(
+            request,
+            gpt.course,
+            capability='export',
+            audit_denial=True,
+        )
+        if error is not None:
+            return error
+
+        messages = list(
+            FeedbackMessage.objects
+            .filter(gpt_id=gpt.id)
+            .order_by('session_id', 'created_at')
+        )
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(['session_id', 'sent_by', 'content', 'created_at'])
         for m in messages:
             writer.writerow([m.session_id, m.sent_by, m.content, m.created_at.strftime('%Y-%m-%d %H:%M:%S')])
 
+        if account is not None:
+            with transaction.atomic():
+                record_instructor_event(
+                    action=(
+                        InstructorAuditEvent.ACTION_SURVEY_RESPONSES_EXPORTED
+                    ),
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=session,
+                    course=gpt.course,
+                    target_type='survey',
+                    target_id=gpt.pk,
+                    metadata={'row_count': len(messages)},
+                )
+
         filename = f'survey_{gpt.id}_responses.csv'
         response = HttpResponse(buf.getvalue(), content_type='text/csv')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        response['Cache-Control'] = 'no-store, private'
         return response
     return HttpResponse(status=405)
 
