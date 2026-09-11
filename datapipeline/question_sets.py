@@ -689,8 +689,6 @@ def create_survey_from_revision(
         'Survey label',
         max_length=200,
     )
-    if expires_at is None:
-        expires_at = timezone.now() + timedelta(days=14)
     if opens_at is not None and expires_at is not None and opens_at >= expires_at:
         raise QuestionSetError('invalid_schedule', 'Closing time must be after opening time.')
 
