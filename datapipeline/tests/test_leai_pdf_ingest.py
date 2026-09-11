@@ -279,6 +279,24 @@ class WorkerTests(TestCase):
                 self.survey, [("a.pdf", make_clean_pdf())], {},
             )
 
+    def test_audit_failure_rolls_back_job_before_worker_starts(self):
+        def fail_audit(_job):
+            raise RuntimeError("audit failed")
+
+        with patch(
+            "datapipeline.leai_pdf_ingest.threading.Thread.start",
+        ) as start_worker:
+            with self.assertRaisesRegex(RuntimeError, "audit failed"):
+                leai_pdf_ingest.start_pdf_ingest_job(
+                    self.survey,
+                    [("a.pdf", make_clean_pdf())],
+                    {"a.pdf": "alice"},
+                    audit_callback=fail_audit,
+                )
+
+        self.assertFalse(LEAIPdfIngestJob.objects.exists())
+        start_worker.assert_not_called()
+
     def test_oversize_file_rejected_before_worker(self):
         big = b"x" * (leai_pdf_ingest.MAX_BYTES_PER_FILE + 1)
         with self.assertRaisesRegex(ValueError, "10 MB"):
@@ -485,6 +503,31 @@ class CommitRevertTests(TestCase):
         # Job is consumed.
         self.assertFalse(LEAIPdfIngestJob.objects.filter(pk=job.pk).exists())
 
+    def test_commit_audit_failure_rolls_back_batch_messages_and_job_delete(self):
+        job = self._ready_job()
+        job.refresh_from_db()
+        item = job.items[0]
+
+        def fail_audit(_batch):
+            raise RuntimeError("audit failed")
+
+        with self.assertRaisesRegex(RuntimeError, "audit failed"):
+            leai_pdf_ingest.commit_pdf_ingest_job(
+                job,
+                [{
+                    "filename": item["filename"],
+                    "student_id": item["student_id"],
+                    "mapping": item["mapping"],
+                    "skip": False,
+                }],
+                dedup_decisions={},
+                audit_callback=fail_audit,
+            )
+
+        self.assertTrue(LEAIPdfIngestJob.objects.filter(pk=job.pk).exists())
+        self.assertFalse(LEAIPdfIngestBatch.objects.exists())
+        self.assertFalse(FeedbackMessage.objects.exists())
+
     def test_dedup_replace_overwrites_existing(self):
         # Pre-existing PDF row for this student/survey
         FeedbackMessage.objects.create(
@@ -547,6 +590,38 @@ class CommitRevertTests(TestCase):
         self.assertTrue(FeedbackMessage.objects.filter(pk=chat_msg.pk).exists())
         # Idempotent — second revert is a no-op.
         self.assertEqual(leai_pdf_ingest.revert_pdf_ingest_batch(batch), 0)
+
+    def test_revert_audit_failure_rolls_back_messages_and_reverted_at(self):
+        job = self._ready_job()
+        job.refresh_from_db()
+        item = job.items[0]
+        batch = leai_pdf_ingest.commit_pdf_ingest_job(
+            job,
+            [{
+                "filename": item["filename"],
+                "student_id": item["student_id"],
+                "mapping": item["mapping"],
+                "skip": False,
+            }],
+            dedup_decisions={},
+        )
+        message_count = FeedbackMessage.objects.filter(pdf_batch=batch).count()
+
+        def fail_audit(_batch, _deleted_count):
+            raise RuntimeError("audit failed")
+
+        with self.assertRaisesRegex(RuntimeError, "audit failed"):
+            leai_pdf_ingest.revert_pdf_ingest_batch(
+                batch,
+                audit_callback=fail_audit,
+            )
+
+        batch.refresh_from_db()
+        self.assertIsNone(batch.reverted_at)
+        self.assertEqual(
+            FeedbackMessage.objects.filter(pdf_batch=batch).count(),
+            message_count,
+        )
 
 
 # ─── HTTP layer ──────────────────────────────────────────────────────────

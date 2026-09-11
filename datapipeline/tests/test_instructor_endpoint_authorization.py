@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client, RequestFactory, TestCase
 from django.utils import timezone
 
@@ -25,7 +26,10 @@ from datapipeline.models import (
     InstructorSession,
     LEAIChatMessage,
     LEAIChatSession,
+    LEAIPdfIngestBatch,
+    LEAIPdfIngestJob,
     LEAIQuickTake,
+    TeamConfiguration,
 )
 
 
@@ -540,6 +544,384 @@ class CourseAndSurveyEndpointMatrixTests(TestCase):
         self.assertEqual(FeedbackGPT.objects.count(), original_survey_count)
         self.assertFalse(InstructorAuditEvent.objects.exists())
 
+
+class TeamAndPdfEndpointMatrixTests(CourseAndSurveyEndpointMatrixTests):
+    test_managed_endpoints_reject_missing_and_wrong_course_tokens = None
+    test_owner_can_use_all_endpoints_and_writes_exact_events = None
+    test_legacy_course_endpoints_remain_compatible_without_actor = None
+    test_course_and_survey_mutations_roll_back_when_audit_fails = None
+
+    def setUp(self):
+        super().setUp()
+        self.team_update = TeamConfiguration.objects.create(
+            course=self.course, name='Update Me',
+        )
+        self.team_archive = TeamConfiguration.objects.create(
+            course=self.course, name='Archive Me',
+        )
+        self.team_delete = TeamConfiguration.objects.create(
+            course=self.course, name='Delete Me',
+        )
+
+        self.start_survey = self._create_survey('pdf-start')
+        self.detail_survey = self._create_survey('pdf-detail')
+        self.commit_survey = self._create_survey('pdf-commit')
+        self.revert_survey = self._create_survey('pdf-revert')
+        self.detail_job = LEAIPdfIngestJob.objects.create(
+            survey=self.detail_survey,
+            status=LEAIPdfIngestJob.STATUS_READY,
+            items=[],
+        )
+        self.commit_job = LEAIPdfIngestJob.objects.create(
+            survey=self.commit_survey,
+            status=LEAIPdfIngestJob.STATUS_READY,
+            items=[],
+        )
+        self.revert_batch = LEAIPdfIngestBatch.objects.create(
+            survey=self.revert_survey,
+            student_count=1,
+            message_count=1,
+        )
+        self.revert_message = FeedbackMessage.objects.create(
+            session_id='pdf-revert-session',
+            student_id='student-1',
+            sent_by='student',
+            content='PDF response',
+            gpt_used=self.revert_survey.name,
+            gpt_id=self.revert_survey.pk,
+            source=FeedbackMessage.SOURCE_PDF,
+            pdf_batch=self.revert_batch,
+        )
+
+    def _create_survey(self, public_id):
+        return FeedbackGPT.objects.create(
+            public_id=public_id,
+            name=public_id,
+            instructions='Reflect.',
+            created_by='Prof. A',
+            course=self.course,
+            mode='general',
+        )
+
+    def team_pdf_cases(self):
+        return [
+            ('team_list', 'get', '/datapipeline/api/team_configurations/', {
+                'course_id': self.course.course_id,
+            }, 'query'),
+            ('team_create', 'post', '/datapipeline/api/team_configurations/create/', {
+                'course_id': self.course.course_id,
+                'name': 'Created Configuration',
+                'teams': [{'number': 1, 'size': 4}],
+            }, 'json'),
+            ('team_update', 'post', '/datapipeline/api/team_configurations/update/', {
+                'id': self.team_update.pk,
+                'name': 'Updated Configuration',
+            }, 'json'),
+            ('team_archive', 'post', '/datapipeline/api/team_configurations/archive/', {
+                'id': self.team_archive.pk,
+            }, 'json'),
+            ('team_delete', 'post', '/datapipeline/api/team_configurations/delete/', {
+                'id': self.team_delete.pk,
+            }, 'json'),
+            ('pdf_start', 'post', '/datapipeline/api/leai_pdf_ingest/start/', {
+                'survey_id': self.start_survey.pk,
+                'attributions': json.dumps({'reflection.pdf': 'student-1'}),
+                'files': [SimpleUploadedFile(
+                    'reflection.pdf', b'%PDF-test', content_type='application/pdf',
+                )],
+            }, 'multipart'),
+            ('pdf_detail', 'get', (
+                f'/datapipeline/api/leai_pdf_ingest/{self.detail_job.pk}/'
+            ), {}, 'query'),
+            ('pdf_abandon', 'delete', (
+                f'/datapipeline/api/leai_pdf_ingest/{self.detail_job.pk}/'
+            ), {}, 'query'),
+            ('pdf_commit', 'post', (
+                f'/datapipeline/api/leai_pdf_ingest/{self.commit_job.pk}/commit/'
+            ), {
+                'items': [{
+                    'filename': 'reflection.pdf',
+                    'student_id': 'student-1',
+                    'mapping': {'__pdf_fulltext__': 'Reflection text'},
+                    'skip': False,
+                }],
+                'dedup_decisions': {},
+            }, 'json'),
+            ('pdf_roster', 'get', '/datapipeline/api/leai_pdf_ingest/roster/', {
+                'survey_id': self.survey.pk,
+            }, 'query'),
+            ('pdf_dedup', 'post', '/datapipeline/api/leai_pdf_ingest/dedup_check/', {
+                'survey_id': self.survey.pk,
+                'student_ids': ['student-1'],
+            }, 'json'),
+            ('pdf_batches', 'get', '/datapipeline/api/leai_pdf_ingest_batches/', {
+                'survey_id': self.revert_survey.pk,
+            }, 'query'),
+            ('pdf_revert', 'post', (
+                f'/datapipeline/api/leai_pdf_ingest_batches/{self.revert_batch.pk}/revert/'
+            ), {}, 'json'),
+        ]
+
+    def call_team_pdf_endpoint(self, method, path, data, encoding, token=None):
+        headers = {}
+        if token:
+            headers['HTTP_AUTHORIZATION'] = f'Bearer {token}'
+        if method == 'get':
+            return self.client.get(path, data=data, **headers)
+        if method == 'delete':
+            return self.client.delete(path, **headers)
+        if encoding == 'multipart':
+            return self.client.post(path, data=data, **headers)
+        return self.client.post(
+            path,
+            data=json.dumps(data),
+            content_type='application/json',
+            **headers,
+        )
+
+    def test_team_and_pdf_methods_reject_missing_and_wrong_course_tokens(self):
+        write_names = {
+            'team_create', 'team_update', 'team_archive', 'team_delete',
+            'pdf_start', 'pdf_abandon', 'pdf_commit', 'pdf_revert',
+        }
+        for name, method, path, data, encoding in self.team_pdf_cases():
+            with self.subTest(name=name, token='missing'):
+                response = self.call_team_pdf_endpoint(method, path, data, encoding)
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json(), {'error': 'authentication_required'})
+            with self.subTest(name=name, token='wrong-course'):
+                response = self.call_team_pdf_endpoint(
+                    method, path, data, encoding, token=self.other_token,
+                )
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(response.json(), {'error': 'course_access_denied'})
+
+        self.assertEqual(
+            InstructorAuditEvent.objects.filter(
+                action=InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED,
+            ).count(),
+            len(write_names),
+        )
+        self.assertTrue(TeamConfiguration.objects.filter(pk=self.team_delete.pk).exists())
+        self.assertTrue(LEAIPdfIngestJob.objects.filter(pk=self.detail_job.pk).exists())
+        self.assertTrue(LEAIPdfIngestJob.objects.filter(pk=self.commit_job.pk).exists())
+        self.assertTrue(FeedbackMessage.objects.filter(pk=self.revert_message.pk).exists())
+
+    def test_reads_need_membership_and_writes_need_publish_capability(self):
+        membership = self.course.memberships.get()
+        membership.role = CourseMembership.ROLE_INSTRUCTOR
+        membership.can_publish = False
+        membership.save(update_fields=['role', 'can_publish'])
+        write_names = {
+            'team_create', 'team_update', 'team_archive', 'team_delete',
+            'pdf_start', 'pdf_abandon', 'pdf_commit', 'pdf_revert',
+        }
+
+        for name, method, path, data, encoding in self.team_pdf_cases():
+            with self.subTest(name=name):
+                response = self.call_team_pdf_endpoint(
+                    method, path, data, encoding, token=self.token,
+                )
+                if name in write_names:
+                    self.assertEqual(response.status_code, 403)
+                    self.assertEqual(response.json(), {'error': 'capability_denied'})
+                else:
+                    self.assertEqual(response.status_code, 200)
+
+        denials = InstructorAuditEvent.objects.filter(
+            action=InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED,
+        )
+        self.assertEqual(denials.count(), len(write_names))
+        self.assertTrue(
+            all(
+                metadata == {'reason_code': 'capability_denied'}
+                for metadata in denials.values_list('metadata', flat=True)
+            ),
+        )
+
+    def test_legacy_team_configuration_flow_remains_compatible_without_actor(self):
+        update_cfg = TeamConfiguration.objects.create(
+            course=self.legacy_course, name='Legacy Update',
+        )
+        archive_cfg = TeamConfiguration.objects.create(
+            course=self.legacy_course, name='Legacy Archive',
+        )
+        delete_cfg = TeamConfiguration.objects.create(
+            course=self.legacy_course, name='Legacy Delete',
+        )
+        cases = [
+            ('get', '/datapipeline/api/team_configurations/', {
+                'course_id': self.legacy_course.course_id,
+            }, 'query'),
+            ('post', '/datapipeline/api/team_configurations/create/', {
+                'course_id': self.legacy_course.course_id,
+                'name': 'Legacy Create',
+                'teams': [],
+            }, 'json'),
+            ('post', '/datapipeline/api/team_configurations/update/', {
+                'id': update_cfg.pk,
+                'name': 'Legacy Updated',
+            }, 'json'),
+            ('post', '/datapipeline/api/team_configurations/archive/', {
+                'id': archive_cfg.pk,
+            }, 'json'),
+            ('post', '/datapipeline/api/team_configurations/delete/', {
+                'id': delete_cfg.pk,
+            }, 'json'),
+        ]
+
+        for method, path, data, encoding in cases:
+            with self.subTest(path=path):
+                response = self.call_team_pdf_endpoint(
+                    method, path, data, encoding,
+                )
+                self.assertEqual(response.status_code, 200)
+
+        self.assertFalse(InstructorAuditEvent.objects.exists())
+
+    def test_owner_flow_emits_exact_write_events_and_no_read_events(self):
+        with patch('datapipeline.leai_pdf_ingest.threading.Thread.start'):
+            responses = []
+            for name, method, path, data, encoding in self.team_pdf_cases():
+                with self.subTest(name=name):
+                    response = self.call_team_pdf_endpoint(
+                        method, path, data, encoding, token=self.token,
+                    )
+                    responses.append((name, response.status_code))
+
+        for name, status in responses:
+            with self.subTest(name=name, status=status):
+                self.assertIn(status, {200, 201, 202, 204})
+
+        expected_actions = {
+            InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_CREATED,
+            InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_UPDATED,
+            InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_ARCHIVED,
+            InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_DELETED,
+            InstructorAuditEvent.ACTION_PDF_INGEST_STARTED,
+            InstructorAuditEvent.ACTION_PDF_INGEST_ABANDONED,
+            InstructorAuditEvent.ACTION_PDF_INGEST_COMMITTED,
+            InstructorAuditEvent.ACTION_PDF_INGEST_REVERTED,
+        }
+        events = InstructorAuditEvent.objects.filter(
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+        )
+        self.assertEqual(events.count(), len(expected_actions))
+        self.assertEqual(set(events.values_list('action', flat=True)), expected_actions)
+        self.assertEqual(
+            events.get(
+                action=InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_UPDATED,
+            ).metadata,
+            {'changed_fields': ['name']},
+        )
+        self.assertEqual(
+            events.get(action=InstructorAuditEvent.ACTION_PDF_INGEST_STARTED).metadata,
+            {'file_count': 1},
+        )
+        self.assertEqual(
+            events.get(action=InstructorAuditEvent.ACTION_PDF_INGEST_COMMITTED).metadata,
+            {'student_count': 1, 'message_count': 1},
+        )
+        self.assertEqual(
+            events.get(action=InstructorAuditEvent.ACTION_PDF_INGEST_REVERTED).metadata,
+            {'deleted_count': 1},
+        )
+
+    def test_team_and_pdf_mutations_roll_back_when_audit_fails(self):
+        mutation_names = {
+            'team_create', 'team_update', 'team_archive', 'team_delete',
+            'pdf_start', 'pdf_abandon', 'pdf_commit', 'pdf_revert',
+        }
+        for name, method, path, data, encoding in self.team_pdf_cases():
+            if name not in mutation_names:
+                continue
+            before = {
+                'team_count': TeamConfiguration.objects.count(),
+                'update_name': TeamConfiguration.objects.get(pk=self.team_update.pk).name,
+                'archive_state': TeamConfiguration.objects.get(pk=self.team_archive.pk).archived,
+                'delete_exists': TeamConfiguration.objects.filter(pk=self.team_delete.pk).exists(),
+                'job_count': LEAIPdfIngestJob.objects.count(),
+                'detail_exists': LEAIPdfIngestJob.objects.filter(pk=self.detail_job.pk).exists(),
+                'commit_exists': LEAIPdfIngestJob.objects.filter(pk=self.commit_job.pk).exists(),
+                'batch_count': LEAIPdfIngestBatch.objects.count(),
+                'revert_message_exists': FeedbackMessage.objects.filter(
+                    pk=self.revert_message.pk,
+                ).exists(),
+                'reverted_at': LEAIPdfIngestBatch.objects.get(
+                    pk=self.revert_batch.pk,
+                ).reverted_at,
+            }
+            with self.subTest(name=name):
+                with patch(
+                    'datapipeline.views.record_instructor_event',
+                    side_effect=ValidationError('audit failed'),
+                ), patch('datapipeline.leai_pdf_ingest.threading.Thread.start'):
+                    self.client.raise_request_exception = False
+                    response = self.call_team_pdf_endpoint(
+                        method, path, data, encoding, token=self.token,
+                    )
+                    self.client.raise_request_exception = True
+                self.assertIn(response.status_code, {400, 500})
+                self.assertEqual(TeamConfiguration.objects.count(), before['team_count'])
+                self.assertEqual(
+                    TeamConfiguration.objects.get(pk=self.team_update.pk).name,
+                    before['update_name'],
+                )
+                self.assertEqual(
+                    TeamConfiguration.objects.get(pk=self.team_archive.pk).archived,
+                    before['archive_state'],
+                )
+                self.assertEqual(
+                    TeamConfiguration.objects.filter(pk=self.team_delete.pk).exists(),
+                    before['delete_exists'],
+                )
+                self.assertEqual(LEAIPdfIngestJob.objects.count(), before['job_count'])
+                self.assertEqual(
+                    LEAIPdfIngestJob.objects.filter(pk=self.detail_job.pk).exists(),
+                    before['detail_exists'],
+                )
+                self.assertEqual(
+                    LEAIPdfIngestJob.objects.filter(pk=self.commit_job.pk).exists(),
+                    before['commit_exists'],
+                )
+                self.assertEqual(LEAIPdfIngestBatch.objects.count(), before['batch_count'])
+                self.assertEqual(
+                    FeedbackMessage.objects.filter(pk=self.revert_message.pk).exists(),
+                    before['revert_message_exists'],
+                )
+                self.assertEqual(
+                    LEAIPdfIngestBatch.objects.get(pk=self.revert_batch.pk).reverted_at,
+                    before['reverted_at'],
+                )
+
+        self.assertFalse(InstructorAuditEvent.objects.exists())
+
+    def test_failed_pdf_commit_and_revert_do_not_emit_success_events(self):
+        self.commit_job.status = LEAIPdfIngestJob.STATUS_FAILED
+        self.commit_job.save(update_fields=['status'])
+        self.revert_batch.reverted_at = timezone.now()
+        self.revert_batch.save(update_fields=['reverted_at'])
+
+        commit = self.call_team_pdf_endpoint(
+            'post',
+            f'/datapipeline/api/leai_pdf_ingest/{self.commit_job.pk}/commit/',
+            {'items': [], 'dedup_decisions': {}},
+            'json',
+            token=self.token,
+        )
+        revert = self.call_team_pdf_endpoint(
+            'post',
+            f'/datapipeline/api/leai_pdf_ingest_batches/{self.revert_batch.pk}/revert/',
+            {},
+            'json',
+            token=self.token,
+        )
+
+        self.assertEqual(commit.status_code, 400)
+        self.assertEqual(revert.status_code, 409)
+        self.assertFalse(InstructorAuditEvent.objects.filter(
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+        ).exists())
 
 class AnalysisEndpointMatrixTests(CourseAndSurveyEndpointMatrixTests):
     test_managed_endpoints_reject_missing_and_wrong_course_tokens = None

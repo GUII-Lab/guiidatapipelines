@@ -643,6 +643,7 @@ def start_pdf_ingest_job(
     files: list[tuple[str, bytes]],
     attributions: dict[str, str],
     created_by: str = "",
+    audit_callback=None,
 ) -> LEAIPdfIngestJob:
     """Create a job row and spawn the background worker.
 
@@ -697,11 +698,14 @@ def start_pdf_ingest_job(
         if fname not in attributions or not attributions[fname]:
             raise ValueError(f"Missing student attribution for {fname}.")
 
-    job = LEAIPdfIngestJob.objects.create(
-        survey=survey,
-        created_by=created_by or "",
-        progress={"processed": 0, "total": len(files)},
-    )
+    with transaction.atomic():
+        job = LEAIPdfIngestJob.objects.create(
+            survey=survey,
+            created_by=created_by or "",
+            progress={"processed": 0, "total": len(files)},
+        )
+        if audit_callback is not None:
+            audit_callback(job)
 
     # Snapshot survey bits the worker needs so it doesn't refetch under
     # a different DB connection (Django + threads + per-conn ORM caches).
@@ -810,6 +814,7 @@ def commit_pdf_ingest_job(
     confirmed_items: list[dict],
     dedup_decisions: dict[str, str],
     committed_by: str = "",
+    audit_callback=None,
 ) -> LEAIPdfIngestBatch:
     """Persist the confirmed mapping as FeedbackMessage rows.
 
@@ -938,10 +943,13 @@ def commit_pdf_ingest_job(
         # Done with the preview — drop the transient job row.
         LEAIPdfIngestJob.objects.filter(pk=job.pk).delete()
 
+        if audit_callback is not None:
+            audit_callback(batch)
+
     return batch
 
 
-def revert_pdf_ingest_batch(batch: LEAIPdfIngestBatch) -> int:
+def revert_pdf_ingest_batch(batch: LEAIPdfIngestBatch, audit_callback=None) -> int:
     """Hard-delete the FeedbackMessage rows the batch created.
 
     Idempotent for the row-delete itself; the second call will see
@@ -955,6 +963,8 @@ def revert_pdf_ingest_batch(batch: LEAIPdfIngestBatch) -> int:
         batch.save(update_fields=["reverted_at"])
         if batch.survey and batch.survey.course_id:
             LEAIQuickTake.objects.filter(course_id=batch.survey.course_id).delete()
+        if audit_callback is not None:
+            audit_callback(batch, deleted_count)
     return deleted_count
 
 

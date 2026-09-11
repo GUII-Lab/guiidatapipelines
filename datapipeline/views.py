@@ -2878,6 +2878,12 @@ def list_team_configurations(request):
         course = Course.objects.get(course_id=course_id)
     except Course.DoesNotExist:
         return JsonResponse({'error': 'Course not found'}, status=404)
+    _account, _session, _membership, error = _authorize_course_endpoint(
+        request,
+        course,
+    )
+    if error is not None:
+        return error
     include_archived = request.GET.get('include_archived') in ('1', 'true')
     qs = TeamConfiguration.objects.filter(course=course)
     if not include_archived:
@@ -2905,6 +2911,15 @@ def create_team_configuration(request):
         except Course.DoesNotExist:
             return JsonResponse({'error': 'Course not found'}, status=404)
 
+        account, session, _membership, error = _authorize_course_endpoint(
+            request,
+            course,
+            capability='publish',
+            audit_denial=True,
+        )
+        if error is not None:
+            return error
+
         siblings = list(TeamConfiguration.objects.filter(course=course, archived=False))
         sibling_names = {c.name for c in siblings}
         # Auto-dedupe: "Primary" → "Primary 2" → "Primary 3"
@@ -2927,6 +2942,16 @@ def create_team_configuration(request):
                     size=int(t['size']),
                     display_name=(t.get('display_name') or '').strip(),
                 )
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_CREATED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=session,
+                    course=course,
+                    target_type='team_configuration',
+                    target_id=cfg.pk,
+                )
         return JsonResponse(_team_configuration_to_dict(cfg))
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=400)
@@ -2947,6 +2972,16 @@ def update_team_configuration(request):
         except TeamConfiguration.DoesNotExist:
             return JsonResponse({'error': 'Configuration not found'}, status=404)
 
+        account, session, _membership, error = _authorize_course_endpoint(
+            request,
+            cfg.course,
+            capability='publish',
+            audit_denial=True,
+        )
+        if error is not None:
+            return error
+
+        changed_fields = []
         with transaction.atomic():
             if 'name' in data and data['name']:
                 new_name = data['name'].strip()
@@ -2962,15 +2997,20 @@ def update_team_configuration(request):
                         n += 1
                     new_name = f'{new_name} {n}'
                 cfg.name = new_name
+                changed_fields.append('name')
             if 'label_prefix' in data:
                 cfg.label_prefix = data['label_prefix']
+                changed_fields.append('label_prefix')
             if 'color' in data and data['color'] in dict(COLOR_CHOICES):
                 cfg.color = data['color']
+                changed_fields.append('color')
             if 'archived' in data:
                 cfg.archived = bool(data['archived'])
+                changed_fields.append('archived')
             cfg.save()
 
             if 'teams' in data:
+                changed_fields.append('teams')
                 # Replace the teams wholesale. Preserve existing ids where number matches
                 # so any downstream references don't break.
                 existing_by_number = {t.number: t for t in cfg.teams.all()}
@@ -3028,6 +3068,18 @@ def update_team_configuration(request):
                     obsolete = snap.teams.exclude(number__in=incoming_numbers)
                     obsolete.filter(assignments__isnull=True).delete()
 
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_UPDATED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=session,
+                    course=cfg.course,
+                    target_type='team_configuration',
+                    target_id=cfg.pk,
+                    metadata={'changed_fields': changed_fields},
+                )
+
         return JsonResponse(_team_configuration_to_dict(cfg))
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=400)
@@ -3045,8 +3097,27 @@ def archive_team_configuration(request):
             cfg = TeamConfiguration.objects.get(id=cfg_id)
         except TeamConfiguration.DoesNotExist:
             return JsonResponse({'error': 'Configuration not found'}, status=404)
-        cfg.archived = True
-        cfg.save()
+        account, session, _membership, error = _authorize_course_endpoint(
+            request,
+            cfg.course,
+            capability='publish',
+            audit_denial=True,
+        )
+        if error is not None:
+            return error
+        with transaction.atomic():
+            cfg.archived = True
+            cfg.save(update_fields=['archived', 'updated_at'])
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_ARCHIVED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=session,
+                    course=cfg.course,
+                    target_type='team_configuration',
+                    target_id=cfg.pk,
+                )
         return JsonResponse({'ok': True})
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=400)
@@ -3065,11 +3136,32 @@ def delete_team_configuration(request):
             cfg = TeamConfiguration.objects.get(id=cfg_id)
         except TeamConfiguration.DoesNotExist:
             return JsonResponse({'error': 'Configuration not found'}, status=404)
+        account, session, _membership, error = _authorize_course_endpoint(
+            request,
+            cfg.course,
+            capability='publish',
+            audit_denial=True,
+        )
+        if error is not None:
+            return error
         if SurveyTeamSnapshot.objects.filter(source_configuration=cfg).exists():
             return JsonResponse({
                 'error': 'configuration is referenced by surveys; archive instead',
             }, status=409)
-        cfg.delete()
+        course = cfg.course
+        target_id = cfg.pk
+        with transaction.atomic():
+            cfg.delete()
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_TEAM_CONFIGURATION_DELETED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=session,
+                    course=course,
+                    target_type='team_configuration',
+                    target_id=target_id,
+                )
         return JsonResponse({'ok': True})
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=400)
@@ -3218,9 +3310,20 @@ def leai_pdf_ingest_start(request):
     if not survey_id:
         return JsonResponse({'error': 'survey_id is required'}, status=400)
     try:
-        survey = FeedbackGPT.objects.select_related('form_schema').get(pk=int(survey_id))
+        survey = FeedbackGPT.objects.select_related('form_schema', 'course').get(
+            pk=int(survey_id),
+        )
     except (FeedbackGPT.DoesNotExist, ValueError, TypeError):
         return JsonResponse({'error': 'Survey not found'}, status=404)
+
+    account, session, _membership, error = _authorize_course_endpoint(
+        request,
+        survey.course,
+        capability='publish',
+        audit_denial=True,
+    )
+    if error is not None:
+        return error
 
     # PDF ingest supports two shapes:
     #   - form survey WITH a bound schema  -> section-mapped responses (existing)
@@ -3255,12 +3358,29 @@ def leai_pdf_ingest_start(request):
         files.append((f.name, f.read()))
 
     from . import leai_pdf_ingest
+    audit_callback = None
+    if account is not None:
+        audit_callback = lambda job: record_instructor_event(
+            action=InstructorAuditEvent.ACTION_PDF_INGEST_STARTED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=account,
+            session=session,
+            course=survey.course,
+            target_type='pdf_ingest_job',
+            target_id=job.pk,
+            metadata={'file_count': len(files)},
+        )
     try:
         job = leai_pdf_ingest.start_pdf_ingest_job(
             survey=survey,
             files=files,
             attributions={str(k): str(v) for k, v in attributions.items()},
-            created_by=request.POST.get('created_by') or '',
+            created_by=(
+                account.email
+                if account is not None
+                else request.POST.get('created_by') or ''
+            ),
+            audit_callback=audit_callback,
         )
     except leai_pdf_ingest.IngestJobConflict as e:
         # 409 + the existing job descriptor so the frontend can resume
@@ -3283,14 +3403,40 @@ def leai_pdf_ingest_detail(request, job_id):
     DELETE — abandon a preview without committing.
     """
     try:
-        job = LEAIPdfIngestJob.objects.select_related('survey', 'survey__form_schema').get(pk=job_id)
+        job = LEAIPdfIngestJob.objects.select_related(
+            'survey',
+            'survey__course',
+            'survey__form_schema',
+        ).get(pk=job_id)
     except LEAIPdfIngestJob.DoesNotExist:
         return JsonResponse({'error': 'Job not found'}, status=404)
+
+    account, session, _membership, error = _authorize_course_endpoint(
+        request,
+        job.survey.course,
+        capability='publish' if request.method == 'DELETE' else None,
+        audit_denial=request.method == 'DELETE',
+    )
+    if error is not None:
+        return error
 
     if request.method == 'GET':
         return JsonResponse(_job_to_dict(job))
     if request.method == 'DELETE':
-        job.delete()
+        course = job.survey.course
+        target_id = job.pk
+        with transaction.atomic():
+            job.delete()
+            if account is not None:
+                record_instructor_event(
+                    action=InstructorAuditEvent.ACTION_PDF_INGEST_ABANDONED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=account,
+                    session=session,
+                    course=course,
+                    target_type='pdf_ingest_job',
+                    target_id=target_id,
+                )
         return HttpResponse(status=204)
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
@@ -3308,9 +3454,21 @@ def leai_pdf_ingest_commit(request, job_id):
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
     try:
-        job = LEAIPdfIngestJob.objects.select_related('survey', 'survey__form_schema').get(pk=job_id)
+        job = LEAIPdfIngestJob.objects.select_related(
+            'survey',
+            'survey__course',
+            'survey__form_schema',
+        ).get(pk=job_id)
     except LEAIPdfIngestJob.DoesNotExist:
         return JsonResponse({'error': 'Job not found'}, status=404)
+    account, session, _membership, error = _authorize_course_endpoint(
+        request,
+        job.survey.course,
+        capability='publish',
+        audit_denial=True,
+    )
+    if error is not None:
+        return error
     try:
         data = json.loads(request.body or '{}')
     except json.JSONDecodeError:
@@ -3345,12 +3503,30 @@ def leai_pdf_ingest_commit(request, job_id):
             }, status=400)
 
     from . import leai_pdf_ingest
+    audit_callback = None
+    if account is not None:
+        audit_callback = lambda batch: record_instructor_event(
+            action=InstructorAuditEvent.ACTION_PDF_INGEST_COMMITTED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=account,
+            session=session,
+            course=job.survey.course,
+            target_type='pdf_ingest_batch',
+            target_id=batch.pk,
+            metadata={
+                'student_count': batch.student_count,
+                'message_count': batch.message_count,
+            },
+        )
     try:
         batch = leai_pdf_ingest.commit_pdf_ingest_job(
             job=job,
             confirmed_items=items,
             dedup_decisions={str(k): str(v) for k, v in dedup.items()},
-            committed_by=str(committed_by),
+            committed_by=(
+                account.email if account is not None else str(committed_by)
+            ),
+            audit_callback=audit_callback,
         )
     except ValueError as e:
         return JsonResponse({'error': str(e)}, status=400)
@@ -3388,6 +3564,13 @@ def leai_pdf_ingest_roster(request):
         survey = FeedbackGPT.objects.select_related('course').get(pk=int(survey_id))
     except (FeedbackGPT.DoesNotExist, ValueError, TypeError):
         return JsonResponse({'error': 'Survey not found'}, status=404)
+
+    _account, _session, _membership, error = _authorize_course_endpoint(
+        request,
+        survey.course,
+    )
+    if error is not None:
+        return error
 
     course = survey.course
     course_surveys = FeedbackGPT.objects.filter(course=course).values_list('id', flat=True) if course else [survey.id]
@@ -3445,9 +3628,15 @@ def leai_pdf_ingest_dedup_check(request):
     if not survey_id or not isinstance(student_ids, list):
         return JsonResponse({'error': 'survey_id + student_ids required'}, status=400)
     try:
-        survey = FeedbackGPT.objects.get(pk=int(survey_id))
+        survey = FeedbackGPT.objects.select_related('course').get(pk=int(survey_id))
     except (FeedbackGPT.DoesNotExist, ValueError, TypeError):
         return JsonResponse({'error': 'Survey not found'}, status=404)
+    _account, _session, _membership, error = _authorize_course_endpoint(
+        request,
+        survey.course,
+    )
+    if error is not None:
+        return error
     from . import leai_pdf_ingest
     existing = leai_pdf_ingest.detect_existing_pdf_students(
         survey=survey,
@@ -3469,7 +3658,17 @@ def leai_pdf_ingest_batches_list(request):
     survey_id = request.GET.get('survey_id')
     if not survey_id:
         return JsonResponse({'error': 'survey_id is required'}, status=400)
-    qs = LEAIPdfIngestBatch.objects.filter(survey_id=survey_id)
+    try:
+        survey = FeedbackGPT.objects.select_related('course').get(pk=int(survey_id))
+    except (FeedbackGPT.DoesNotExist, ValueError, TypeError):
+        return JsonResponse({'error': 'Survey not found'}, status=404)
+    _account, _session, _membership, error = _authorize_course_endpoint(
+        request,
+        survey.course,
+    )
+    if error is not None:
+        return error
+    qs = LEAIPdfIngestBatch.objects.filter(survey=survey)
     if request.GET.get('include_reverted') not in ('1', 'true', 'yes'):
         qs = qs.filter(reverted_at__isnull=True)
     return JsonResponse([_batch_to_dict(b) for b in qs.order_by('-created_at')[:100]], safe=False)
@@ -3486,12 +3685,40 @@ def leai_pdf_ingest_batch_revert(request, batch_id):
     if request.method != 'POST':
         return JsonResponse({'error': 'Method not allowed'}, status=405)
     try:
-        batch = LEAIPdfIngestBatch.objects.select_related('survey').get(pk=batch_id)
+        batch = LEAIPdfIngestBatch.objects.select_related(
+            'survey',
+            'survey__course',
+        ).get(pk=batch_id)
     except LEAIPdfIngestBatch.DoesNotExist:
         return JsonResponse({'error': 'Batch not found'}, status=404)
+    account, session, _membership, error = _authorize_course_endpoint(
+        request,
+        batch.survey.course,
+        capability='publish',
+        audit_denial=True,
+    )
+    if error is not None:
+        return error
     if batch.reverted_at:
         return JsonResponse({'error': 'Batch already reverted', 'batch': _batch_to_dict(batch)}, status=409)
     from . import leai_pdf_ingest
-    deleted = leai_pdf_ingest.revert_pdf_ingest_batch(batch)
+    audit_callback = None
+    if account is not None:
+        audit_callback = lambda reverted_batch, deleted_count: (
+            record_instructor_event(
+                action=InstructorAuditEvent.ACTION_PDF_INGEST_REVERTED,
+                outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                actor=account,
+                session=session,
+                course=reverted_batch.survey.course,
+                target_type='pdf_ingest_batch',
+                target_id=reverted_batch.pk,
+                metadata={'deleted_count': deleted_count},
+            )
+        )
+    deleted = leai_pdf_ingest.revert_pdf_ingest_batch(
+        batch,
+        audit_callback=audit_callback,
+    )
     batch.refresh_from_db()
     return JsonResponse({'deleted_count': deleted, 'batch': _batch_to_dict(batch)})
