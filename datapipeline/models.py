@@ -357,6 +357,11 @@ class InstructorAuditEvent(models.Model):
     ACTION_PDF_INGEST_ABANDONED = 'pdf_ingest.abandoned'
     ACTION_PDF_INGEST_COMMITTED = 'pdf_ingest.committed'
     ACTION_PDF_INGEST_REVERTED = 'pdf_ingest.reverted'
+    ACTION_QUESTION_SET_DRAFT_CREATED = 'question_set.draft_created'
+    ACTION_QUESTION_SET_DRAFT_SAVED = 'question_set.draft_saved'
+    ACTION_QUESTION_SET_REVISION_FROZEN = 'question_set.revision_frozen'
+    ACTION_QUESTION_SET_PREVIEW_STARTED = 'question_set.preview_started'
+    ACTION_QUESTION_SET_PREVIEW_COMPLETED = 'question_set.preview_completed'
     ACTION_AUTHORIZATION_DENIED = 'authorization.denied'
 
     ACTION_CHOICES = [
@@ -388,6 +393,11 @@ class InstructorAuditEvent(models.Model):
         (ACTION_PDF_INGEST_ABANDONED, 'PDF ingest abandoned'),
         (ACTION_PDF_INGEST_COMMITTED, 'PDF ingest committed'),
         (ACTION_PDF_INGEST_REVERTED, 'PDF ingest reverted'),
+        (ACTION_QUESTION_SET_DRAFT_CREATED, 'Question set draft created'),
+        (ACTION_QUESTION_SET_DRAFT_SAVED, 'Question set draft saved'),
+        (ACTION_QUESTION_SET_REVISION_FROZEN, 'Question set revision frozen'),
+        (ACTION_QUESTION_SET_PREVIEW_STARTED, 'Question set preview started'),
+        (ACTION_QUESTION_SET_PREVIEW_COMPLETED, 'Question set preview completed'),
         (ACTION_AUTHORIZATION_DENIED, 'Authorization denied'),
     ]
 
@@ -757,6 +767,279 @@ class FormSchema(models.Model):
 
     def __str__(self):
         return f'{self.schema_id} ({self.title})'
+
+
+class QuestionSet(models.Model):
+    AUDIENCE_INDIVIDUAL = 'individual'
+    AUDIENCE_CHOICES = [
+        (AUDIENCE_INDIVIDUAL, 'Individual structured reflection'),
+    ]
+
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    course = models.ForeignKey(
+        Course,
+        on_delete=models.PROTECT,
+        related_name='question_sets',
+    )
+    owner = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        related_name='owned_question_sets',
+    )
+    template_id = models.CharField(max_length=64)
+    title = models.CharField(max_length=200)
+    audience = models.CharField(
+        max_length=20,
+        choices=AUDIENCE_CHOICES,
+        default=AUDIENCE_INDIVIDUAL,
+    )
+    archived_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at', '-id']
+        indexes = [
+            models.Index(
+                fields=['course', 'archived_at', '-updated_at'],
+                name='leai_qset_course_active',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.title} ({self.course.course_id})'
+
+
+class ImmutableQuestionSetRevisionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError('Question set revisions are immutable.')
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError('Question set revisions are immutable.')
+
+    def delete(self):
+        raise ValidationError('Question set revisions are immutable.')
+
+
+class QuestionSetRevision(models.Model):
+    objects = ImmutableQuestionSetRevisionQuerySet.as_manager()
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    question_set = models.ForeignKey(
+        QuestionSet,
+        on_delete=models.PROTECT,
+        related_name='revisions',
+    )
+    revision_number = models.PositiveIntegerField()
+    source_draft_version = models.PositiveIntegerField()
+    canonical_body = models.JSONField()
+    compiled_protocol = models.JSONField()
+    content_hash = models.CharField(max_length=64)
+    compiler_version = models.CharField(max_length=32, default='1')
+    engine_version = models.CharField(max_length=32, default='formmode-v1')
+    created_by = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        related_name='created_question_set_revisions',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['question_set_id', 'revision_number']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['question_set', 'revision_number'],
+                name='leai_unique_qset_revision_number',
+            ),
+            models.UniqueConstraint(
+                fields=['question_set', 'content_hash'],
+                name='leai_unique_qset_revision_hash',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self).objects.filter(pk=self.pk).values(
+                'public_id',
+                'question_set_id',
+                'revision_number',
+                'source_draft_version',
+                'canonical_body',
+                'compiled_protocol',
+                'content_hash',
+                'compiler_version',
+                'engine_version',
+                'created_by_id',
+                'created_at',
+            ).first()
+            current = {
+                'public_id': self.public_id,
+                'question_set_id': self.question_set_id,
+                'revision_number': self.revision_number,
+                'source_draft_version': self.source_draft_version,
+                'canonical_body': self.canonical_body,
+                'compiled_protocol': self.compiled_protocol,
+                'content_hash': self.content_hash,
+                'compiler_version': self.compiler_version,
+                'engine_version': self.engine_version,
+                'created_by_id': self.created_by_id,
+                'created_at': self.created_at,
+            }
+            if stored is not None and stored != current:
+                raise ValidationError('Question set revisions are immutable.')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError('Question set revisions are immutable.')
+
+    def __str__(self):
+        return f'{self.question_set.title} v{self.revision_number}'
+
+
+class QuestionSetDraft(models.Model):
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    question_set = models.OneToOneField(
+        QuestionSet,
+        on_delete=models.CASCADE,
+        related_name='draft',
+    )
+    base_revision = models.ForeignKey(
+        QuestionSetRevision,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='based_drafts',
+    )
+    body = models.JSONField()
+    version = models.PositiveIntegerField(default=1)
+    updated_by = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        related_name='updated_question_set_drafts',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at', '-id']
+
+    def __str__(self):
+        return f'Draft for {self.question_set.title}'
+
+
+class QuestionSetValidationRun(models.Model):
+    draft = models.ForeignKey(
+        QuestionSetDraft,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='validation_runs',
+    )
+    revision = models.ForeignKey(
+        QuestionSetRevision,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='validation_runs',
+    )
+    is_valid = models.BooleanField()
+    result = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(draft__isnull=False, revision__isnull=True)
+                    | models.Q(draft__isnull=True, revision__isnull=False)
+                ),
+                name='leai_validation_one_source',
+            ),
+        ]
+
+
+class PreviewSession(models.Model):
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    revision = models.ForeignKey(
+        QuestionSetRevision,
+        on_delete=models.PROTECT,
+        related_name='preview_sessions',
+    )
+    instructor = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        related_name='question_set_preview_sessions',
+    )
+    token_digest = models.CharField(max_length=64, unique=True)
+    expires_at = models.DateTimeField()
+    completed_at = models.DateTimeField(null=True, blank=True)
+    next_message_sequence = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+        indexes = [
+            models.Index(
+                fields=['revision', 'completed_at'],
+                name='leai_preview_revision_done',
+            ),
+        ]
+
+    @property
+    def is_valid(self):
+        return self.expires_at > timezone.now()
+
+
+class PreviewMessage(models.Model):
+    ROLE_USER = 'user'
+    ROLE_ASSISTANT = 'assistant'
+    ROLE_CHOICES = [
+        (ROLE_USER, 'User'),
+        (ROLE_ASSISTANT, 'Assistant'),
+    ]
+
+    preview_session = models.ForeignKey(
+        PreviewSession,
+        on_delete=models.CASCADE,
+        related_name='messages',
+    )
+    sequence = models.PositiveIntegerField()
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES)
+    content = models.TextField()
+    attribution = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['sequence', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['preview_session', 'sequence'],
+                name='leai_unique_preview_message_sequence',
+            ),
+        ]
+
+
+class QuestionSetSurvey(models.Model):
+    survey = models.OneToOneField(
+        FeedbackGPT,
+        on_delete=models.PROTECT,
+        related_name='question_set_link',
+    )
+    revision = models.ForeignKey(
+        QuestionSetRevision,
+        on_delete=models.PROTECT,
+        related_name='survey_links',
+    )
+    idempotency_key = models.CharField(max_length=100, unique=True)
+    created_by = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        related_name='created_question_set_surveys',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
 
 
 # ================= In-Group feedback models =================

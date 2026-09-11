@@ -186,6 +186,58 @@ class FormSchemaAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+class ImmutableQuestionSetAdmin(admin.ModelAdmin):
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(QuestionSet)
+class QuestionSetAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('public_id', 'title', 'course', 'owner', 'template_id', 'updated_at')
+    list_filter = ('audience', 'course', 'archived_at')
+    search_fields = ('=public_id', 'title', 'course__course_id', 'owner__email')
+    list_select_related = ('course', 'owner')
+
+
+@admin.register(QuestionSetDraft)
+class QuestionSetDraftAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('public_id', 'question_set', 'version', 'updated_by', 'updated_at')
+    search_fields = ('=public_id', 'question_set__title', 'question_set__course__course_id')
+    list_select_related = ('question_set', 'question_set__course', 'updated_by')
+
+
+@admin.register(QuestionSetRevision)
+class QuestionSetRevisionAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('public_id', 'question_set', 'revision_number', 'created_by', 'created_at')
+    search_fields = ('=public_id', 'question_set__title', 'content_hash')
+    list_select_related = ('question_set', 'created_by')
+
+
+@admin.register(PreviewSession)
+class PreviewSessionAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('public_id', 'revision', 'instructor', 'created_at', 'expires_at', 'completed_at')
+    list_filter = ('created_at', 'expires_at', 'completed_at')
+    search_fields = ('=public_id', 'instructor__email', 'revision__question_set__title')
+    exclude = ('token_digest',)
+    list_select_related = ('revision', 'revision__question_set', 'instructor')
+
+
+@admin.register(QuestionSetSurvey)
+class QuestionSetSurveyAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('survey', 'revision', 'created_by', 'created_at')
+    search_fields = ('survey__public_id', 'survey__name', 'revision__question_set__title')
+    list_select_related = ('survey', 'revision', 'revision__question_set', 'created_by')
+
+
 class TeamInline(admin.TabularInline):
     model = Team
     extra = 0

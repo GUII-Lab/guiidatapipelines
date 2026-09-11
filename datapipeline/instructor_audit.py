@@ -42,6 +42,11 @@ ALLOWED_METADATA_KEYS = {
         'message_count',
     }),
     InstructorAuditEvent.ACTION_PDF_INGEST_REVERTED: frozenset({'deleted_count'}),
+    InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_CREATED: frozenset(),
+    InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_SAVED: frozenset(),
+    InstructorAuditEvent.ACTION_QUESTION_SET_REVISION_FROZEN: frozenset(),
+    InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_STARTED: frozenset(),
+    InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_COMPLETED: frozenset(),
     InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED: frozenset({'reason_code'}),
 }
 
@@ -137,6 +142,11 @@ TARGET_TYPE_BY_ACTION = {
     InstructorAuditEvent.ACTION_PDF_INGEST_ABANDONED: 'pdf_ingest_job',
     InstructorAuditEvent.ACTION_PDF_INGEST_COMMITTED: 'pdf_ingest_batch',
     InstructorAuditEvent.ACTION_PDF_INGEST_REVERTED: 'pdf_ingest_batch',
+    InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_CREATED: 'question_set',
+    InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_SAVED: 'question_set',
+    InstructorAuditEvent.ACTION_QUESTION_SET_REVISION_FROZEN: 'question_set',
+    InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_STARTED: 'question_set',
+    InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_COMPLETED: 'question_set',
     InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED: 'course',
 }
 
@@ -149,6 +159,7 @@ UUID_TARGET_TYPES = frozenset({
     'analysis_session',
     'pdf_ingest_job',
     'pdf_ingest_batch',
+    'question_set',
 })
 
 

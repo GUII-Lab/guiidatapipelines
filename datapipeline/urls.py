@@ -2,6 +2,7 @@ from django.urls import path
 
 from . import views
 from . import instructor_views
+from . import question_set_views
 from .views import *
 
 urlpatterns = [
@@ -42,6 +43,16 @@ urlpatterns = [
     path('api/create_feedback_gpt/', create_feedback_gpt, name='create_feedback_gpt'),
     path('api/feedback_gpts_by_course/', feedback_gpts_by_course, name='feedback_gpts_by_course'),
     path('api/get_feedback_gpt_by_public_id/', get_feedback_gpt_by_public_id, name='get_feedback_gpt_by_public_id'),
+    # Instructor self-service question-set Wizard
+    path('api/question_set_templates/', question_set_views.question_set_templates, name='question_set_templates'),
+    path('api/question_set_drafts/', question_set_views.question_set_drafts, name='question_set_drafts'),
+    path('api/question_set_drafts/<uuid:draft_id>/', question_set_views.question_set_draft_detail, name='question_set_draft_detail'),
+    path('api/question_set_drafts/<uuid:draft_id>/freeze/', question_set_views.question_set_draft_freeze, name='question_set_draft_freeze'),
+    path('api/question_set_revisions/<uuid:revision_id>/preview_capability/', question_set_views.question_set_preview_capability, name='question_set_preview_capability'),
+    path('api/question_set_revisions/<uuid:revision_id>/surveys/', question_set_views.question_set_revision_surveys, name='question_set_revision_surveys'),
+    path('api/question_set_preview/<str:raw_token>/', question_set_views.question_set_preview, name='question_set_preview'),
+    path('api/question_set_preview/<str:raw_token>/messages/', question_set_views.question_set_preview_messages, name='question_set_preview_messages'),
+    path('api/question_set_preview/<str:raw_token>/complete/', question_set_views.question_set_preview_complete, name='question_set_preview_complete'),
     # Form-mode schema registry (read-only for now; edits via Django admin)
     path('api/form_schemas/', list_form_schemas, name='list_form_schemas'),
     path('api/form_schemas/<str:schema_id>/', get_form_schema, name='get_form_schema'),

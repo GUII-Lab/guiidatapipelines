@@ -165,6 +165,21 @@ class ResponseSessionPersistenceTests(ResponseSessionFixtures, TestCase):
         self.assertEqual(first.sequence, 1)
         self.assertEqual(second.sequence, 1)
 
+    def test_course_less_legacy_survey_keeps_loose_message_compatibility(self):
+        legacy = FeedbackGPT.objects.create(
+            public_id='legacy-no-course',
+            name='Legacy form survey',
+            instructions='Ask for feedback.',
+            course=None,
+            mode='form',
+        )
+
+        message = persist_feedback_messages([self.message_payload(legacy)])[0]
+
+        self.assertIsNone(message.response_session_id)
+        self.assertIsNone(message.sequence)
+        self.assertFalse(ResponseSession.objects.filter(survey=legacy).exists())
+
     def test_batch_is_fully_validated_before_any_rows_are_written(self):
         payloads = [
             self.message_payload(self.survey),

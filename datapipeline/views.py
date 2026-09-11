@@ -18,6 +18,7 @@ from .response_sessions import (
     ResponseWriteValidationError,
     persist_feedback_messages,
 )
+from .question_sets import QUESTION_SET_EFFECTIVE_SETTINGS
 import json
 import os
 import secrets
@@ -166,7 +167,10 @@ def feedback_message_api(request):
     return JsonResponse({
         'status': 'success',
         'message': 'Feedback message saved successfully',
-        'response_session_id': str(feedback_message.response_session.public_id),
+        'response_session_id': (
+            str(feedback_message.response_session.public_id)
+            if feedback_message.response_session_id else None
+        ),
         'sequence': feedback_message.sequence,
     })
 
@@ -215,6 +219,8 @@ def feedback_messages_bulk_api(request):
     seen_sessions = set()
     for message in messages:
         session = message.response_session
+        if session is None:
+            continue
         if session.pk in seen_sessions:
             continue
         seen_sessions.add(session.pk)
@@ -1095,6 +1101,10 @@ def feedback_gpts_by_course(request):
             msg_count = FeedbackMessage.objects.filter(gpt_id=gpt.id).count()
             avg_turns = round(msg_count / session_count) if session_count else 0
             snap = getattr(gpt, 'team_snapshot', None)
+            question_set_link = getattr(gpt, 'question_set_link', None)
+            question_set_revision = (
+                question_set_link.revision if question_set_link else None
+            )
             result.append({
                 'id': gpt.id,
                 'public_id': gpt.public_id,
@@ -1114,7 +1124,18 @@ def feedback_gpts_by_course(request):
                 'team_configuration_id': snap.source_configuration_id if snap else None,
                 'team_snapshot_name': snap.name if snap else None,
                 'team_snapshot_color': snap.color if snap else None,
-                'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
+                'form_schema_id': (
+                    gpt.form_schema.schema_id
+                    if gpt.form_schema_id
+                    else (
+                        question_set_revision.compiled_protocol.get('schema_id')
+                        if question_set_revision else None
+                    )
+                ),
+                'question_set_revision_id': (
+                    str(question_set_revision.public_id)
+                    if question_set_revision else None
+                ),
             })
         return JsonResponse(result, safe=False)
     return HttpResponse(status=405)
@@ -1146,8 +1167,26 @@ def get_feedback_gpt_by_public_id(request):
             reason = 'expired'
 
         snap = getattr(gpt, 'team_snapshot', None)
-        course_banner = None
-        if gpt.course:
+        question_set_link = getattr(gpt, 'question_set_link', None)
+        question_set_revision = (
+            question_set_link.revision if question_set_link else None
+        )
+        question_set_protocol = (
+            question_set_revision.compiled_protocol
+            if question_set_revision else None
+        )
+        question_set_settings = (
+            question_set_protocol.get(
+                'effective_settings',
+                QUESTION_SET_EFFECTIVE_SETTINGS,
+            )
+            if question_set_protocol else None
+        )
+        course_banner = (
+            question_set_settings.get('course_banner')
+            if question_set_settings is not None else None
+        )
+        if question_set_settings is None and gpt.course:
             course_banner = _course_banner_dict(gpt.course)
             # Resolve and persist the per-session A/B decision. session_id is
             # the anonymous client session; absent for a bare preview load.
@@ -1171,18 +1210,53 @@ def get_feedback_gpt_by_public_id(request):
             'course_banner': course_banner,
             # Course-level name for the AI message tag (replaces "LEAI"). Always
             # resolved to a usable string so feedback.html can use it directly.
-            'bot_display_name': _resolve_bot_name(gpt.course),
+            'bot_display_name': (
+                question_set_settings['bot_display_name']
+                if question_set_settings is not None
+                else _resolve_bot_name(gpt.course)
+            ),
             # POINT TO A HUMAN referral gate config. feedback.html overlays
             # these onto the form schema so the engine's 7th turn gate can arm.
-            'referral_enabled': bool(gpt.course.referral_enabled) if gpt.course else False,
-            'referral_text': _resolve_referral_text(gpt.course),
+            'referral_enabled': (
+                bool(question_set_settings['referral_enabled'])
+                if question_set_settings is not None
+                else bool(gpt.course.referral_enabled) if gpt.course else False
+            ),
+            'referral_text': (
+                question_set_settings['referral_text']
+                if question_set_settings is not None
+                else _resolve_referral_text(gpt.course)
+            ),
             # When true, feedback.html silently records device signals for
             # cross-week clustering (register_session_identity).
-            'identity_tracking_enabled': bool(gpt.course.identity_tracking_enabled) if gpt.course else False,
-            'completion_certificate_enabled': bool(gpt.course.completion_certificate_enabled) if gpt.course else False,
-            'parsed_document_download_enabled': bool(gpt.course.parsed_document_download_enabled) if gpt.course else False,
+            'identity_tracking_enabled': (
+                bool(question_set_settings['identity_tracking_enabled'])
+                if question_set_settings is not None
+                else bool(gpt.course.identity_tracking_enabled) if gpt.course else False
+            ),
+            'completion_certificate_enabled': (
+                bool(question_set_settings['completion_certificate_enabled'])
+                if question_set_settings is not None
+                else bool(gpt.course.completion_certificate_enabled) if gpt.course else False
+            ),
+            'parsed_document_download_enabled': (
+                bool(question_set_settings['parsed_document_download_enabled'])
+                if question_set_settings is not None
+                else bool(gpt.course.parsed_document_download_enabled) if gpt.course else False
+            ),
             'team_snapshot': _survey_snapshot_to_dict(snap) if snap else None,
-            'form_schema_id': gpt.form_schema.schema_id if gpt.form_schema_id else None,
+            'form_schema_id': (
+                gpt.form_schema.schema_id
+                if gpt.form_schema_id
+                else (
+                    question_set_protocol.get('schema_id')
+                    if question_set_protocol else None
+                )
+            ),
+            'question_set_revision_id': (
+                str(question_set_revision.public_id)
+                if question_set_revision else None
+            ),
             # Inline the schema body so feedback.html doesn't need a second
             # round-trip to render Area-N-of-N transitions on first paint.
             'form_schema': (
@@ -1192,7 +1266,15 @@ def get_feedback_gpt_by_public_id(request):
                     'title': gpt.form_schema.title,
                     'body': gpt.form_schema.body,
                 }
-                if gpt.form_schema_id else None
+                if gpt.form_schema_id else (
+                    {
+                        'schema_id': question_set_protocol['schema_id'],
+                        'version': question_set_protocol['version'],
+                        'title': question_set_protocol['title'],
+                        'body': question_set_protocol,
+                    }
+                    if question_set_protocol else None
+                )
             ),
         })
 
@@ -1519,6 +1601,16 @@ def update_survey(request):
         if error is not None:
             return error
 
+        if QuestionSetSurvey.objects.filter(survey_id=gpt.pk).exists():
+            return JsonResponse({
+                'error': 'question_set_managed',
+                'detail': (
+                    'This structured reflection is pinned to an immutable '
+                    'question-set revision and cannot be edited through the '
+                    'legacy survey endpoint.'
+                ),
+            }, status=409)
+
         updatable = [
             'name',
             'survey_label',
@@ -1701,6 +1793,15 @@ def delete_survey(request):
             )
             if error is not None:
                 return error
+            if QuestionSetSurvey.objects.filter(survey_id=gpt.pk).exists():
+                return JsonResponse({
+                    'error': 'question_set_managed',
+                    'detail': (
+                        'Structured reflections cannot be permanently deleted '
+                        'in this release. Close the survey to preserve its '
+                        'revision and creation history.'
+                    ),
+                }, status=409)
             target_id = gpt.pk
             course = gpt.course
             with transaction.atomic():
@@ -1751,6 +1852,16 @@ def clone_survey(request):
             )
             if error is not None:
                 return error
+
+            if QuestionSetSurvey.objects.filter(survey_id=src.pk).exists():
+                return JsonResponse({
+                    'error': 'question_set_managed',
+                    'detail': (
+                        'This structured reflection is pinned to an immutable '
+                        'question-set revision and cannot be duplicated through '
+                        'the legacy survey endpoint.'
+                    ),
+                }, status=409)
 
             with transaction.atomic():
                 clone = FeedbackGPT.objects.create(

@@ -148,16 +148,11 @@ def persist_feedback_messages(payloads: list[dict]) -> list[FeedbackMessage]:
             survey = surveys.get(message['gpt_id'])
             if survey is None:
                 raise _invalid('survey does not exist', 'invalid_survey', index)
-            if survey.course_id is None:
-                raise _invalid(
-                    'survey must belong to a course',
-                    'survey_without_course',
-                    index,
-                )
 
         grouped_indexes: dict[tuple[int, str], list[int]] = defaultdict(list)
         for index, message in enumerate(normalized):
-            grouped_indexes[(message['gpt_id'], message['session_id'])].append(index)
+            if surveys[message['gpt_id']].course_id is not None:
+                grouped_indexes[(message['gpt_id'], message['session_id'])].append(index)
 
         sessions: dict[tuple[int, str], ResponseSession] = {}
         for survey_id, client_session_id in sorted(grouped_indexes):
