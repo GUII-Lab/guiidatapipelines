@@ -1998,7 +1998,40 @@ def sendFireData(request):
 
 @csrf_exempt
 def feedbackList(request):
-    messages = FeedbackMessage.objects.all()
+    if request.method != 'GET':
+        response = HttpResponse(status=405)
+        response['Allow'] = 'GET'
+        response['Cache-Control'] = 'no-store, private'
+        return response
+
+    course_id = request.GET.get('course_id')
+    if not course_id:
+        response = JsonResponse(
+            {'error': 'course_id parameter is required'},
+            status=400,
+        )
+        response['Cache-Control'] = 'no-store, private'
+        return response
+    try:
+        course = Course.objects.get(course_id=course_id)
+    except Course.DoesNotExist:
+        response = JsonResponse({'error': 'Course not found'}, status=404)
+        response['Cache-Control'] = 'no-store, private'
+        return response
+
+    _account, _session, _membership, error = authorize_instructor_course(
+        request,
+        course,
+    )
+    if error is not None:
+        return error
+
+    course_survey_ids = FeedbackGPT.objects.filter(course=course).values('id')
+    messages = (
+        FeedbackMessage.objects
+        .filter(gpt_id__in=course_survey_ids)
+        .order_by('id')
+    )
     grouped_messages = defaultdict(list)
 
     # Group messages by session_id
@@ -2016,7 +2049,9 @@ def feedbackList(request):
     # Convert defaultdict to dict for JSON serialization
     grouped_messages_dict = dict(grouped_messages)
 
-    return JsonResponse(grouped_messages_dict, safe=False)  # safe=False is needed to allow non-dict objects
+    response = JsonResponse(grouped_messages_dict, safe=False)
+    response['Cache-Control'] = 'no-store, private'
+    return response
 
 
 @csrf_exempt

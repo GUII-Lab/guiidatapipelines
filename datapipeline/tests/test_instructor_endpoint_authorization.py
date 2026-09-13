@@ -260,6 +260,241 @@ class InstructorCourseAuthorizationTests(TestCase):
         self.assertTrue(InstructorSession.objects.filter(pk=self.session.pk).exists())
 
 
+class FeedbackListAuthorizationTests(TestCase):
+    endpoint = '/datapipeline/api/feedbackList/'
+
+    def setUp(self):
+        self.client = Client()
+        self.institution = Institution.objects.create(
+            slug='feedback-list-university',
+            name='Feedback List University',
+        )
+        self.course, self.account = self.create_owned_course(
+            'feedback-list-course',
+            'feedback-list-owner@example.edu',
+        )
+        self.other_course, self.other_account = self.create_owned_course(
+            'feedback-list-other-course',
+            'feedback-list-other@example.edu',
+        )
+        self.token, self.session = issue_instructor_session(self.account)
+        self.other_token, _other_session = issue_instructor_session(
+            self.other_account,
+        )
+        self.survey = FeedbackGPT.objects.create(
+            public_id='feedback-survey',
+            name='Authorized survey',
+            instructions='Reflect.',
+            created_by=self.account.display_name,
+            course=self.course,
+        )
+        self.other_survey = FeedbackGPT.objects.create(
+            public_id='feedback-other',
+            name='Other survey',
+            instructions='Do not disclose.',
+            created_by=self.other_account.display_name,
+            course=self.other_course,
+        )
+
+    def create_owned_course(self, course_id, email):
+        user = get_user_model().objects.create_user(
+            username=email,
+            email=email,
+            password='TemporaryPass123!',
+        )
+        account = InstructorAccount.objects.create(
+            user=user,
+            email=email,
+            display_name=email.split('@')[0],
+            must_change_password=False,
+        )
+        institution_membership = InstitutionMembership.objects.create(
+            institution=self.institution,
+            instructor=account,
+        )
+        course = Course.objects.create(
+            course_id=course_id,
+            course_name=course_id,
+            instructor_name=account.display_name,
+            password='unusable',
+            institution=self.institution,
+            legacy_password_login_enabled=False,
+        )
+        CourseMembership.objects.create(
+            course=course,
+            institution_membership=institution_membership,
+            role=CourseMembership.ROLE_OWNER,
+        )
+        return course, account
+
+    def get(self, *, course_id=None, token=None, authorization=None):
+        data = {}
+        if course_id is not None:
+            data['course_id'] = course_id
+        headers = {}
+        if authorization is not None:
+            headers['HTTP_AUTHORIZATION'] = authorization
+        elif token is not None:
+            headers['HTTP_AUTHORIZATION'] = f'Bearer {token}'
+        return self.client.get(self.endpoint, data=data, **headers)
+
+    def assert_private_error(self, response, status, code):
+        self.assertEqual(response.status_code, status)
+        self.assertEqual(response.json(), {'error': code})
+        self.assertEqual(response['Cache-Control'], 'no-store, private')
+
+    def test_requires_get_and_declares_the_allowed_method(self):
+        response = self.client.post(
+            self.endpoint,
+            data={'course_id': self.course.course_id},
+            HTTP_AUTHORIZATION=f'Bearer {self.token}',
+        )
+
+        self.assertEqual(response.status_code, 405)
+        self.assertEqual(response['Allow'], 'GET')
+        self.assertEqual(response['Cache-Control'], 'no-store, private')
+
+    def test_requires_an_exact_existing_course_id(self):
+        missing = self.get(token=self.token)
+        unknown = self.get(course_id='not-the-course', token=self.token)
+
+        self.assert_private_error(
+            missing,
+            400,
+            'course_id parameter is required',
+        )
+        self.assert_private_error(unknown, 404, 'Course not found')
+
+    def test_rejects_missing_malformed_and_expired_bearer_sessions(self):
+        expired_token, expired_session = issue_instructor_session(self.account)
+        expired_session.expires_at = timezone.now() - timedelta(seconds=1)
+        expired_session.save(update_fields=['expires_at'])
+
+        responses = [
+            self.get(course_id=self.course.course_id),
+            self.get(
+                course_id=self.course.course_id,
+                authorization='Token malformed',
+            ),
+            self.get(course_id=self.course.course_id, token=expired_token),
+        ]
+
+        for response in responses:
+            with self.subTest(status=response.status_code):
+                self.assert_private_error(
+                    response,
+                    401,
+                    'authentication_required',
+                )
+
+    def test_rejects_wrong_course_inactive_membership_and_password_change(self):
+        wrong_course = self.get(
+            course_id=self.course.course_id,
+            token=self.other_token,
+        )
+
+        membership = self.course.memberships.get()
+        membership.is_active = False
+        membership.save(update_fields=['is_active'])
+        inactive_membership = self.get(
+            course_id=self.course.course_id,
+            token=self.token,
+        )
+        membership.is_active = True
+        membership.save(update_fields=['is_active'])
+
+        self.account.must_change_password = True
+        self.account.save(update_fields=['must_change_password'])
+        password_change = self.get(
+            course_id=self.course.course_id,
+            token=self.token,
+        )
+
+        self.assert_private_error(
+            wrong_course,
+            403,
+            'course_access_denied',
+        )
+        self.assert_private_error(
+            inactive_membership,
+            403,
+            'course_access_denied',
+        )
+        self.assert_private_error(
+            password_change,
+            403,
+            'password_change_required',
+        )
+
+    def test_rejects_membership_after_course_moves_to_another_institution(self):
+        other_institution = Institution.objects.create(
+            slug='feedback-list-other-university',
+            name='Feedback List Other University',
+        )
+        Course.objects.filter(pk=self.course.pk).update(
+            institution=other_institution,
+        )
+
+        response = self.get(
+            course_id=self.course.course_id,
+            token=self.token,
+        )
+
+        self.assert_private_error(
+            response,
+            403,
+            'course_access_denied',
+        )
+
+    def test_authorized_response_preserves_grouping_without_cross_course_leaks(self):
+        allowed = FeedbackMessage.objects.create(
+            session_id='shared-session',
+            student_id='authorized-student',
+            sent_by='user-message',
+            content='Authorized response',
+            gpt_used=self.survey.name,
+            gpt_id=self.survey.pk,
+        )
+        FeedbackMessage.objects.create(
+            session_id='shared-session',
+            student_id='other-course-student',
+            sent_by='user-message',
+            content='CROSS_COURSE_SECRET',
+            gpt_used=self.survey.name,
+            gpt_id=self.other_survey.pk,
+        )
+        FeedbackMessage.objects.create(
+            session_id='orphan-session',
+            student_id='orphan-student',
+            sent_by='user-message',
+            content='ORPHAN_SECRET',
+            gpt_used=self.survey.name,
+            gpt_id=999999,
+        )
+
+        response = self.get(
+            course_id=self.course.course_id,
+            token=self.token,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Cache-Control'], 'no-store, private')
+        self.assertEqual(response.json(), {
+            'shared-session': [{
+                'id': allowed.id,
+                'session_id': allowed.session_id,
+                'student_id': allowed.student_id,
+                'sent_by': allowed.sent_by,
+                'created_at': allowed.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                'content': allowed.content,
+                'gpt_used': allowed.gpt_used,
+            }],
+        })
+        serialized = response.content.decode('utf-8')
+        self.assertNotIn('CROSS_COURSE_SECRET', serialized)
+        self.assertNotIn('ORPHAN_SECRET', serialized)
+
+
 class CourseAndSurveyEndpointMatrixTests(TestCase):
     def setUp(self):
         self.client = Client()
