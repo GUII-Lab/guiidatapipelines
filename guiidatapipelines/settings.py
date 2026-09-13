@@ -10,9 +10,15 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/3.2/ref/settings/
 """
 import os
+import ipaddress
+import re
 from pathlib import Path
+from urllib.parse import urlsplit
+
 import dj_database_url
 import django_on_heroku as django_heroku
+from django.conf import settings as django_settings
+from django.core.checks import Error, Tags, register
 
 try:
     from dotenv import load_dotenv
@@ -25,6 +31,165 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+LEAI_ENVIRONMENTS = frozenset({'local', 'qa', 'production'})
+_LEAI_TRUE_VALUES = frozenset({'1', 'true', 'yes', 'on'})
+_LEAI_FALSE_VALUES = frozenset({'0', 'false', 'no', 'off'})
+_LEAI_BUILD_ID_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+_LEAI_DOMAIN_PATTERN = re.compile(
+    r'^(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
+    r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$',
+)
+
+
+def _comma_separated_environment(name, default):
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return list(default)
+    if not raw_value.strip():
+        return []
+    return [value.strip() for value in raw_value.split(',')]
+
+
+def _valid_leai_build_id(value):
+    return bool(_LEAI_BUILD_ID_PATTERN.fullmatch(str(value or '')))
+
+
+def _valid_allowed_host(value):
+    candidate = str(value or '')
+    if not candidate or candidate == '*' or any(char.isspace() for char in candidate):
+        return False
+    if candidate.startswith('.'):
+        candidate = candidate[1:]
+    if not candidate:
+        return False
+    if candidate.startswith('[') and candidate.endswith(']'):
+        candidate = candidate[1:-1]
+    try:
+        ipaddress.ip_address(candidate)
+        return True
+    except ValueError:
+        return bool(_LEAI_DOMAIN_PATTERN.fullmatch(candidate))
+
+
+def _valid_allowed_origin(value):
+    try:
+        parsed = urlsplit(str(value or ''))
+        parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == 'https'
+        and bool(parsed.hostname)
+        and not parsed.netloc.endswith(':')
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.path
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+@register(Tags.security)
+def check_leai_environment_configuration(app_configs, **kwargs):
+    errors = []
+    environment = getattr(django_settings, 'LEAI_ENV', '')
+    build_id = getattr(django_settings, 'LEAI_BUILD_ID', '')
+    email_flag_valid = getattr(
+        django_settings,
+        'LEAI_EMAIL_ENABLED_CONFIG_VALID',
+        False,
+    )
+
+    if environment not in LEAI_ENVIRONMENTS:
+        errors.append(Error(
+            'LEAI_ENV must identify local, qa, or production.',
+            id='leai.E001',
+        ))
+    if not email_flag_valid:
+        errors.append(Error(
+            'LEAI_EMAIL_ENABLED must be a boolean environment value.',
+            id='leai.E002',
+        ))
+    if not _valid_leai_build_id(build_id):
+        errors.append(Error(
+            'LEAI_BUILD_ID must be a non-secret deployment identifier.',
+            id='leai.E003',
+        ))
+
+    if environment in {'qa', 'production'}:
+        allowed_hosts = getattr(django_settings, 'LEAI_ALLOWED_HOSTS', [])
+        allowed_origins = getattr(django_settings, 'LEAI_ALLOWED_ORIGINS', [])
+        if not allowed_hosts:
+            errors.append(Error(
+                'LEAI_ALLOWED_HOSTS is required outside local development.',
+                id='leai.E004',
+            ))
+        elif any(not _valid_allowed_host(host) for host in allowed_hosts):
+            errors.append(Error(
+                'LEAI_ALLOWED_HOSTS contains a malformed or wildcard host.',
+                id='leai.E005',
+            ))
+        if not allowed_origins:
+            errors.append(Error(
+                'LEAI_ALLOWED_ORIGINS is required outside local development.',
+                id='leai.E006',
+            ))
+        elif any(not _valid_allowed_origin(origin) for origin in allowed_origins):
+            errors.append(Error(
+                'LEAI_ALLOWED_ORIGINS must contain HTTPS origins without paths.',
+                id='leai.E007',
+            ))
+        if getattr(django_settings, 'CORS_ALLOW_ALL_ORIGINS', True):
+            errors.append(Error(
+                'CORS_ALLOW_ALL_ORIGINS must be false outside local development.',
+                id='leai.E008',
+            ))
+        if getattr(django_settings, 'CORS_ALLOWED_ORIGINS', []) != allowed_origins:
+            errors.append(Error(
+                'CORS_ALLOWED_ORIGINS must match LEAI_ALLOWED_ORIGINS.',
+                id='leai.E009',
+            ))
+        if getattr(django_settings, 'CSRF_TRUSTED_ORIGINS', []) != allowed_origins:
+            errors.append(Error(
+                'CSRF_TRUSTED_ORIGINS must match LEAI_ALLOWED_ORIGINS.',
+                id='leai.E010',
+            ))
+        if getattr(django_settings, 'ALLOWED_HOSTS', []) != allowed_hosts:
+            errors.append(Error(
+                'ALLOWED_HOSTS must match LEAI_ALLOWED_HOSTS.',
+                id='leai.E011',
+            ))
+
+    return errors
+
+
+LEAI_ENV = os.environ.get('LEAI_ENV', 'local').strip().lower()
+_leai_build_id = os.environ.get(
+    'LEAI_BUILD_ID',
+    'local' if LEAI_ENV == 'local' else '',
+).strip()
+LEAI_BUILD_ID = _leai_build_id if _valid_leai_build_id(_leai_build_id) else ''
+_leai_email_enabled = os.environ.get('LEAI_EMAIL_ENABLED', 'false').strip().lower()
+LEAI_EMAIL_ENABLED_CONFIG_VALID = (
+    _leai_email_enabled in _LEAI_TRUE_VALUES | _LEAI_FALSE_VALUES
+)
+LEAI_EMAIL_ENABLED = _leai_email_enabled in _LEAI_TRUE_VALUES
+
+_local_allowed_hosts = ('localhost', '127.0.0.1', '[::1]', 'testserver')
+_local_allowed_origins = (
+    'http://localhost:8080',
+    'http://127.0.0.1:8080',
+)
+LEAI_ALLOWED_HOSTS = _comma_separated_environment(
+    'LEAI_ALLOWED_HOSTS',
+    _local_allowed_hosts if LEAI_ENV == 'local' else (),
+)
+LEAI_ALLOWED_ORIGINS = _comma_separated_environment(
+    'LEAI_ALLOWED_ORIGINS',
+    _local_allowed_origins if LEAI_ENV == 'local' else (),
+)
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/3.2/howto/deployment/checklist/
 
@@ -32,9 +197,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-n=tqs=w%ta2ejbii@g*r!!_)n02bj)@&i7d6zyy%mz5skvn+ke'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = LEAI_ENV == 'local'
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = LEAI_ALLOWED_HOSTS
 
 
 # Application definition
@@ -142,5 +307,10 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 # https://docs.djangoproject.com/en/3.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-CORS_ALLOW_ALL_ORIGINS = True  # For development only, specify domains in production
-django_heroku.settings(locals())
+CORS_ALLOW_ALL_ORIGINS = LEAI_ENV == 'local'
+CORS_ALLOWED_ORIGINS = LEAI_ALLOWED_ORIGINS
+CSRF_TRUSTED_ORIGINS = LEAI_ALLOWED_ORIGINS
+
+# Keep the helper's database/static behavior, but never allow it to broaden
+# the explicit environment-specific host policy back to ['*'].
+django_heroku.settings(locals(), allowed_hosts=False)
