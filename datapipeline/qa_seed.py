@@ -156,22 +156,11 @@ def _reset_owned_children() -> None:
     InstructorAuditEvent.objects.filter(event_id__in=QA_AUDIT_EVENT_IDS).delete()
     LEAIChatSession.objects.filter(pk=QA_ANALYSIS_SESSION_ID).delete()
     ResponseSession.objects.filter(public_id=QA_RESPONSE_PUBLIC_ID).delete()
-    QuestionSetSurvey.objects.filter(
-        idempotency_key=QA_SURVEY_IDEMPOTENCY_KEY,
-    ).delete()
-    FeedbackGPT.objects.filter(public_id=QA_SURVEY_PUBLIC_ID).delete()
     PreviewSession.objects.filter(public_id=QA_PREVIEW_PUBLIC_ID).delete()
     QuestionSetValidationRun.objects.filter(
         Q(draft__public_id=QA_DRAFT_PUBLIC_ID)
         | Q(revision__public_id=QA_REVISION_PUBLIC_ID)
     ).delete()
-    QuestionSetDraft.objects.filter(public_id=QA_DRAFT_PUBLIC_ID).delete()
-    # The public manager intentionally rejects all revision deletion. Reset is
-    # the sole private bypass, scoped to this one deterministic QA revision.
-    QuestionSetRevision._base_manager.filter(
-        public_id=QA_REVISION_PUBLIC_ID,
-    ).delete()
-    QuestionSet.objects.filter(public_id=QA_QUESTION_SET_PUBLIC_ID).delete()
 
 
 def _upsert_instructor(*, email, username, display_name, password):
@@ -302,26 +291,6 @@ def _upsert_base_graph(passwords: dict[str, str]):
     return institution, primary, reviewer, courses
 
 
-def _latest_event_pk() -> int:
-    return (
-        InstructorAuditEvent.objects.order_by('-pk').values_list('pk', flat=True).first()
-        or 0
-    )
-
-
-def _rekey_service_event(*, after_pk, action, event_id, target_id=None):
-    event = InstructorAuditEvent.objects.filter(
-        pk__gt=after_pk,
-        action=action,
-    ).order_by('pk').first()
-    if event is None:
-        raise QASeedError(f'Expected service audit event was not persisted: {action}')
-    updates = {'event_id': event_id}
-    if target_id is not None:
-        updates['target_id'] = str(target_id)
-    InstructorAuditEvent.objects.filter(pk=event.pk).update(**updates)
-
-
 def _expected_revision_values(question_set_public_id):
     body, validation = validate_body(get_template('weekly-reflection')['body'])
     compiled = copy.deepcopy(body)
@@ -344,39 +313,24 @@ def _expected_revision_values(question_set_public_id):
     return body, validation, compiled, content_hash
 
 
-def _ensure_question_set_graph(*, course, primary):
-    body, _validation, expected_compiled, expected_hash = _expected_revision_values(
+def _ensure_question_set_graph(*, course, primary, reset):
+    body, validation, expected_compiled, expected_hash = _expected_revision_values(
         QA_QUESTION_SET_PUBLIC_ID
     )
     question_set = QuestionSet.objects.filter(
         public_id=QA_QUESTION_SET_PUBLIC_ID,
     ).first()
     if question_set is None:
-        before_pk = _latest_event_pk()
         draft = create_draft(
             course=course,
             actor=primary,
             instructor_session=None,
             template_id='weekly-reflection',
+            question_set_public_id=QA_QUESTION_SET_PUBLIC_ID,
+            draft_public_id=QA_DRAFT_PUBLIC_ID,
+            audit_event_id=QA_AUDIT_EVENT_IDS[3],
         )
         question_set = draft.question_set
-        original_public_id = question_set.public_id
-        QuestionSet.objects.filter(pk=question_set.pk).update(
-            public_id=QA_QUESTION_SET_PUBLIC_ID,
-        )
-        QuestionSetDraft.objects.filter(pk=draft.pk).update(
-            public_id=QA_DRAFT_PUBLIC_ID,
-        )
-        question_set.refresh_from_db()
-        draft.refresh_from_db()
-        _rekey_service_event(
-            after_pk=before_pk,
-            action=InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_CREATED,
-            event_id=QA_AUDIT_EVENT_IDS[3],
-            target_id=QA_QUESTION_SET_PUBLIC_ID,
-        )
-        if original_public_id == QA_QUESTION_SET_PUBLIC_ID:
-            raise QASeedError('Question set service unexpectedly reused the QA identifier.')
     else:
         try:
             draft = QuestionSetDraft.objects.get(public_id=QA_DRAFT_PUBLIC_ID)
@@ -391,31 +345,43 @@ def _ensure_question_set_graph(*, course, primary):
         or question_set.template_id != 'weekly-reflection'
     ):
         raise QASeedError('QA question set identity conflicts with existing data.')
+    if reset:
+        question_set.title = body['title']
+        question_set.audience = QuestionSet.AUDIENCE_INDIVIDUAL
+        question_set.archived_at = None
+        question_set.save(update_fields=['title', 'audience', 'archived_at', 'updated_at'])
 
     revision = QuestionSetRevision.objects.filter(
         public_id=QA_REVISION_PUBLIC_ID,
     ).first()
     if revision is None:
-        if QuestionSetRevision.objects.filter(question_set=question_set).exists():
-            raise QASeedError('QA question set has a non-seed immutable revision.')
-        before_pk = _latest_event_pk()
+        if QuestionSetRevision.objects.filter(
+            question_set=question_set,
+            revision_number=1,
+        ).exists():
+            raise QASeedError('QA revision number conflicts with existing data.')
+        if reset:
+            draft.body = copy.deepcopy(body)
+            draft.version = 1
+            draft.base_revision = None
+            draft.updated_by = primary
+            draft.save(update_fields=[
+                'body',
+                'version',
+                'base_revision',
+                'updated_by',
+                'updated_at',
+            ])
         revision, created = freeze_draft(
             draft_id=draft.public_id,
             actor=primary,
             instructor_session=None,
             expected_version=draft.version,
+            revision_public_id=QA_REVISION_PUBLIC_ID,
+            audit_event_id=QA_AUDIT_EVENT_IDS[4],
         )
         if not created:
             raise QASeedError('QA revision was not created from the current compiler.')
-        QuestionSetRevision._base_manager.filter(pk=revision.pk).update(
-            public_id=QA_REVISION_PUBLIC_ID,
-        )
-        revision.refresh_from_db()
-        _rekey_service_event(
-            after_pk=before_pk,
-            action=InstructorAuditEvent.ACTION_QUESTION_SET_REVISION_FROZEN,
-            event_id=QA_AUDIT_EVENT_IDS[4],
-        )
 
     if (
         revision.question_set_id != question_set.pk
@@ -429,11 +395,35 @@ def _ensure_question_set_graph(*, course, primary):
         or revision.created_by_id != primary.pk
     ):
         raise QASeedError('QA immutable revision differs from the current seed contract.')
-    if draft.body != body or draft.version != 1:
+    if reset:
+        draft.body = copy.deepcopy(body)
+        draft.version = 1
+        draft.base_revision = revision
+        draft.updated_by = primary
+        draft.save(update_fields=[
+            'body',
+            'version',
+            'base_revision',
+            'updated_by',
+            'updated_at',
+        ])
+    elif draft.body != body or draft.version != 1:
         raise QASeedError('QA draft differs from the current seed contract; reset it first.')
     if draft.base_revision_id != revision.pk:
         draft.base_revision = revision
         draft.save(update_fields=['base_revision', 'updated_at'])
+    if not QuestionSetValidationRun.objects.filter(draft=draft).exists():
+        QuestionSetValidationRun.objects.create(
+            draft=draft,
+            is_valid=True,
+            result={'errors': [], 'question_count': len(body['sections'])},
+        )
+    if not QuestionSetValidationRun.objects.filter(revision=revision).exists():
+        QuestionSetValidationRun.objects.create(
+            revision=revision,
+            is_valid=True,
+            result=validation,
+        )
     return question_set, draft, revision
 
 
@@ -470,22 +460,17 @@ def _preview_payloads(revision):
 def _ensure_preview(*, revision, primary):
     preview = PreviewSession.objects.filter(public_id=QA_PREVIEW_PUBLIC_ID).first()
     if preview is None:
-        before_pk = _latest_event_pk()
         raw_token, preview = issue_preview_capability(
             revision=revision,
             actor=primary,
             instructor_session=None,
+            preview_public_id=QA_PREVIEW_PUBLIC_ID,
+            audit_event_id=QA_AUDIT_EVENT_IDS[5],
         )
         PreviewSession.objects.filter(pk=preview.pk).update(
-            public_id=QA_PREVIEW_PUBLIC_ID,
             expires_at=_FIXED_PREVIEW_EXPIRY,
         )
         preview.refresh_from_db()
-        _rekey_service_event(
-            after_pk=before_pk,
-            action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_STARTED,
-            event_id=QA_AUDIT_EVENT_IDS[5],
-        )
         for role, content, attribution in _preview_payloads(revision):
             save_preview_message(
                 raw_token=raw_token,
@@ -493,26 +478,46 @@ def _ensure_preview(*, revision, primary):
                 content=content,
                 attribution=copy.deepcopy(attribution),
             )
-        before_pk = _latest_event_pk()
-        preview = complete_preview(raw_token=raw_token)
-        _rekey_service_event(
-            after_pk=before_pk,
-            action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_COMPLETED,
-            event_id=QA_AUDIT_EVENT_IDS[6],
+        preview = complete_preview(
+            raw_token=raw_token,
+            audit_event_id=QA_AUDIT_EVENT_IDS[6],
         )
     if preview.revision_id != revision.pk or preview.completed_at is None:
         raise QASeedError('QA preview does not prove the seeded revision.')
     return preview
 
 
-def _ensure_survey(*, revision, primary):
+def _survey_values(*, revision, primary):
+    return {
+        'name': 'QA Active Course Week 4 Reflection',
+        'survey_label': 'QA Active Course Week 4 Reflection',
+        'instructions': (
+            'You are LEAI, a conversational reflection facilitator. Follow the '
+            'form-mode directives exactly, ask one question at a time, and keep '
+            'your responses concise and supportive.'
+        ),
+        'created_by': primary.display_name,
+        'course': revision.question_set.course,
+        'week_number': 4,
+        'opens_at': None,
+        'expires_at': None,
+        'is_closed': False,
+        'anonymity_mode': 'anonymous',
+        'reporting_structure': '',
+        'canvas_integration': False,
+        'mode': 'form',
+        'form_schema': None,
+    }
+
+
+def _ensure_survey(*, revision, primary, reset):
+    expected_survey = _survey_values(revision=revision, primary=primary)
     survey = FeedbackGPT.objects.filter(public_id=QA_SURVEY_PUBLIC_ID).first()
     if survey is None:
         if QuestionSetSurvey.objects.filter(
             idempotency_key=QA_SURVEY_IDEMPOTENCY_KEY,
         ).exists():
             raise QASeedError('QA survey idempotency key conflicts with existing data.')
-        before_pk = _latest_event_pk()
         link, created = create_survey_from_revision(
             revision=revision,
             actor=primary,
@@ -522,33 +527,43 @@ def _ensure_survey(*, revision, primary):
             week_number=4,
             opens_at=None,
             expires_at=None,
+            survey_public_id=QA_SURVEY_PUBLIC_ID,
+            audit_event_id=QA_AUDIT_EVENT_IDS[7],
         )
         if not created:
             raise QASeedError('QA published survey was not created.')
         survey = link.survey
-        FeedbackGPT.objects.filter(pk=survey.pk).update(public_id=QA_SURVEY_PUBLIC_ID)
-        survey.refresh_from_db()
-        _rekey_service_event(
-            after_pk=before_pk,
-            action=InstructorAuditEvent.ACTION_SURVEY_CREATED,
-            event_id=QA_AUDIT_EVENT_IDS[7],
-        )
-    try:
-        link = QuestionSetSurvey.objects.get(
+    else:
+        link = QuestionSetSurvey.objects.filter(
             idempotency_key=QA_SURVEY_IDEMPOTENCY_KEY,
-        )
-    except QuestionSetSurvey.DoesNotExist as exc:
-        raise QASeedError('QA survey link is missing; run a confirmed reset.') from exc
+        ).first()
+        survey_link = QuestionSetSurvey.objects.filter(survey=survey).first()
+        if link is not None and link.survey_id != survey.pk:
+            raise QASeedError('QA survey idempotency key conflicts with existing data.')
+        if survey_link is not None and survey_link.pk != getattr(link, 'pk', None):
+            raise QASeedError('QA survey is linked through non-seed data.')
+        if link is None:
+            link = QuestionSetSurvey.objects.create(
+                survey=survey,
+                revision=revision,
+                idempotency_key=QA_SURVEY_IDEMPOTENCY_KEY,
+                created_by=primary,
+            )
+    if reset:
+        for field_name, value in expected_survey.items():
+            setattr(survey, field_name, value)
+        survey.save(update_fields=[*expected_survey, 'updated_at'])
+        link.revision = revision
+        link.created_by = primary
+        link.save(update_fields=['revision', 'created_by'])
     if (
         link.survey_id != survey.pk
         or link.revision_id != revision.pk
         or link.created_by_id != primary.pk
-        or survey.course_id != revision.question_set.course_id
-        or survey.mode != 'form'
-        or survey.form_schema_id is not None
-        or survey.is_closed
-        or survey.opens_at is not None
-        or survey.expires_at is not None
+        or any(
+            getattr(survey, field_name) != value
+            for field_name, value in expected_survey.items()
+        )
     ):
         raise QASeedError('QA published survey differs from the seed contract.')
     return survey, link
@@ -629,6 +644,7 @@ def _ensure_audit_event(*, event_id, action, actor, course, target_type, target_
     event = InstructorAuditEvent.objects.filter(event_id=event_id).first()
     if event is None:
         event = record_instructor_event(
+            event_id=event_id,
             action=action,
             outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
             actor=actor,
@@ -638,7 +654,19 @@ def _ensure_audit_event(*, event_id, action, actor, course, target_type, target_
             target_id=target_id,
             metadata=metadata,
         )
-        InstructorAuditEvent.objects.filter(pk=event.pk).update(event_id=event_id)
+    expected_target_id = str(target_id)
+    if (
+        event.action != action
+        or event.outcome != InstructorAuditEvent.OUTCOME_SUCCESS
+        or event.actor_id != actor.pk
+        or event.session_id is not None
+        or event.course_id != course.pk
+        or event.course_id_snapshot != course.course_id
+        or event.target_type != target_type
+        or event.target_id != expected_target_id
+        or event.metadata != metadata
+    ):
+        raise QASeedError('QA audit event identifier conflicts with existing data.')
 
 
 def _ensure_audit_graph(*, institution, primary, courses, question_set, survey, analysis):
@@ -796,9 +824,14 @@ def seed_qa_data(
         question_set, _draft, revision = _ensure_question_set_graph(
             course=courses['qa-active-course'],
             primary=primary,
+            reset=reset,
         )
         _ensure_preview(revision=revision, primary=primary)
-        survey, _link = _ensure_survey(revision=revision, primary=primary)
+        survey, _link = _ensure_survey(
+            revision=revision,
+            primary=primary,
+            reset=reset,
+        )
         response = _ensure_response(revision=revision, survey=survey)
         analysis = _ensure_analysis(
             course=courses['qa-active-course'],

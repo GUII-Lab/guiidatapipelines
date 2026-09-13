@@ -5,6 +5,7 @@ import hashlib
 import json
 import secrets
 import string
+import uuid
 from datetime import timedelta
 
 from django.core.exceptions import ValidationError
@@ -336,8 +337,16 @@ def serialize_revision(revision):
     }
 
 
-def _record_question_set_event(*, action, actor, instructor_session, question_set):
+def _record_question_set_event(
+    *,
+    action,
+    actor,
+    instructor_session,
+    question_set,
+    event_id=None,
+):
     record_instructor_event(
+        event_id=event_id,
         action=action,
         outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
         actor=actor,
@@ -349,22 +358,60 @@ def _record_question_set_event(*, action, actor, instructor_session, question_se
     )
 
 
+def _validate_optional_uuid(value, *, field_name, conflict_model=None):
+    if value is None:
+        return
+    if type(value) is not uuid.UUID:
+        raise QuestionSetError('invalid_deterministic_id', f'{field_name} must be a UUID.')
+    if conflict_model is not None and conflict_model.objects.filter(
+        public_id=value,
+    ).exists():
+        raise QuestionSetError(f'{field_name}_conflict')
+
+
 @transaction.atomic
-def create_draft(*, course, actor, instructor_session, template_id):
+def create_draft(
+    *,
+    course,
+    actor,
+    instructor_session,
+    template_id,
+    question_set_public_id=None,
+    draft_public_id=None,
+    audit_event_id=None,
+):
+    _validate_optional_uuid(
+        question_set_public_id,
+        field_name='question_set_public_id',
+        conflict_model=QuestionSet,
+    )
+    _validate_optional_uuid(
+        draft_public_id,
+        field_name='draft_public_id',
+        conflict_model=QuestionSetDraft,
+    )
     template = get_template(template_id)
     body, _result = validate_body(template['body'])
+    question_set_values = {
+        'course': course,
+        'owner': actor,
+        'template_id': template['id'],
+        'title': body['title'],
+        'audience': template['audience'],
+    }
+    if question_set_public_id is not None:
+        question_set_values['public_id'] = question_set_public_id
     question_set = QuestionSet.objects.create(
-        course=course,
-        owner=actor,
-        template_id=template['id'],
-        title=body['title'],
-        audience=template['audience'],
+        **question_set_values,
     )
-    draft = QuestionSetDraft.objects.create(
-        question_set=question_set,
-        body=body,
-        updated_by=actor,
-    )
+    draft_values = {
+        'question_set': question_set,
+        'body': body,
+        'updated_by': actor,
+    }
+    if draft_public_id is not None:
+        draft_values['public_id'] = draft_public_id
+    draft = QuestionSetDraft.objects.create(**draft_values)
     QuestionSetValidationRun.objects.create(
         draft=draft,
         is_valid=True,
@@ -375,6 +422,7 @@ def create_draft(*, course, actor, instructor_session, template_id):
         actor=actor,
         instructor_session=instructor_session,
         question_set=question_set,
+        event_id=audit_event_id,
     )
     return draft
 
@@ -419,7 +467,19 @@ def _normalized_preview_text(value):
 
 
 @transaction.atomic
-def freeze_draft(*, draft_id, actor, instructor_session, expected_version):
+def freeze_draft(
+    *,
+    draft_id,
+    actor,
+    instructor_session,
+    expected_version,
+    revision_public_id=None,
+    audit_event_id=None,
+):
+    _validate_optional_uuid(
+        revision_public_id,
+        field_name='revision_public_id',
+    )
     draft = (
         QuestionSetDraft.objects
         .select_for_update()
@@ -442,7 +502,18 @@ def freeze_draft(*, draft_id, actor, instructor_session, expected_version):
         content_hash=content_hash,
     ).first()
     if existing is not None:
+        if (
+            revision_public_id is not None
+            and existing.public_id != revision_public_id
+        ):
+            raise QuestionSetError('revision_public_id_conflict')
         return existing, False
+
+    if (
+        revision_public_id is not None
+        and QuestionSetRevision.objects.filter(public_id=revision_public_id).exists()
+    ):
+        raise QuestionSetError('revision_public_id_conflict')
 
     latest_number = (
         QuestionSetRevision.objects
@@ -459,16 +530,21 @@ def freeze_draft(*, draft_id, actor, instructor_session, expected_version):
     compiled['effective_settings'] = copy.deepcopy(
         QUESTION_SET_EFFECTIVE_SETTINGS
     )
+    revision_values = {
+        'question_set': draft.question_set,
+        'revision_number': revision_number,
+        'source_draft_version': draft.version,
+        'canonical_body': canonical,
+        'compiled_protocol': compiled,
+        'content_hash': content_hash,
+        'compiler_version': COMPILER_VERSION,
+        'engine_version': ENGINE_VERSION,
+        'created_by': actor,
+    }
+    if revision_public_id is not None:
+        revision_values['public_id'] = revision_public_id
     revision = QuestionSetRevision.objects.create(
-        question_set=draft.question_set,
-        revision_number=revision_number,
-        source_draft_version=draft.version,
-        canonical_body=canonical,
-        compiled_protocol=compiled,
-        content_hash=content_hash,
-        compiler_version=COMPILER_VERSION,
-        engine_version=ENGINE_VERSION,
-        created_by=actor,
+        **revision_values,
     )
     QuestionSetValidationRun.objects.create(
         revision=revision,
@@ -482,24 +558,41 @@ def freeze_draft(*, draft_id, actor, instructor_session, expected_version):
         actor=actor,
         instructor_session=instructor_session,
         question_set=draft.question_set,
+        event_id=audit_event_id,
     )
     return revision, True
 
 
 @transaction.atomic
-def issue_preview_capability(*, revision, actor, instructor_session):
-    raw_token = secrets.token_urlsafe(32)
-    preview = PreviewSession.objects.create(
-        revision=revision,
-        instructor=actor,
-        token_digest=token_digest(raw_token),
-        expires_at=timezone.now() + PREVIEW_TTL,
+def issue_preview_capability(
+    *,
+    revision,
+    actor,
+    instructor_session,
+    preview_public_id=None,
+    audit_event_id=None,
+):
+    _validate_optional_uuid(
+        preview_public_id,
+        field_name='preview_public_id',
+        conflict_model=PreviewSession,
     )
+    raw_token = secrets.token_urlsafe(32)
+    preview_values = {
+        'revision': revision,
+        'instructor': actor,
+        'token_digest': token_digest(raw_token),
+        'expires_at': timezone.now() + PREVIEW_TTL,
+    }
+    if preview_public_id is not None:
+        preview_values['public_id'] = preview_public_id
+    preview = PreviewSession.objects.create(**preview_values)
     _record_question_set_event(
         action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_STARTED,
         actor=actor,
         instructor_session=instructor_session,
         question_set=revision.question_set,
+        event_id=audit_event_id,
     )
     return raw_token, preview
 
@@ -543,7 +636,7 @@ def save_preview_message(*, raw_token, role, content, attribution=None):
 
 
 @transaction.atomic
-def complete_preview(*, raw_token):
+def complete_preview(*, raw_token, audit_event_id=None):
     preview = get_preview(raw_token)
     preview = (
         PreviewSession.objects
@@ -636,6 +729,7 @@ def complete_preview(*, raw_token):
             actor=preview.instructor,
             instructor_session=None,
             question_set=preview.revision.question_set,
+            event_id=audit_event_id,
         )
     return preview
 
@@ -660,6 +754,8 @@ def create_survey_from_revision(
     week_number,
     opens_at,
     expires_at,
+    survey_public_id=None,
+    audit_event_id=None,
 ):
     idempotency_key = _bounded_text(
         idempotency_key,
@@ -692,8 +788,17 @@ def create_survey_from_revision(
     if opens_at is not None and expires_at is not None and opens_at >= expires_at:
         raise QuestionSetError('invalid_schedule', 'Closing time must be after opening time.')
 
+    if survey_public_id is not None:
+        survey_public_id = _bounded_text(
+            survey_public_id,
+            'Survey public ID',
+            max_length=16,
+        )
+        if FeedbackGPT.objects.filter(public_id=survey_public_id).exists():
+            raise QuestionSetError('survey_public_id_conflict')
+
     survey = FeedbackGPT.objects.create(
-        public_id=_new_survey_public_id(),
+        public_id=survey_public_id or _new_survey_public_id(),
         name=survey_label,
         survey_label=survey_label,
         instructions=(
@@ -734,6 +839,7 @@ def create_survey_from_revision(
             raise QuestionSetError('idempotency_key_conflict')
         return winner, False
     record_instructor_event(
+        event_id=audit_event_id,
         action=InstructorAuditEvent.ACTION_SURVEY_CREATED,
         outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
         actor=actor,

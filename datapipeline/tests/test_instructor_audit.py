@@ -181,6 +181,36 @@ class InstructorAuditWriterTests(TestCase):
 
         self.assertEqual(event.course_id_snapshot, self.course.course_id)
 
+    def test_writer_creates_requested_event_id_and_rejects_collision(self):
+        event_id = uuid.UUID('78ce94a4-a6f1-4ab0-99fe-acde0ebc9479')
+        original = record_instructor_event(
+            event_id=event_id,
+            action=InstructorAuditEvent.ACTION_COURSE_CREATED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=self.account,
+            course=self.course,
+            target_type='course',
+            target_id=self.course.course_id,
+            metadata={'institution_slug': self.institution.slug},
+        )
+
+        with self.assertRaises(ValidationError):
+            record_instructor_event(
+                event_id=event_id,
+                action=InstructorAuditEvent.ACTION_COURSE_CREATED,
+                outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                actor=self.account,
+                course=self.course,
+                target_type='course',
+                target_id=self.course.course_id,
+                metadata={'institution_slug': self.institution.slug},
+            )
+
+        original.refresh_from_db()
+        self.assertEqual(original.event_id, event_id)
+        self.assertEqual(original.target_id, self.course.course_id)
+        self.assertEqual(InstructorAuditEvent.objects.filter(event_id=event_id).count(), 1)
+
     def test_writer_rejects_non_dict_metadata(self):
         with self.assertRaises(ValidationError):
             record_instructor_event(

@@ -1,3 +1,4 @@
+import copy
 import io
 import json
 import os
@@ -8,9 +9,11 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ValidationError
+from django.db import connection
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import Client, TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 
 from datapipeline.models import (
     Course,
@@ -48,7 +51,9 @@ from datapipeline.qa_seed import (
     QASeedError,
     seed_qa_data,
 )
-from datapipeline.question_sets import create_draft, freeze_draft
+from datapipeline.instructor_audit import record_instructor_event
+from datapipeline.question_sets import create_draft, freeze_draft, save_draft
+from datapipeline.response_sessions import persist_feedback_messages
 
 
 EXPECTED_RESULT = {
@@ -264,6 +269,117 @@ class QASeedTests(TestCase):
         self.assertTrue(
             QuestionSetRevision.objects.filter(public_id=QA_REVISION_PUBLIC_ID).exists()
         )
+
+    def test_confirmed_reset_preserves_nonseed_response_on_seed_survey(self):
+        self.seed()
+        survey = FeedbackGPT.objects.get(public_id=QA_SURVEY_PUBLIC_ID)
+        survey_pk = survey.pk
+        messages = persist_feedback_messages([{
+            'session_id': 'browser-review-probe',
+            'student_id': 'anonymous-review-probe',
+            'sent_by': 'user-message',
+            'content': 'Non-seed response that must survive a QA reset.',
+            'gpt_used': survey.name,
+            'gpt_id': survey.pk,
+            'research_consent': False,
+        }])
+        response = messages[0].response_session
+        response_pk = response.pk
+        message_pk = messages[0].pk
+        survey.name = 'Drifted QA survey name'
+        survey.survey_label = 'Drifted QA survey label'
+        survey.is_closed = True
+        survey.save(update_fields=['name', 'survey_label', 'is_closed', 'updated_at'])
+
+        result = self.seed(reset=True, confirm='qa')
+
+        self.assertEqual(result, EXPECTED_RESULT)
+        survey.refresh_from_db()
+        self.assertEqual(survey.pk, survey_pk)
+        self.assertEqual(survey.name, 'QA Active Course Week 4 Reflection')
+        self.assertEqual(survey.survey_label, 'QA Active Course Week 4 Reflection')
+        self.assertFalse(survey.is_closed)
+        self.assertTrue(ResponseSession.objects.filter(pk=response_pk).exists())
+        self.assertTrue(FeedbackMessage.objects.filter(pk=message_pk).exists())
+
+    def test_confirmed_reset_preserves_later_revision_on_seed_question_set(self):
+        self.seed()
+        question_set = QuestionSet.objects.get(public_id=QA_QUESTION_SET_PUBLIC_ID)
+        question_set_pk = question_set.pk
+        seed_revision = QuestionSetRevision.objects.get(public_id=QA_REVISION_PUBLIC_ID)
+        seed_revision_pk = seed_revision.pk
+        draft = QuestionSetDraft.objects.get(public_id=QA_DRAFT_PUBLIC_ID)
+        later_body = copy.deepcopy(draft.body)
+        later_body['title'] = 'Later non-seed revision'
+        draft = save_draft(
+            draft_id=draft.public_id,
+            actor=draft.updated_by,
+            instructor_session=None,
+            expected_version=draft.version,
+            body=later_body,
+        )
+        later_revision, created = freeze_draft(
+            draft_id=draft.public_id,
+            actor=draft.updated_by,
+            instructor_session=None,
+            expected_version=draft.version,
+        )
+        self.assertTrue(created)
+        later_revision_pk = later_revision.pk
+        later_content_hash = later_revision.content_hash
+
+        result = self.seed(reset=True, confirm='qa')
+
+        self.assertEqual(result, EXPECTED_RESULT)
+        self.assertTrue(QuestionSet.objects.filter(pk=question_set_pk).exists())
+        self.assertTrue(QuestionSetRevision.objects.filter(pk=seed_revision_pk).exists())
+        later_revision.refresh_from_db()
+        self.assertEqual(later_revision.pk, later_revision_pk)
+        self.assertEqual(later_revision.content_hash, later_content_hash)
+        reset_draft = QuestionSetDraft.objects.get(public_id=QA_DRAFT_PUBLIC_ID)
+        self.assertEqual(reset_draft.version, 1)
+        self.assertEqual(reset_draft.base_revision_id, seed_revision_pk)
+        self.assertEqual(reset_draft.body['title'], 'Weekly learning reflection')
+
+    def test_ordinary_seed_does_not_privately_update_immutable_revision(self):
+        with CaptureQueriesContext(connection) as queries:
+            self.seed()
+
+        revision_updates = [
+            query['sql']
+            for query in queries.captured_queries
+            if query['sql'].lstrip().upper().startswith('UPDATE')
+            and 'datapipeline_questionsetrevision' in query['sql'].lower()
+        ]
+        self.assertEqual(revision_updates, [])
+
+    def test_same_action_audit_event_is_not_captured_or_mutated(self):
+        racing = {}
+
+        def create_with_same_action_event(**kwargs):
+            target_id = uuid.uuid4()
+            event = record_instructor_event(
+                action=InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_CREATED,
+                outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                actor=kwargs['actor'],
+                session=kwargs['instructor_session'],
+                course=kwargs['course'],
+                target_type='question_set',
+                target_id=target_id,
+                metadata={},
+            )
+            racing.update(event_id=event.event_id, target_id=str(target_id))
+            return create_draft(**kwargs)
+
+        with patch(
+            'datapipeline.qa_seed.create_draft',
+            side_effect=create_with_same_action_event,
+        ):
+            self.seed()
+
+        event = InstructorAuditEvent.objects.get(event_id=racing['event_id'])
+        self.assertEqual(event.target_id, racing['target_id'])
+        self.assertNotIn(event.event_id, QA_AUDIT_EVENT_IDS)
 
     def test_seed_requires_runtime_credentials_for_missing_accounts(self):
         with self.assertRaises(QASeedError):

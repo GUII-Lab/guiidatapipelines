@@ -259,6 +259,7 @@ def _validated_target(*, action, target_type, target_id, course):
 
 def record_instructor_event(
     *,
+    event_id=None,
     action,
     outcome,
     actor=None,
@@ -268,6 +269,8 @@ def record_instructor_event(
     target_id='',
     metadata=None,
 ) -> InstructorAuditEvent:
+    if event_id is not None and type(event_id) is not uuid.UUID:
+        raise ValidationError({'event_id': 'Event ID must be a UUID.'})
     valid_actions = {value for value, _label in InstructorAuditEvent.ACTION_CHOICES}
     valid_outcomes = {value for value, _label in InstructorAuditEvent.OUTCOME_CHOICES}
     if action not in valid_actions:
@@ -307,16 +310,21 @@ def record_instructor_event(
         course=course,
     )
 
+    event_values = {
+        'actor': actor,
+        'session': session,
+        'course': course,
+        'course_id_snapshot': course.course_id if course is not None else '',
+        'action': action,
+        'outcome': outcome,
+        'target_type': target_type,
+        'target_id': target_id,
+        'metadata': metadata,
+    }
+    if event_id is not None:
+        event_values['event_id'] = event_id
     event = InstructorAuditEvent(
-        actor=actor,
-        session=session,
-        course=course,
-        course_id_snapshot=course.course_id if course is not None else '',
-        action=action,
-        outcome=outcome,
-        target_type=target_type,
-        target_id=target_id,
-        metadata=metadata,
+        **event_values,
     )
     event.full_clean()
     event.save()

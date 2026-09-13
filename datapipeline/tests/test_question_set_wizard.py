@@ -26,6 +26,11 @@ from datapipeline.models import (
     QuestionSetRevision,
     QuestionSetSurvey,
 )
+from datapipeline.question_sets import (
+    QuestionSetError,
+    create_draft as create_draft_service,
+    freeze_draft as freeze_draft_service,
+)
 
 
 class QuestionSetWizardApiTests(TestCase):
@@ -346,6 +351,68 @@ class QuestionSetWizardApiTests(TestCase):
                 'parsed_document_download_enabled': False,
             },
         )
+
+    def test_freeze_creates_requested_revision_and_audit_ids_atomically(self):
+        draft = create_draft_service(
+            course=self.course,
+            actor=self.account,
+            instructor_session=None,
+            template_id='weekly-reflection',
+        )
+        revision_id = uuid.UUID('81a151d4-5a71-4937-9a01-51d98456e08a')
+        audit_id = uuid.UUID('05714ed9-cbaa-463c-946b-28d37ff6937f')
+
+        revision, created = freeze_draft_service(
+            draft_id=draft.public_id,
+            actor=self.account,
+            instructor_session=None,
+            expected_version=draft.version,
+            revision_public_id=revision_id,
+            audit_event_id=audit_id,
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(revision.public_id, revision_id)
+        event = InstructorAuditEvent.objects.get(event_id=audit_id)
+        self.assertEqual(event.target_id, str(draft.question_set.public_id))
+
+    def test_freeze_rejects_requested_revision_id_collision_without_side_effects(self):
+        first_draft = create_draft_service(
+            course=self.course,
+            actor=self.account,
+            instructor_session=None,
+            template_id='weekly-reflection',
+        )
+        collision_id = uuid.UUID('e4507ace-ae34-42d8-9037-0521cb8ff01a')
+        freeze_draft_service(
+            draft_id=first_draft.public_id,
+            actor=self.account,
+            instructor_session=None,
+            expected_version=first_draft.version,
+            revision_public_id=collision_id,
+        )
+        second_draft = create_draft_service(
+            course=self.course,
+            actor=self.account,
+            instructor_session=None,
+            template_id='weekly-reflection',
+        )
+
+        with self.assertRaises(QuestionSetError) as raised:
+            freeze_draft_service(
+                draft_id=second_draft.public_id,
+                actor=self.account,
+                instructor_session=None,
+                expected_version=second_draft.version,
+                revision_public_id=collision_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'revision_public_id_conflict')
+        self.assertFalse(
+            QuestionSetRevision.objects.filter(question_set=second_draft.question_set).exists()
+        )
+        second_draft.refresh_from_db()
+        self.assertIsNone(second_draft.base_revision_id)
 
     def test_engine_upgrade_creates_a_new_revision_for_the_same_body(self):
         draft = self.create_draft()
