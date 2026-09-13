@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 import uuid
 from datetime import timedelta
 from unittest.mock import patch
@@ -7,8 +8,10 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, connections
+from django.db.migrations.executor import MigrationExecutor
 from django.db.models.deletion import ProtectedError
-from django.test import Client, TestCase
+from django.test import Client, TestCase, TransactionTestCase
 from django.utils import timezone
 
 from datapipeline.models import (
@@ -20,6 +23,7 @@ from datapipeline.models import (
     InstitutionMembership,
     InstructorAccount,
     InstructorAuditEvent,
+    InstructorSession,
     PreviewMessage,
     PreviewSession,
     QuestionSetDraft,
@@ -33,6 +37,54 @@ from datapipeline.question_sets import (
     create_survey_from_revision,
     freeze_draft as freeze_draft_service,
 )
+
+
+def _survey_persistence_state():
+    return {
+        'surveys': list(
+            FeedbackGPT.objects.order_by('pk').values(
+                'pk',
+                'public_id',
+                'name',
+                'survey_label',
+                'instructions',
+                'created_by',
+                'course_id',
+                'week_number',
+                'opens_at',
+                'expires_at',
+                'is_closed',
+                'anonymity_mode',
+                'reporting_structure',
+                'mode',
+                'form_schema_id',
+            )
+        ),
+        'links': list(
+            QuestionSetSurvey.objects.order_by('pk').values(
+                'pk',
+                'survey_id',
+                'revision_id',
+                'idempotency_key',
+                'created_by_id',
+            )
+        ),
+        'events': list(
+            InstructorAuditEvent.objects.order_by('pk').values(
+                'pk',
+                'event_id',
+                'action',
+                'outcome',
+                'actor_id',
+                'session_id',
+                'course_id',
+                'course_id_snapshot',
+                'target_type',
+                'target_id',
+                'metadata',
+            )
+        ),
+    }
 
 
 class QuestionSetWizardApiTests(TestCase):
@@ -248,13 +300,14 @@ class QuestionSetWizardApiTests(TestCase):
         self,
         *,
         revision,
+        instructor_session=None,
         survey_public_id=None,
         audit_event_id=None,
     ):
         return create_survey_from_revision(
             revision=revision,
             actor=self.account,
-            instructor_session=None,
+            instructor_session=instructor_session,
             idempotency_key='service-survey-idempotency',
             survey_label='Ignored on idempotent retry',
             week_number=9,
@@ -295,38 +348,7 @@ class QuestionSetWizardApiTests(TestCase):
         )
 
     def service_survey_state(self):
-        return {
-            'surveys': list(
-                FeedbackGPT.objects.order_by('pk').values(
-                    'pk',
-                    'public_id',
-                    'course_id',
-                    'mode',
-                )
-            ),
-            'links': list(
-                QuestionSetSurvey.objects.order_by('pk').values(
-                    'pk',
-                    'survey_id',
-                    'revision_id',
-                    'idempotency_key',
-                    'created_by_id',
-                )
-            ),
-            'events': list(
-                InstructorAuditEvent.objects.order_by('pk').values(
-                    'pk',
-                    'event_id',
-                    'action',
-                    'outcome',
-                    'actor_id',
-                    'course_id',
-                    'target_type',
-                    'target_id',
-                    'metadata',
-                )
-            ),
-        }
+        return _survey_persistence_state()
 
     def test_templates_require_auth_and_only_offer_individual_reflections(self):
         denied = self.client.get('/datapipeline/api/question_set_templates/')
@@ -894,6 +916,59 @@ class QuestionSetWizardApiTests(TestCase):
         self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
         self.assertEqual(self.service_survey_state(), state_before)
 
+    def test_service_survey_retry_rejects_wrong_instructor_session(self):
+        revision, link, audit_event_id = self.create_service_survey()
+        instructor_session = InstructorSession.objects.get(
+            instructor=self.account,
+            revoked_at__isnull=True,
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                instructor_session=instructor_session,
+                survey_public_id=link.survey.public_id,
+                audit_event_id=audit_event_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_course_id_snapshot(self):
+        revision, link, audit_event_id = self.create_service_survey()
+        InstructorAuditEvent.objects.filter(event_id=audit_event_id).update(
+            course_id_snapshot='wrong-course-snapshot',
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id=link.survey.public_id,
+                audit_event_id=audit_event_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_target_type(self):
+        revision, link, audit_event_id = self.create_service_survey()
+        InstructorAuditEvent.objects.filter(event_id=audit_event_id).update(
+            target_type='course',
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id=link.survey.public_id,
+                audit_event_id=audit_event_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
+
     def test_expired_preview_capability_cannot_be_used_or_completed(self):
         draft = self.create_draft()
         revision = self.freeze_draft(draft)
@@ -1000,3 +1075,189 @@ class QuestionSetWizardApiTests(TestCase):
 
         self.assertEqual(preview.status_code, 200)
         self.assertEqual(preview.json()['name'], draft['body']['title'])
+
+
+class QuestionSetSurveyRaceTests(TransactionTestCase):
+    idempotency_key = 'concurrent-survey-idempotency'
+
+    def setUp(self):
+        executor = MigrationExecutor(connections['default'])
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        self.institution = Institution.objects.create(
+            slug='race-institution',
+            name='Race Institution',
+        )
+        self.user = get_user_model().objects.create_user(
+            username='race-instructor@qa.invalid',
+            email='race-instructor@qa.invalid',
+        )
+        self.account = InstructorAccount.objects.create(
+            user=self.user,
+            email='race-instructor@qa.invalid',
+            display_name='Race Instructor',
+            must_change_password=False,
+        )
+        institution_membership = InstitutionMembership.objects.create(
+            institution=self.institution,
+            instructor=self.account,
+        )
+        self.course = Course.objects.create(
+            course_id='race-course',
+            course_name='Race Course',
+            instructor_name='Race Instructor',
+            password=make_password(None),
+            institution=self.institution,
+        )
+        CourseMembership.objects.create(
+            course=self.course,
+            institution_membership=institution_membership,
+            role=CourseMembership.ROLE_OWNER,
+        )
+        draft = create_draft_service(
+            course=self.course,
+            actor=self.account,
+            instructor_session=None,
+            template_id='weekly-reflection',
+        )
+        self.revision, created = freeze_draft_service(
+            draft_id=draft.public_id,
+            actor=self.account,
+            instructor_session=None,
+            expected_version=draft.version,
+        )
+        self.assertTrue(created)
+        PreviewSession.objects.create(
+            revision=self.revision,
+            instructor=self.account,
+            token_digest=hashlib.sha256(b'race-preview').hexdigest(),
+            expires_at=timezone.now() + timedelta(hours=1),
+            completed_at=timezone.now(),
+        )
+        self.winner_survey = FeedbackGPT.objects.create(
+            public_id='race-winner',
+            name='Concurrent winner',
+            survey_label='Concurrent winner',
+            instructions='Concurrent winner instructions.',
+            created_by=self.account.display_name,
+            course=self.course,
+            week_number=4,
+            is_closed=False,
+            anonymity_mode='anonymous',
+            reporting_structure='',
+            mode='form',
+            form_schema=None,
+        )
+        self.race_winner_state = None
+
+    def call_with_concurrent_winner(
+        self,
+        *,
+        supplied_audit_event_id,
+        winner_audit_event_id,
+    ):
+        original_create = QuestionSetSurvey.objects.create
+        thread_errors = []
+        winner_states = []
+
+        def persist_winner():
+            connections.close_all()
+            try:
+                revision = QuestionSetRevision.objects.get(pk=self.revision.pk)
+                actor = InstructorAccount.objects.get(pk=self.account.pk)
+                course = Course.objects.get(pk=self.course.pk)
+                survey = FeedbackGPT.objects.get(pk=self.winner_survey.pk)
+                original_create(
+                    survey=survey,
+                    revision=revision,
+                    idempotency_key=self.idempotency_key,
+                    created_by=actor,
+                )
+                record_instructor_event(
+                    event_id=winner_audit_event_id,
+                    action=InstructorAuditEvent.ACTION_SURVEY_CREATED,
+                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+                    actor=actor,
+                    session=None,
+                    course=course,
+                    target_type='survey',
+                    target_id=survey.pk,
+                    metadata={'mode': 'form'},
+                )
+                winner_states.append(_survey_persistence_state())
+            except Exception as exc:  # pragma: no cover - asserted below
+                thread_errors.append(exc)
+            finally:
+                connections.close_all()
+
+        def collide_at_link_create(**_kwargs):
+            worker = threading.Thread(target=persist_winner)
+            worker.start()
+            worker.join(timeout=10)
+            if worker.is_alive():
+                raise AssertionError('Concurrent winner did not finish.')
+            if thread_errors:
+                raise thread_errors[0]
+            self.assertEqual(len(winner_states), 1)
+            self.race_winner_state = winner_states[0]
+            raise IntegrityError('forced concurrent link winner')
+
+        with patch.object(
+            QuestionSetSurvey.objects,
+            'create',
+            side_effect=collide_at_link_create,
+        ):
+            return create_survey_from_revision(
+                revision=self.revision,
+                actor=self.account,
+                instructor_session=None,
+                idempotency_key=self.idempotency_key,
+                survey_label='Losing survey',
+                week_number=9,
+                opens_at=None,
+                expires_at=None,
+                audit_event_id=supplied_audit_event_id,
+            )
+
+    def test_concurrent_winner_retry_rejects_mismatched_audit_id_without_mutation(self):
+        mismatched_event_id = uuid.UUID('0e4069ef-7875-465d-a2b7-a3911ae422a1')
+        winner_event_id = uuid.UUID('513e62df-5b64-4b75-b3e6-039387403f17')
+        record_instructor_event(
+            event_id=mismatched_event_id,
+            action=InstructorAuditEvent.ACTION_SURVEY_UPDATED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=self.account,
+            session=None,
+            course=self.course,
+            target_type='survey',
+            target_id=self.winner_survey.pk,
+            metadata={'changed_fields': []},
+        )
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.call_with_concurrent_winner(
+                supplied_audit_event_id=mismatched_event_id,
+                winner_audit_event_id=winner_event_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertIsNotNone(self.race_winner_state)
+        self.assertEqual(_survey_persistence_state(), self.race_winner_state)
+        self.assertEqual(FeedbackGPT.objects.count(), 1)
+        self.assertEqual(QuestionSetSurvey.objects.count(), 1)
+        self.assertEqual(InstructorAuditEvent.objects.count(), 4)
+
+    def test_concurrent_winner_retry_accepts_matching_audit_id_without_mutation(self):
+        winner_event_id = uuid.UUID('b709ce1f-f5cf-4a42-b7fa-f1460eab7250')
+
+        link, created = self.call_with_concurrent_winner(
+            supplied_audit_event_id=winner_event_id,
+            winner_audit_event_id=winner_event_id,
+        )
+
+        self.assertFalse(created)
+        self.assertEqual(link.survey_id, self.winner_survey.pk)
+        self.assertIsNotNone(self.race_winner_state)
+        self.assertEqual(_survey_persistence_state(), self.race_winner_state)
+        self.assertEqual(FeedbackGPT.objects.count(), 1)
+        self.assertEqual(QuestionSetSurvey.objects.count(), 1)
+        self.assertEqual(InstructorAuditEvent.objects.count(), 3)
