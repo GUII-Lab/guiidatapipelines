@@ -4,15 +4,15 @@ import json
 import os
 import secrets
 import uuid
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ValidationError
-from django.db import connection
+from django.db import DatabaseError, connection
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import Client, TestCase, override_settings
+from django.test import Client, SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
 from datapipeline.models import (
@@ -87,6 +87,13 @@ def _runtime_password():
 @override_settings(LEAI_ENV='qa')
 class QASeedTests(TestCase):
     def setUp(self):
+        self.schema_guard = patch(
+            'datapipeline.qa_seed.require_environment_database_schema',
+            return_value='leai_qa',
+            create=True,
+        )
+        self.schema_guard.start()
+        self.addCleanup(self.schema_guard.stop)
         self.passwords = {
             email: _runtime_password()
             for email in QA_INSTRUCTOR_EMAILS
@@ -413,6 +420,20 @@ class QASeedTests(TestCase):
 
 
 class QASeedCommandTests(TestCase):
+    def setUp(self):
+        self.command_schema_guard = patch(
+            'datapipeline.management.commands.seed_leai_qa.require_environment_database_schema',
+            return_value='leai_qa',
+        )
+        self.service_schema_guard = patch(
+            'datapipeline.qa_seed.require_environment_database_schema',
+            return_value='leai_qa',
+        )
+        self.command_schema_guard.start()
+        self.service_schema_guard.start()
+        self.addCleanup(self.command_schema_guard.stop)
+        self.addCleanup(self.service_schema_guard.stop)
+
     def test_seed_refuses_non_qa_environment_before_requesting_credentials(self):
         with override_settings(LEAI_ENV='production'):
             with patch('getpass.getpass') as prompt:
@@ -460,3 +481,72 @@ class QASeedCommandTests(TestCase):
             for key, value in payload.items()
             if key != 'seed_version'
         ))
+
+
+class QASeedSchemaGuardTests(SimpleTestCase):
+    databases = {'default'}
+
+    def schema_module(self):
+        try:
+            from datapipeline import database_schema
+        except ImportError:
+            self.fail('database schema helper must exist')
+        return database_schema
+
+    @override_settings(LEAI_ENV='qa', LEAI_DB_SCHEMA='leai_qa')
+    def test_service_rejects_nonmatching_active_schema_before_fixture_work(self):
+        schema = self.schema_module()
+        for active in (None, 'public', 'leai_qa,public'):
+            with self.subTest(active=active):
+                cursor = MagicMock()
+                cursor.__enter__.return_value = cursor
+                cursor.fetchone.return_value = None if active is None else (active,)
+                with patch.object(schema.connection, 'cursor', return_value=cursor), patch(
+                    'datapipeline.qa_seed._normalized_passwords',
+                    side_effect=QASeedError('fixture work must not begin'),
+                ) as normalize:
+                    with self.assertRaisesRegex(
+                        QASeedError,
+                        'Database schema verification failed',
+                    ):
+                        seed_qa_data()
+                normalize.assert_not_called()
+                cursor.execute.assert_called_once_with('SELECT current_schema()')
+
+    @override_settings(LEAI_ENV='qa', LEAI_DB_SCHEMA='leai_qa')
+    def test_service_rejects_unavailable_schema_before_fixture_work(self):
+        schema = self.schema_module()
+        with patch.object(
+            schema.connection,
+            'cursor',
+            side_effect=DatabaseError('DATABASE_URL=postgres://secret-bearing-error'),
+        ), patch(
+            'datapipeline.qa_seed._normalized_passwords',
+            side_effect=QASeedError('fixture work must not begin'),
+        ) as normalize:
+            with self.assertRaisesRegex(
+                QASeedError,
+                'Database schema verification failed',
+            ) as raised:
+                seed_qa_data()
+
+        self.assertNotIn('secret-bearing-error', str(raised.exception))
+        normalize.assert_not_called()
+
+    @override_settings(LEAI_ENV='qa', LEAI_DB_SCHEMA='leai_qa')
+    def test_command_rejects_nonmatching_schema_before_instructor_lookup(self):
+        schema = self.schema_module()
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.return_value = ('public',)
+        with patch.object(schema.connection, 'cursor', return_value=cursor), patch(
+            'datapipeline.management.commands.seed_leai_qa.InstructorAccount.objects.filter',
+        ) as instructor_lookup:
+            with self.assertRaisesRegex(
+                CommandError,
+                'Database schema verification failed',
+            ):
+                call_command('seed_leai_qa')
+
+        instructor_lookup.assert_not_called()
+        cursor.execute.assert_called_once_with('SELECT current_schema()')

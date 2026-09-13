@@ -32,6 +32,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 LEAI_ENVIRONMENTS = frozenset({'local', 'qa', 'production'})
+_LEAI_EXPECTED_DB_SCHEMA = {
+    'local': 'public',
+    'qa': 'leai_qa',
+    'production': 'public',
+}
 _LEAI_TRUE_VALUES = frozenset({'1', 'true', 'yes', 'on'})
 _LEAI_FALSE_VALUES = frozenset({'0', 'false', 'no', 'off'})
 _LEAI_BUILD_ID_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
@@ -126,6 +131,30 @@ def check_leai_environment_configuration(app_configs, **kwargs):
             id='leai.E012',
         ))
 
+    expected_schema = _LEAI_EXPECTED_DB_SCHEMA.get(environment)
+    configured_schema = getattr(django_settings, 'LEAI_DB_SCHEMA', '')
+    effective_search_path = (
+        configured_schema
+        if configured_schema == expected_schema
+        else 'pg_catalog'
+    )
+    if configured_schema != expected_schema:
+        errors.append(Error(
+            'LEAI_DB_SCHEMA must match the exact schema for LEAI_ENV.',
+            id='leai.E013',
+        ))
+    if (
+        getattr(django_settings, 'DATABASES', {})
+        .get('default', {})
+        .get('OPTIONS', {})
+        .get('options')
+        != f'-c search_path={effective_search_path}'
+    ):
+        errors.append(Error(
+            'Default database search_path must use the effective LEAI schema.',
+            id='leai.E014',
+        ))
+
     if environment in {'qa', 'production'}:
         allowed_hosts = getattr(django_settings, 'LEAI_ALLOWED_HOSTS', [])
         allowed_origins = getattr(django_settings, 'LEAI_ALLOWED_ORIGINS', [])
@@ -174,6 +203,10 @@ def check_leai_environment_configuration(app_configs, **kwargs):
 
 
 LEAI_ENV = os.environ.get('LEAI_ENV', 'local').strip().lower()
+LEAI_DB_SCHEMA = os.environ.get(
+    'LEAI_DB_SCHEMA',
+    'public' if LEAI_ENV in {'local', 'production'} else '',
+).strip()
 _leai_build_id = os.environ.get(
     'LEAI_BUILD_ID',
     'local' if LEAI_ENV == 'local' else '',
@@ -336,3 +369,12 @@ CSRF_TRUSTED_ORIGINS = LEAI_ALLOWED_ORIGINS
 # Keep the helper's database/static behavior, but never allow it to broaden
 # the explicit environment-specific host policy back to ['*'].
 django_heroku.settings(locals(), allowed_hosts=False)
+
+_effective_search_path = (
+    LEAI_DB_SCHEMA
+    if LEAI_DB_SCHEMA == _LEAI_EXPECTED_DB_SCHEMA.get(LEAI_ENV)
+    else 'pg_catalog'
+)
+DATABASES['default'].setdefault('OPTIONS', {})['options'] = (
+    f'-c search_path={_effective_search_path}'
+)

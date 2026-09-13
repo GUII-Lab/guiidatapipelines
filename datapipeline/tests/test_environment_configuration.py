@@ -18,6 +18,7 @@ from django.test.utils import CaptureQueriesContext
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LEAI_ENVIRONMENT_VARIABLES = (
     'LEAI_ENV',
+    'LEAI_DB_SCHEMA',
     'LEAI_BUILD_ID',
     'LEAI_EMAIL_ENABLED',
     'LEAI_ALLOWED_HOSTS',
@@ -63,6 +64,8 @@ payload = {
     'secure_hsts_preload': settings.SECURE_HSTS_PRELOAD,
     'session_cookie_secure': settings.SESSION_COOKIE_SECURE,
     'csrf_cookie_secure': settings.CSRF_COOKIE_SECURE,
+    'database_schema': getattr(settings, 'LEAI_DB_SCHEMA', None),
+    'database_options': settings.DATABASES['default'].get('OPTIONS', {}),
     'leai_check_ids': sorted(
         issue.id for issue in issues
         if issue.id.startswith('leai.')
@@ -88,6 +91,11 @@ print(json.dumps(payload))
 
         self.assertEqual(loaded['environment'], 'local')
         self.assertEqual(loaded['build_id'], 'local')
+        self.assertEqual(loaded['database_schema'], 'public')
+        self.assertEqual(
+            loaded['database_options']['options'],
+            '-c search_path=public',
+        )
         self.assertIs(loaded['email_enabled'], False)
         self.assertIn('localhost', loaded['allowed_hosts'])
         self.assertIn('testserver', loaded['allowed_hosts'])
@@ -97,6 +105,7 @@ print(json.dumps(payload))
     def test_qa_uses_only_explicit_hosts_and_origins(self):
         loaded = self.load_settings(
             LEAI_ENV='qa',
+            LEAI_DB_SCHEMA='leai_qa',
             LEAI_BUILD_ID='abc1234',
             LEAI_EMAIL_ENABLED='false',
             LEAI_ALLOWED_HOSTS='qa-api.example,qa-alt.example',
@@ -105,6 +114,11 @@ print(json.dumps(payload))
         )
 
         self.assertEqual(loaded['environment'], 'qa')
+        self.assertEqual(loaded['database_schema'], 'leai_qa')
+        self.assertEqual(
+            loaded['database_options']['options'],
+            '-c search_path=leai_qa',
+        )
         self.assertEqual(loaded['build_id'], 'abc1234')
         self.assertIs(loaded['email_enabled'], False)
         self.assertEqual(
@@ -133,6 +147,7 @@ print(json.dumps(payload))
     def test_production_also_disables_allow_all_cors(self):
         loaded = self.load_settings(
             LEAI_ENV='production',
+            LEAI_DB_SCHEMA='public',
             LEAI_BUILD_ID='release-2026.09.13',
             LEAI_EMAIL_ENABLED='true',
             LEAI_ALLOWED_HOSTS='api.example.edu',
@@ -141,6 +156,11 @@ print(json.dumps(payload))
         )
 
         self.assertEqual(loaded['environment'], 'production')
+        self.assertEqual(loaded['database_schema'], 'public')
+        self.assertEqual(
+            loaded['database_options']['options'],
+            '-c search_path=public',
+        )
         self.assertIs(loaded['email_enabled'], True)
         self.assertIs(loaded['cors_allow_all_origins'], False)
         self.assertEqual(loaded['cors_allowed_origins'], ['https://example.edu'])
@@ -202,6 +222,57 @@ print(json.dumps(payload))
 
         self.assertIn('leai.E012', loaded['leai_check_ids'])
 
+    def test_qa_schema_misconfiguration_uses_only_non_application_fallback(self):
+        cases = (
+            {},
+            {'LEAI_DB_SCHEMA': 'public'},
+            {'LEAI_DB_SCHEMA': 'leai_qa,public'},
+            {'LEAI_DB_SCHEMA': 'leai_qa public'},
+            {'LEAI_DB_SCHEMA': 'not-a-schema'},
+        )
+        for schema_environment in cases:
+            with self.subTest(schema_environment=schema_environment):
+                loaded = self.load_settings(
+                    LEAI_ENV='qa',
+                    LEAI_BUILD_ID='abc1234',
+                    LEAI_EMAIL_ENABLED='false',
+                    LEAI_ALLOWED_HOSTS='qa-api.example',
+                    LEAI_ALLOWED_ORIGINS='https://qa.example',
+                    SECRET_KEY=STRONG_TEST_SECRET_KEY,
+                    **schema_environment,
+                )
+
+                self.assertIn('leai.E013', loaded['leai_check_ids'])
+                self.assertEqual(
+                    loaded['database_options']['options'],
+                    '-c search_path=pg_catalog',
+                )
+                self.assertNotIn(',public', loaded['database_options']['options'])
+                self.assertNotIn(
+                    'leai_qa public',
+                    loaded['database_options']['options'],
+                )
+
+    @override_settings(
+        LEAI_ENV='qa',
+        LEAI_DB_SCHEMA='leai_qa',
+        DATABASES={
+            'default': {
+                **settings.DATABASES['default'],
+                'OPTIONS': {'options': '-c search_path=pg_catalog'},
+            },
+        },
+    )
+    def test_database_option_mismatch_has_a_stable_check_id(self):
+        from guiidatapipelines.settings import check_leai_environment_configuration
+
+        issue_ids = {
+            issue.id
+            for issue in check_leai_environment_configuration(None)
+        }
+
+        self.assertIn('leai.E014', issue_ids)
+
     def test_invalid_environment_email_flag_and_build_id_are_check_errors(self):
         loaded = self.load_settings(
             LEAI_ENV='staging',
@@ -219,10 +290,16 @@ print(json.dumps(payload))
 class EnvironmentEndpointTests(SimpleTestCase):
     @override_settings(
         LEAI_ENV='qa',
+        LEAI_DB_SCHEMA='leai_qa',
         LEAI_BUILD_ID='abc1234',
         LEAI_EMAIL_ENABLED=False,
     )
-    def test_environment_endpoint_reports_only_safe_identity(self):
+    @patch(
+        'datapipeline.environment_views.require_environment_database_schema',
+        return_value='leai_qa',
+        create=True,
+    )
+    def test_environment_endpoint_reports_only_safe_identity(self, schema_guard):
         response = self.client.get('/datapipeline/api/environment/')
 
         self.assertEqual(response.status_code, 200)
@@ -230,21 +307,61 @@ class EnvironmentEndpointTests(SimpleTestCase):
             'environment': 'qa',
             'build_id': 'abc1234',
             'email_enabled': False,
+            'database_schema': 'leai_qa',
         })
+        schema_guard.assert_called_once_with('qa')
         self.assertNotContains(response, 'DATABASE_URL')
         self.assertNotContains(response, 'SECRET_KEY')
 
     @override_settings(
         LEAI_ENV='qa',
+        LEAI_DB_SCHEMA='leai_qa',
         LEAI_BUILD_ID='postgres://must-not-leak',
         LEAI_EMAIL_ENABLED=False,
     )
-    def test_environment_endpoint_does_not_echo_an_unsafe_build_id(self):
+    @patch(
+        'datapipeline.environment_views.require_environment_database_schema',
+        return_value='leai_qa',
+        create=True,
+    )
+    def test_environment_endpoint_does_not_echo_an_unsafe_build_id(self, schema_guard):
         response = self.client.get('/datapipeline/api/environment/')
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['build_id'], '')
+        self.assertEqual(response.json()['database_schema'], 'leai_qa')
+        schema_guard.assert_called_once_with('qa')
         self.assertNotContains(response, 'postgres://must-not-leak')
+
+    @override_settings(
+        LEAI_ENV='qa',
+        LEAI_DB_SCHEMA='leai_qa',
+        LEAI_BUILD_ID='abc1234',
+        LEAI_EMAIL_ENABLED=False,
+    )
+    def test_environment_endpoint_returns_safe_503_when_schema_is_unavailable(self):
+        try:
+            from datapipeline.database_schema import DatabaseSchemaError
+        except ImportError:
+            self.fail('database schema verification helper must exist')
+        with patch(
+            'datapipeline.environment_views.require_environment_database_schema',
+            side_effect=DatabaseSchemaError(
+                'DATABASE_URL=postgres://secret-bearing-error',
+            ),
+            create=True,
+        ):
+            response = self.client.get('/datapipeline/api/environment/')
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {
+            'error': 'Database schema verification failed.',
+        })
+        self.assertNotContains(
+            response,
+            'secret-bearing-error',
+            status_code=503,
+        )
 
     def test_environment_endpoint_rejects_non_get_methods(self):
         for method_name in ('post', 'put', 'patch', 'delete'):
@@ -258,6 +375,7 @@ class EnvironmentEndpointTests(SimpleTestCase):
 class VerifyEnvironmentCommandTests(TestCase):
     valid_qa_settings = {
         'LEAI_ENV': 'qa',
+        'LEAI_DB_SCHEMA': 'leai_qa',
         'LEAI_BUILD_ID': 'abc1234',
         'LEAI_EMAIL_ENABLED': False,
         'LEAI_ALLOWED_HOSTS': ['qa-api.example'],
@@ -274,6 +392,12 @@ class VerifyEnvironmentCommandTests(TestCase):
         'SECURE_HSTS_PRELOAD': True,
         'SESSION_COOKIE_SECURE': True,
         'CSRF_COOKIE_SECURE': True,
+        'DATABASES': {
+            'default': {
+                **settings.DATABASES['default'],
+                'OPTIONS': {'options': '-c search_path=leai_qa'},
+            },
+        },
     }
 
     def test_verify_command_rejects_environment_mismatch(self):
@@ -282,31 +406,36 @@ class VerifyEnvironmentCommandTests(TestCase):
                 call_command('verify_leai_environment', expect='qa')
 
     @override_settings(**valid_qa_settings)
-    def test_verify_command_prints_only_safe_json_and_queries_default_database(self):
+    @patch(
+        'datapipeline.management.commands.verify_leai_environment.require_environment_database_schema',
+        return_value='leai_qa',
+        create=True,
+    )
+    def test_verify_command_prints_only_safe_json_after_schema_verification(
+        self,
+        schema_guard,
+    ):
         stdout = StringIO()
         stderr = StringIO()
 
-        with CaptureQueriesContext(connection) as captured_queries:
-            call_command(
-                'verify_leai_environment',
-                expect='qa',
-                json=True,
-                stdout=stdout,
-                stderr=stderr,
-            )
+        call_command(
+            'verify_leai_environment',
+            expect='qa',
+            json=True,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
         self.assertEqual(json.loads(stdout.getvalue()), {
             'environment': 'qa',
             'build_id': 'abc1234',
             'email_enabled': False,
+            'database_schema': 'leai_qa',
         })
         self.assertEqual(stderr.getvalue(), '')
         self.assertNotIn('DATABASE_URL', stdout.getvalue())
         self.assertNotIn(settings.SECRET_KEY, stdout.getvalue())
-        self.assertTrue(any(
-            query['sql'].strip().upper() == 'SELECT 1'
-            for query in captured_queries.captured_queries
-        ))
+        schema_guard.assert_called_once_with('qa')
 
     @override_settings(
         LEAI_ENV='qa',
@@ -344,7 +473,14 @@ class VerifyEnvironmentCommandTests(TestCase):
     @override_settings(**{
         **valid_qa_settings,
         'LEAI_ENV': 'production',
+        'LEAI_DB_SCHEMA': 'public',
         'LEAI_EMAIL_ENABLED': True,
+        'DATABASES': {
+            'default': {
+                **settings.DATABASES['default'],
+                'OPTIONS': {'options': '-c search_path=public'},
+            },
+        },
     })
     def test_secure_production_verification_can_enable_email(self):
         stdout = StringIO()
@@ -360,20 +496,28 @@ class VerifyEnvironmentCommandTests(TestCase):
             'environment': 'production',
             'build_id': 'abc1234',
             'email_enabled': True,
+            'database_schema': 'public',
         })
 
     @override_settings(**valid_qa_settings)
-    @patch(
-        'datapipeline.management.commands.verify_leai_environment.connection.cursor',
-        side_effect=DatabaseError('DATABASE_URL=postgres://secret-bearing-error'),
-    )
-    def test_database_failure_suppresses_secret_bearing_cause(self, _cursor):
+    def test_database_failure_suppresses_secret_bearing_cause(self):
+        try:
+            from datapipeline.database_schema import DatabaseSchemaError
+        except ImportError:
+            self.fail('database schema verification helper must exist')
         with self.assertRaises(CommandError) as raised:
-            call_command('verify_leai_environment', expect='qa', json=True)
+            with patch(
+                'datapipeline.management.commands.verify_leai_environment.require_environment_database_schema',
+                side_effect=DatabaseSchemaError(
+                    'DATABASE_URL=postgres://secret-bearing-error',
+                ),
+                create=True,
+            ):
+                call_command('verify_leai_environment', expect='qa', json=True)
 
         error = raised.exception
         rendered_traceback = ''.join(traceback.format_exception(error))
-        self.assertEqual(str(error), 'Default database verification failed.')
+        self.assertEqual(str(error), 'Database schema verification failed.')
         self.assertIsNone(error.__cause__)
         self.assertIs(error.__suppress_context__, True)
         self.assertNotIn('secret-bearing-error', rendered_traceback)

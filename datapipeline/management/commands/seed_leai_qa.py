@@ -5,6 +5,10 @@ import os
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
+from datapipeline.database_schema import (
+    DatabaseSchemaError,
+    require_environment_database_schema,
+)
 from datapipeline.models import InstructorAccount
 from datapipeline.qa_seed import (
     QA_INSTRUCTOR_EMAILS,
@@ -41,6 +45,10 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         if getattr(settings, 'LEAI_ENV', None) != 'qa':
             raise CommandError('LEAI QA seed is available only when LEAI_ENV is qa.')
+        try:
+            require_environment_database_schema('qa')
+        except DatabaseSchemaError:
+            raise CommandError('Database schema verification failed.') from None
         reset = options['reset']
         if reset and options['confirm'] != 'qa':
             raise CommandError('QA reset requires exact confirmation: --confirm qa.')

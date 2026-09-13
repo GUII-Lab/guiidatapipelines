@@ -3,8 +3,11 @@ import json
 from django.conf import settings
 from django.core import checks
 from django.core.management.base import BaseCommand, CommandError
-from django.db import DatabaseError, connection
 
+from datapipeline.database_schema import (
+    DatabaseSchemaError,
+    require_environment_database_schema,
+)
 from datapipeline.environment_views import environment_identity
 
 
@@ -43,15 +46,11 @@ class Command(BaseCommand):
             raise CommandError(f'Deployment checks failed: {issue_ids}')
 
         try:
-            with connection.cursor() as cursor:
-                cursor.execute('SELECT 1')
-                result = cursor.fetchone()
-        except DatabaseError:
-            raise CommandError('Default database verification failed.') from None
-        if not result or result[0] != 1:
-            raise CommandError('Default database verification failed.')
+            database_schema = require_environment_database_schema(expected_environment)
+        except DatabaseSchemaError:
+            raise CommandError('Database schema verification failed.') from None
 
-        identity = environment_identity()
+        identity = environment_identity(database_schema=database_schema)
         if options['as_json']:
             self.stdout.write(json.dumps(identity, sort_keys=True))
             return

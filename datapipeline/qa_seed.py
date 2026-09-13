@@ -10,6 +10,11 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from django.db import transaction
+
+from datapipeline.database_schema import (
+    DatabaseSchemaError,
+    require_environment_database_schema,
+)
 from django.db.models import Q
 from django.utils import timezone
 
@@ -132,6 +137,10 @@ class QASeedError(RuntimeError):
 def _require_qa_environment(*, reset: bool, confirm: str | None) -> None:
     if getattr(settings, 'LEAI_ENV', None) != 'qa':
         raise QASeedError('LEAI QA seed is available only when LEAI_ENV is qa.')
+    try:
+        require_environment_database_schema('qa')
+    except DatabaseSchemaError:
+        raise QASeedError('Database schema verification failed.') from None
     if reset and confirm != 'qa':
         raise QASeedError('QA reset requires exact confirmation: qa.')
 
