@@ -56,11 +56,12 @@ def _valid_leai_build_id(value):
 
 def _valid_allowed_host(value):
     candidate = str(value or '')
-    if not candidate or candidate == '*' or any(char.isspace() for char in candidate):
-        return False
-    if candidate.startswith('.'):
-        candidate = candidate[1:]
-    if not candidate:
+    if (
+        not candidate
+        or candidate.startswith('.')
+        or '*' in candidate
+        or any(char.isspace() for char in candidate)
+    ):
         return False
     if candidate.startswith('[') and candidate.endswith(']'):
         candidate = candidate[1:-1]
@@ -79,7 +80,8 @@ def _valid_allowed_origin(value):
         return False
     return (
         parsed.scheme == 'https'
-        and bool(parsed.hostname)
+        and _valid_allowed_host(parsed.hostname)
+        and '*' not in parsed.netloc
         and not parsed.netloc.endswith(':')
         and parsed.username is None
         and parsed.password is None
@@ -114,6 +116,14 @@ def check_leai_environment_configuration(app_configs, **kwargs):
         errors.append(Error(
             'LEAI_BUILD_ID must be a non-secret deployment identifier.',
             id='leai.E003',
+        ))
+    if (
+        environment == 'qa'
+        and getattr(django_settings, 'LEAI_EMAIL_ENABLED', False) is not False
+    ):
+        errors.append(Error(
+            'LEAI_EMAIL_ENABLED must be false in QA.',
+            id='leai.E012',
         ))
 
     if environment in {'qa', 'production'}:
@@ -188,6 +198,7 @@ LEAI_ALLOWED_ORIGINS = _comma_separated_environment(
     'LEAI_ALLOWED_ORIGINS',
     _local_allowed_origins if LEAI_ENV == 'local' else (),
 )
+_LEAI_NONLOCAL_ENVIRONMENT = LEAI_ENV in {'qa', 'production'}
 
 
 # Quick-start development settings - unsuitable for production
@@ -200,6 +211,17 @@ SECRET_KEY = 'django-insecure-n=tqs=w%ta2ejbii@g*r!!_)n02bj)@&i7d6zyy%mz5skvn+ke
 DEBUG = LEAI_ENV == 'local'
 
 ALLOWED_HOSTS = LEAI_ALLOWED_HOSTS
+SECURE_SSL_REDIRECT = _LEAI_NONLOCAL_ENVIRONMENT
+SESSION_COOKIE_SECURE = _LEAI_NONLOCAL_ENVIRONMENT
+CSRF_COOKIE_SECURE = _LEAI_NONLOCAL_ENVIRONMENT
+SECURE_HSTS_SECONDS = 31536000 if _LEAI_NONLOCAL_ENVIRONMENT else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = _LEAI_NONLOCAL_ENVIRONMENT
+SECURE_HSTS_PRELOAD = _LEAI_NONLOCAL_ENVIRONMENT
+SECURE_PROXY_SSL_HEADER = (
+    ('HTTP_X_FORWARDED_PROTO', 'https')
+    if _LEAI_NONLOCAL_ENVIRONMENT
+    else None
+)
 
 
 # Application definition

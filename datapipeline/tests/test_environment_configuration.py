@@ -2,13 +2,15 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import connection
+from django.db import DatabaseError, connection
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
@@ -20,6 +22,11 @@ LEAI_ENVIRONMENT_VARIABLES = (
     'LEAI_EMAIL_ENABLED',
     'LEAI_ALLOWED_HOSTS',
     'LEAI_ALLOWED_ORIGINS',
+    'SECRET_KEY',
+)
+
+STRONG_TEST_SECRET_KEY = (
+    'task-3-test-only-secret-key-with-more-than-fifty-safe-characters-123456789'
 )
 
 
@@ -37,9 +44,10 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'guiidatapipelines.settings')
 
 import django
 from django.conf import settings
-from django.core.checks import run_checks
+from django.core.checks import WARNING, run_checks
 
 django.setup()
+issues = run_checks(include_deployment_checks=True)
 payload = {
     'environment': settings.LEAI_ENV,
     'build_id': settings.LEAI_BUILD_ID,
@@ -49,9 +57,18 @@ payload = {
     'cors_allow_all_origins': settings.CORS_ALLOW_ALL_ORIGINS,
     'cors_allowed_origins': settings.CORS_ALLOWED_ORIGINS,
     'csrf_trusted_origins': settings.CSRF_TRUSTED_ORIGINS,
+    'secure_ssl_redirect': settings.SECURE_SSL_REDIRECT,
+    'secure_hsts_seconds': settings.SECURE_HSTS_SECONDS,
+    'secure_hsts_include_subdomains': settings.SECURE_HSTS_INCLUDE_SUBDOMAINS,
+    'secure_hsts_preload': settings.SECURE_HSTS_PRELOAD,
+    'session_cookie_secure': settings.SESSION_COOKIE_SECURE,
+    'csrf_cookie_secure': settings.CSRF_COOKIE_SECURE,
     'leai_check_ids': sorted(
-        issue.id for issue in run_checks(include_deployment_checks=True)
+        issue.id for issue in issues
         if issue.id.startswith('leai.')
+    ),
+    'deployment_issue_ids': sorted(
+        issue.id for issue in issues if issue.level >= WARNING
     ),
 }
 print(json.dumps(payload))
@@ -81,14 +98,15 @@ print(json.dumps(payload))
         loaded = self.load_settings(
             LEAI_ENV='qa',
             LEAI_BUILD_ID='abc1234',
-            LEAI_EMAIL_ENABLED='true',
+            LEAI_EMAIL_ENABLED='false',
             LEAI_ALLOWED_HOSTS='qa-api.example,qa-alt.example',
             LEAI_ALLOWED_ORIGINS='https://qa.example,https://review.example',
+            SECRET_KEY=STRONG_TEST_SECRET_KEY,
         )
 
         self.assertEqual(loaded['environment'], 'qa')
         self.assertEqual(loaded['build_id'], 'abc1234')
-        self.assertIs(loaded['email_enabled'], True)
+        self.assertIs(loaded['email_enabled'], False)
         self.assertEqual(
             loaded['allowed_hosts'],
             ['qa-api.example', 'qa-alt.example'],
@@ -103,22 +121,32 @@ print(json.dumps(payload))
             loaded['csrf_trusted_origins'],
             ['https://qa.example', 'https://review.example'],
         )
+        self.assertIs(loaded['secure_ssl_redirect'], True)
+        self.assertGreater(loaded['secure_hsts_seconds'], 0)
+        self.assertIs(loaded['secure_hsts_include_subdomains'], True)
+        self.assertIs(loaded['secure_hsts_preload'], True)
+        self.assertIs(loaded['session_cookie_secure'], True)
+        self.assertIs(loaded['csrf_cookie_secure'], True)
         self.assertEqual(loaded['leai_check_ids'], [])
+        self.assertEqual(loaded['deployment_issue_ids'], [])
 
     def test_production_also_disables_allow_all_cors(self):
         loaded = self.load_settings(
             LEAI_ENV='production',
             LEAI_BUILD_ID='release-2026.09.13',
-            LEAI_EMAIL_ENABLED='false',
+            LEAI_EMAIL_ENABLED='true',
             LEAI_ALLOWED_HOSTS='api.example.edu',
             LEAI_ALLOWED_ORIGINS='https://example.edu',
+            SECRET_KEY=STRONG_TEST_SECRET_KEY,
         )
 
         self.assertEqual(loaded['environment'], 'production')
+        self.assertIs(loaded['email_enabled'], True)
         self.assertIs(loaded['cors_allow_all_origins'], False)
         self.assertEqual(loaded['cors_allowed_origins'], ['https://example.edu'])
         self.assertEqual(loaded['csrf_trusted_origins'], ['https://example.edu'])
         self.assertEqual(loaded['leai_check_ids'], [])
+        self.assertEqual(loaded['deployment_issue_ids'], [])
 
     def test_missing_nonlocal_hosts_and_origins_are_system_check_errors(self):
         loaded = self.load_settings(
@@ -132,17 +160,47 @@ print(json.dumps(payload))
         self.assertNotEqual(loaded['allowed_hosts'], ['*'])
         self.assertIs(loaded['cors_allow_all_origins'], False)
 
-    def test_malformed_nonlocal_hosts_and_origins_are_system_check_errors(self):
+    def test_wildcard_style_nonlocal_hosts_are_system_check_errors(self):
+        for host in ('.example.com', '*.example.com', '*'):
+            with self.subTest(host=host):
+                loaded = self.load_settings(
+                    LEAI_ENV='qa',
+                    LEAI_BUILD_ID='abc1234',
+                    LEAI_EMAIL_ENABLED='false',
+                    LEAI_ALLOWED_HOSTS=host,
+                    LEAI_ALLOWED_ORIGINS='https://qa.example',
+                )
+
+                self.assertIn('leai.E005', loaded['leai_check_ids'])
+
+    def test_wildcard_and_malformed_nonlocal_origins_are_system_check_errors(self):
+        for origin in (
+            'https://*.example.com',
+            'https://*',
+            'https://qa.example/path',
+        ):
+            with self.subTest(origin=origin):
+                loaded = self.load_settings(
+                    LEAI_ENV='qa',
+                    LEAI_BUILD_ID='abc1234',
+                    LEAI_EMAIL_ENABLED='false',
+                    LEAI_ALLOWED_HOSTS='qa-api.example',
+                    LEAI_ALLOWED_ORIGINS=origin,
+                )
+
+                self.assertIn('leai.E007', loaded['leai_check_ids'])
+
+    def test_qa_email_enabled_is_a_system_check_error(self):
         loaded = self.load_settings(
             LEAI_ENV='qa',
             LEAI_BUILD_ID='abc1234',
-            LEAI_EMAIL_ENABLED='false',
-            LEAI_ALLOWED_HOSTS='*',
-            LEAI_ALLOWED_ORIGINS='https://qa.example/path',
+            LEAI_EMAIL_ENABLED='true',
+            LEAI_ALLOWED_HOSTS='qa-api.example',
+            LEAI_ALLOWED_ORIGINS='https://qa.example',
+            SECRET_KEY=STRONG_TEST_SECRET_KEY,
         )
 
-        self.assertIn('leai.E005', loaded['leai_check_ids'])
-        self.assertIn('leai.E007', loaded['leai_check_ids'])
+        self.assertIn('leai.E012', loaded['leai_check_ids'])
 
     def test_invalid_environment_email_flag_and_build_id_are_check_errors(self):
         loaded = self.load_settings(
@@ -208,6 +266,14 @@ class VerifyEnvironmentCommandTests(TestCase):
         'CORS_ALLOW_ALL_ORIGINS': False,
         'CORS_ALLOWED_ORIGINS': ['https://qa.example'],
         'CSRF_TRUSTED_ORIGINS': ['https://qa.example'],
+        'DEBUG': False,
+        'SECRET_KEY': STRONG_TEST_SECRET_KEY,
+        'SECURE_SSL_REDIRECT': True,
+        'SECURE_HSTS_SECONDS': 31536000,
+        'SECURE_HSTS_INCLUDE_SUBDOMAINS': True,
+        'SECURE_HSTS_PRELOAD': True,
+        'SESSION_COOKIE_SECURE': True,
+        'CSRF_COOKIE_SECURE': True,
     }
 
     def test_verify_command_rejects_environment_mismatch(self):
@@ -256,3 +322,58 @@ class VerifyEnvironmentCommandTests(TestCase):
     def test_verify_command_fails_when_deployment_checks_have_errors(self):
         with self.assertRaisesRegex(CommandError, 'leai.E004'):
             call_command('verify_leai_environment', expect='qa', json=True)
+
+    def test_verify_command_fails_on_nonlocal_deployment_warnings(self):
+        warning_cases = (
+            ({'SECURE_HSTS_PRELOAD': False}, 'security.W021'),
+            ({'SECRET_KEY': 'weak'}, 'security.W009'),
+        )
+        for changed_settings, expected_warning in warning_cases:
+            with self.subTest(expected_warning=expected_warning):
+                with override_settings(**{
+                    **self.valid_qa_settings,
+                    **changed_settings,
+                }):
+                    with self.assertRaisesRegex(CommandError, expected_warning):
+                        call_command(
+                            'verify_leai_environment',
+                            expect='qa',
+                            json=True,
+                        )
+
+    @override_settings(**{
+        **valid_qa_settings,
+        'LEAI_ENV': 'production',
+        'LEAI_EMAIL_ENABLED': True,
+    })
+    def test_secure_production_verification_can_enable_email(self):
+        stdout = StringIO()
+
+        call_command(
+            'verify_leai_environment',
+            expect='production',
+            json=True,
+            stdout=stdout,
+        )
+
+        self.assertEqual(json.loads(stdout.getvalue()), {
+            'environment': 'production',
+            'build_id': 'abc1234',
+            'email_enabled': True,
+        })
+
+    @override_settings(**valid_qa_settings)
+    @patch(
+        'datapipeline.management.commands.verify_leai_environment.connection.cursor',
+        side_effect=DatabaseError('DATABASE_URL=postgres://secret-bearing-error'),
+    )
+    def test_database_failure_suppresses_secret_bearing_cause(self, _cursor):
+        with self.assertRaises(CommandError) as raised:
+            call_command('verify_leai_environment', expect='qa', json=True)
+
+        error = raised.exception
+        rendered_traceback = ''.join(traceback.format_exception(error))
+        self.assertEqual(str(error), 'Default database verification failed.')
+        self.assertIsNone(error.__cause__)
+        self.assertIs(error.__suppress_context__, True)
+        self.assertNotIn('secret-bearing-error', rendered_traceback)

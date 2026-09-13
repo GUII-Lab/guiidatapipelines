@@ -28,21 +28,26 @@ class Command(BaseCommand):
                 'the active environment differs.'
             )
 
-        errors = [
+        failure_level = (
+            checks.WARNING
+            if expected_environment in {'qa', 'production'}
+            else checks.ERROR
+        )
+        blocking_issues = [
             issue
             for issue in checks.run_checks(include_deployment_checks=True)
-            if issue.level >= checks.ERROR
+            if issue.level >= failure_level
         ]
-        if errors:
-            error_ids = ', '.join(sorted({issue.id for issue in errors}))
-            raise CommandError(f'Deployment checks failed: {error_ids}')
+        if blocking_issues:
+            issue_ids = ', '.join(sorted({issue.id for issue in blocking_issues}))
+            raise CommandError(f'Deployment checks failed: {issue_ids}')
 
         try:
             with connection.cursor() as cursor:
                 cursor.execute('SELECT 1')
                 result = cursor.fetchone()
-        except DatabaseError as exc:
-            raise CommandError('Default database verification failed.') from exc
+        except DatabaseError:
+            raise CommandError('Default database verification failed.') from None
         if not result or result[0] != 1:
             raise CommandError('Default database verification failed.')
 
