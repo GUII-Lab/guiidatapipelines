@@ -743,6 +743,42 @@ def _new_survey_public_id():
     raise QuestionSetError('public_id_generation_failed')
 
 
+def _validate_existing_survey_retry(
+    *,
+    link,
+    revision,
+    actor,
+    instructor_session,
+    survey_public_id,
+    audit_event_id,
+):
+    if link.revision_id != revision.pk or link.created_by_id != actor.pk:
+        raise QuestionSetError('idempotency_key_conflict')
+    if (
+        survey_public_id is not None
+        and link.survey.public_id != survey_public_id
+    ):
+        raise QuestionSetError('survey_public_id_conflict')
+    if audit_event_id is None:
+        return
+    event = InstructorAuditEvent.objects.filter(event_id=audit_event_id).first()
+    if event is None:
+        raise QuestionSetError('audit_event_id_not_found')
+    course = revision.question_set.course
+    if (
+        event.action != InstructorAuditEvent.ACTION_SURVEY_CREATED
+        or event.outcome != InstructorAuditEvent.OUTCOME_SUCCESS
+        or event.actor_id != actor.pk
+        or event.session_id != getattr(instructor_session, 'pk', None)
+        or event.course_id != course.pk
+        or event.course_id_snapshot != course.course_id
+        or event.target_type != 'survey'
+        or event.target_id != str(link.survey.pk)
+        or event.metadata != {'mode': 'form'}
+    ):
+        raise QuestionSetError('audit_event_id_conflict')
+
+
 @transaction.atomic
 def create_survey_from_revision(
     *,
@@ -764,6 +800,23 @@ def create_survey_from_revision(
     )
     if len(idempotency_key) < 8:
         raise QuestionSetError('invalid_idempotency_key')
+    if survey_public_id is not None:
+        if type(survey_public_id) is not str:
+            raise QuestionSetError(
+                'invalid_survey_public_id',
+                'Survey public ID must be text.',
+            )
+        survey_public_id = survey_public_id.strip()
+        if not survey_public_id or len(survey_public_id) > 16:
+            raise QuestionSetError(
+                'invalid_survey_public_id',
+                'Survey public ID must be between 1 and 16 characters.',
+            )
+    if audit_event_id is not None and type(audit_event_id) is not uuid.UUID:
+        raise QuestionSetError(
+            'invalid_audit_event_id',
+            'Audit event ID must be a UUID.',
+        )
     existing = (
         QuestionSetSurvey.objects
         .select_related('survey', 'revision')
@@ -771,8 +824,14 @@ def create_survey_from_revision(
         .first()
     )
     if existing is not None:
-        if existing.revision_id != revision.pk or existing.created_by_id != actor.pk:
-            raise QuestionSetError('idempotency_key_conflict')
+        _validate_existing_survey_retry(
+            link=existing,
+            revision=revision,
+            actor=actor,
+            instructor_session=instructor_session,
+            survey_public_id=survey_public_id,
+            audit_event_id=audit_event_id,
+        )
         return existing, False
     if not revision.preview_sessions.filter(completed_at__isnull=False).exists():
         raise QuestionSetError('preview_required')
@@ -788,14 +847,11 @@ def create_survey_from_revision(
     if opens_at is not None and expires_at is not None and opens_at >= expires_at:
         raise QuestionSetError('invalid_schedule', 'Closing time must be after opening time.')
 
-    if survey_public_id is not None:
-        survey_public_id = _bounded_text(
-            survey_public_id,
-            'Survey public ID',
-            max_length=16,
-        )
-        if FeedbackGPT.objects.filter(public_id=survey_public_id).exists():
-            raise QuestionSetError('survey_public_id_conflict')
+    if (
+        survey_public_id is not None
+        and FeedbackGPT.objects.filter(public_id=survey_public_id).exists()
+    ):
+        raise QuestionSetError('survey_public_id_conflict')
 
     survey = FeedbackGPT.objects.create(
         public_id=survey_public_id or _new_survey_public_id(),
@@ -835,8 +891,14 @@ def create_survey_from_revision(
         )
         if winner is None:
             raise
-        if winner.revision_id != revision.pk or winner.created_by_id != actor.pk:
-            raise QuestionSetError('idempotency_key_conflict')
+        _validate_existing_survey_retry(
+            link=winner,
+            revision=revision,
+            actor=actor,
+            instructor_session=instructor_session,
+            survey_public_id=survey_public_id,
+            audit_event_id=audit_event_id,
+        )
         return winner, False
     record_instructor_event(
         event_id=audit_event_id,

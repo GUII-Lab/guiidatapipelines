@@ -26,9 +26,11 @@ from datapipeline.models import (
     QuestionSetRevision,
     QuestionSetSurvey,
 )
+from datapipeline.instructor_audit import record_instructor_event
 from datapipeline.question_sets import (
     QuestionSetError,
     create_draft as create_draft_service,
+    create_survey_from_revision,
     freeze_draft as freeze_draft_service,
 )
 
@@ -218,6 +220,113 @@ class QuestionSetWizardApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 201)
         return FeedbackGPT.objects.get(public_id=response.json()['public_id'])
+
+    def create_service_survey(self):
+        draft = self.create_draft()
+        revision_payload = self.freeze_draft(draft)
+        self.complete_preview(revision_payload)
+        revision = QuestionSetRevision.objects.get(
+            public_id=revision_payload['id'],
+        )
+        audit_event_id = uuid.UUID('dd7dbeda-9f52-4411-a3bc-ab9a410112a8')
+        link, created = create_survey_from_revision(
+            revision=revision,
+            actor=self.account,
+            instructor_session=None,
+            idempotency_key='service-survey-idempotency',
+            survey_label='Service survey',
+            week_number=4,
+            opens_at=None,
+            expires_at=None,
+            survey_public_id='service-a',
+            audit_event_id=audit_event_id,
+        )
+        self.assertTrue(created)
+        return revision, link, audit_event_id
+
+    def retry_service_survey(
+        self,
+        *,
+        revision,
+        survey_public_id=None,
+        audit_event_id=None,
+    ):
+        return create_survey_from_revision(
+            revision=revision,
+            actor=self.account,
+            instructor_session=None,
+            idempotency_key='service-survey-idempotency',
+            survey_label='Ignored on idempotent retry',
+            week_number=9,
+            opens_at=None,
+            expires_at=None,
+            survey_public_id=survey_public_id,
+            audit_event_id=audit_event_id,
+        )
+
+    def create_conflicting_survey_event(
+        self,
+        *,
+        event_id,
+        link,
+        action=InstructorAuditEvent.ACTION_SURVEY_CREATED,
+        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+        actor=True,
+        course=None,
+        target_id=None,
+        metadata=None,
+    ):
+        if course is None:
+            course = self.course
+        if target_id is None:
+            target_id = link.survey.pk
+        if metadata is None:
+            metadata = {'mode': 'form'}
+        return record_instructor_event(
+            event_id=event_id,
+            action=action,
+            outcome=outcome,
+            actor=self.account if actor else None,
+            session=None,
+            course=course,
+            target_type='survey',
+            target_id=target_id,
+            metadata=metadata,
+        )
+
+    def service_survey_state(self):
+        return {
+            'surveys': list(
+                FeedbackGPT.objects.order_by('pk').values(
+                    'pk',
+                    'public_id',
+                    'course_id',
+                    'mode',
+                )
+            ),
+            'links': list(
+                QuestionSetSurvey.objects.order_by('pk').values(
+                    'pk',
+                    'survey_id',
+                    'revision_id',
+                    'idempotency_key',
+                    'created_by_id',
+                )
+            ),
+            'events': list(
+                InstructorAuditEvent.objects.order_by('pk').values(
+                    'pk',
+                    'event_id',
+                    'action',
+                    'outcome',
+                    'actor_id',
+                    'course_id',
+                    'target_type',
+                    'target_id',
+                    'metadata',
+                )
+            ),
+        }
 
     def test_templates_require_auth_and_only_offer_individual_reflections(self):
         denied = self.client.get('/datapipeline/api/question_set_templates/')
@@ -572,6 +681,218 @@ class QuestionSetWizardApiTests(TestCase):
             public.json()['form_schema_id'],
             f'question-set:{link.revision.question_set.public_id}:v1',
         )
+
+    def test_service_survey_retry_accepts_matching_optional_ids(self):
+        revision, link, audit_event_id = self.create_service_survey()
+        counts_before = (
+            FeedbackGPT.objects.count(),
+            QuestionSetSurvey.objects.count(),
+            InstructorAuditEvent.objects.count(),
+        )
+
+        repeated, created = self.retry_service_survey(
+            revision=revision,
+            survey_public_id=link.survey.public_id,
+            audit_event_id=audit_event_id,
+        )
+
+        self.assertFalse(created)
+        self.assertEqual(repeated.pk, link.pk)
+        self.assertEqual(counts_before, (
+            FeedbackGPT.objects.count(),
+            QuestionSetSurvey.objects.count(),
+            InstructorAuditEvent.objects.count(),
+        ))
+
+    def test_service_survey_retry_rejects_different_optional_ids(self):
+        revision, link, _audit_event_id = self.create_service_survey()
+        second_audit_id = uuid.UUID('eb5431c8-0299-4054-935f-8d8469002e4f')
+        counts_before = (
+            FeedbackGPT.objects.count(),
+            QuestionSetSurvey.objects.count(),
+            InstructorAuditEvent.objects.count(),
+        )
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id='service-b',
+                audit_event_id=second_audit_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'survey_public_id_conflict')
+        link.refresh_from_db()
+        self.assertEqual(link.survey.public_id, 'service-a')
+        self.assertFalse(
+            InstructorAuditEvent.objects.filter(event_id=second_audit_id).exists()
+        )
+        self.assertEqual(counts_before, (
+            FeedbackGPT.objects.count(),
+            QuestionSetSurvey.objects.count(),
+            InstructorAuditEvent.objects.count(),
+        ))
+
+    def test_service_survey_retry_rejects_missing_audit_event(self):
+        revision, _link, _audit_event_id = self.create_service_survey()
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id='service-a',
+                audit_event_id=uuid.UUID('066d68af-50fd-48d8-9434-050a39a33f5b'),
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_not_found')
+        self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_optional_id_types(self):
+        revision, _link, audit_event_id = self.create_service_survey()
+        state_before = self.service_survey_state()
+        invalid_cases = (
+            ({'survey_public_id': uuid.uuid4(), 'audit_event_id': audit_event_id},
+             'invalid_survey_public_id'),
+            ({'survey_public_id': 'service-a', 'audit_event_id': str(audit_event_id)},
+             'invalid_audit_event_id'),
+        )
+
+        for optional_ids, error_code in invalid_cases:
+            with self.subTest(error_code=error_code):
+                with self.assertRaises(QuestionSetError) as raised:
+                    self.retry_service_survey(
+                        revision=revision,
+                        **optional_ids,
+                    )
+                self.assertEqual(raised.exception.code, error_code)
+                self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_action_event(self):
+        revision, link, _audit_event_id = self.create_service_survey()
+        conflicting_id = uuid.UUID('fa25967f-96cf-4ba8-8e3a-aea9d6da8d46')
+        self.create_conflicting_survey_event(
+            event_id=conflicting_id,
+            link=link,
+            action=InstructorAuditEvent.ACTION_SURVEY_UPDATED,
+            metadata={'changed_fields': []},
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id='service-a',
+                audit_event_id=conflicting_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_outcome_event(self):
+        revision, link, _audit_event_id = self.create_service_survey()
+        conflicting_id = uuid.UUID('27021f45-04af-4498-bf00-5b634c370cee')
+        self.create_conflicting_survey_event(
+            event_id=conflicting_id,
+            link=link,
+            outcome=InstructorAuditEvent.OUTCOME_FAILED,
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id='service-a',
+                audit_event_id=conflicting_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_target_event(self):
+        revision, link, _audit_event_id = self.create_service_survey()
+        conflicting_id = uuid.UUID('3c44cb69-44d9-43d8-80d1-589a4143a776')
+        self.create_conflicting_survey_event(
+            event_id=conflicting_id,
+            link=link,
+            target_id=link.survey.pk + 1000,
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id='service-a',
+                audit_event_id=conflicting_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_actor_event(self):
+        revision, link, _audit_event_id = self.create_service_survey()
+        conflicting_id = uuid.UUID('e1aa68d2-c6b2-4fc6-a623-263745243a21')
+        self.create_conflicting_survey_event(
+            event_id=conflicting_id,
+            link=link,
+            actor=False,
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id='service-a',
+                audit_event_id=conflicting_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_course_event(self):
+        other_course = Course.objects.create(
+            course_id='other-wizard-course',
+            course_name='Other Wizard Course',
+            instructor_name='Prof. Test',
+            password=make_password(None),
+            institution=self.institution,
+        )
+        revision, link, _audit_event_id = self.create_service_survey()
+        conflicting_id = uuid.UUID('78d10c72-9764-453b-b570-0d817bc0f9de')
+        self.create_conflicting_survey_event(
+            event_id=conflicting_id,
+            link=link,
+            course=other_course,
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id='service-a',
+                audit_event_id=conflicting_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
+
+    def test_service_survey_retry_rejects_wrong_metadata_event(self):
+        revision, link, _audit_event_id = self.create_service_survey()
+        conflicting_id = uuid.UUID('c317ec32-852c-45e0-b6e9-0d36f907bce5')
+        self.create_conflicting_survey_event(
+            event_id=conflicting_id,
+            link=link,
+            metadata={'mode': 'general'},
+        )
+        state_before = self.service_survey_state()
+
+        with self.assertRaises(QuestionSetError) as raised:
+            self.retry_service_survey(
+                revision=revision,
+                survey_public_id='service-a',
+                audit_event_id=conflicting_id,
+            )
+
+        self.assertEqual(raised.exception.code, 'audit_event_id_conflict')
+        self.assertEqual(self.service_survey_state(), state_before)
 
     def test_expired_preview_capability_cannot_be_used_or_completed(self):
         draft = self.create_draft()
