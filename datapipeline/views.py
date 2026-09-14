@@ -876,9 +876,15 @@ def issue_completion_certificate(request):
 
 
 @csrf_exempt
-def issue_preview_completion_certificate(request, raw_token):
+def issue_preview_completion_certificate(request):
     if request.method != 'POST':
         return HttpResponse(status=405, content='Method not allowed')
+    # The capability must stay out of paths/queries, which request logs record.
+    # Resolve it only as a preview capability, never as an instructor session.
+    authorization = request.headers.get('Authorization', '').split()
+    if len(authorization) != 2 or authorization[0].lower() != 'bearer':
+        return _private_json_response({'error': 'preview_token_required'}, status=400)
+    raw_token = authorization[1]
     try:
         preview = get_preview(raw_token)
     except QuestionSetError as exc:

@@ -1229,7 +1229,7 @@ class CertificateIssuanceApiTest(TestCase):
 
 
 class PreviewCompletionCertificateApiTest(TestCase):
-    url = "/datapipeline/api/question_set_preview/{token}/completion_certificate/"
+    url = "/datapipeline/api/issue_preview_completion_certificate/"
 
     def setUp(self):
         self.client = Client()
@@ -1271,8 +1271,90 @@ class PreviewCompletionCertificateApiTest(TestCase):
             completion_certificate_enabled=True,
         )
 
-    def _request(self):
-        return self.client.post(self.url.format(token=self.raw_token))
+    def _request(self, token=None):
+        return self.client.post(
+            self.url,
+            HTTP_AUTHORIZATION='Bearer ' + (self.raw_token if token is None else token),
+        )
+
+    def test_rejected_certificate_request_does_not_log_raw_capability(self):
+        with self.assertLogs('django.request', level='WARNING') as captured:
+            response = self._request()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertNotIn(self.raw_token, '\n'.join(captured.output))
+
+    def test_certificate_requires_a_well_formed_capability_header(self):
+        self._save_preview_response()
+        for authorization in ('', 'Bearer', 'Basic ' + self.raw_token, 'Bearer extra ' + self.raw_token):
+            with self.subTest(scheme=authorization.split(' ')[0]):
+                with self.assertLogs('django.request', level='WARNING') as captured:
+                    response = self.client.post(self.url, HTTP_AUTHORIZATION=authorization)
+
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json(), {'error': 'preview_token_required'})
+                self.assertNotIn(self.raw_token, '\n'.join(captured.output))
+        self.assertEqual(SurveyCompletionCertificate.objects.count(), 0)
+
+    def test_renderer_error_does_not_log_capability_or_answers(self):
+        self._save_preview_response()
+        with mock.patch(
+            'datapipeline.views.render_preview_certificate_pdf',
+            side_effect=RuntimeError(self.raw_token + ' Private preview response'),
+        ), self.assertLogs('django.request', level='ERROR') as captured:
+            response = self._request()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {'error': 'Unable to issue preview completion certificate'})
+        for private_value in (self.raw_token, 'Private preview response'):
+            self.assertNotIn(private_value, '\n'.join(captured.output))
+            self.assertNotIn(private_value, response.content.decode())
+        self.assertEqual(SurveyCompletionCertificate.objects.count(), 0)
+
+    def test_invalid_and_digest_tokens_cannot_authorize_a_preview_certificate(self):
+        self._save_preview_response()
+        for token in ('invalid-preview-capability', self.preview.token_digest):
+            with self.subTest(token_kind='digest' if token == self.preview.token_digest else 'invalid'):
+                with self.assertLogs('django.request', level='WARNING') as captured:
+                    response = self._request(token)
+
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.json(), {'error': 'preview_not_found'})
+                self.assertNotIn(token, '\n'.join(captured.output))
+                self.assertEqual(SurveyCompletionCertificate.objects.count(), 0)
+
+    def test_assistant_only_preview_cannot_unlock_certificate(self):
+        PreviewMessage.objects.create(
+            preview_session=self.preview,
+            sequence=1,
+            role=PreviewMessage.ROLE_ASSISTANT,
+            content='Practice question',
+        )
+
+        response = self._request()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(SurveyCompletionCertificate.objects.count(), 0)
+
+    def test_response_in_another_preview_cannot_unlock_certificate(self):
+        other = PreviewSession.objects.create(
+            revision=self.revision,
+            instructor=self.instructor,
+            token_digest=hashlib.sha256(b'other-preview-capability').hexdigest(),
+            expires_at=self.preview.expires_at,
+            ready_at=self.preview.ready_at,
+        )
+        PreviewMessage.objects.create(
+            preview_session=other,
+            sequence=1,
+            role=PreviewMessage.ROLE_USER,
+            content='Response belonging to another preview',
+        )
+
+        response = self._request()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(SurveyCompletionCertificate.objects.count(), 0)
 
     def _save_preview_response(self, content="Private preview response"):
         PreviewMessage.objects.create(
@@ -1332,10 +1414,12 @@ class PreviewCompletionCertificateApiTest(TestCase):
             with self.subTest(name=name):
                 PreviewSession.objects.filter(pk=self.preview.pk).update(**updates)
 
-                response = self._request()
+                with self.assertLogs('django.request', level='WARNING') as captured:
+                    response = self._request()
 
                 self.assertEqual(response.status_code, status)
                 self.assertEqual(response.json()["error"], error)
+                self.assertNotIn(self.raw_token, '\n'.join(captured.output))
                 self.assertEqual(SurveyCompletionCertificate.objects.count(), 0)
 
                 PreviewSession.objects.filter(pk=self.preview.pk).update(
