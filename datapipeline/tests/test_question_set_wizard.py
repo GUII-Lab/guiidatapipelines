@@ -1920,7 +1920,7 @@ class QuestionSetCompletionSettingsMigrationTests(TransactionTestCase):
             created_by=owner,
         )
         survey = FeedbackGPT.objects.create(
-            public_id='completion-migrate-01',
+            public_id='completion-mig01',
             name='Historical completion settings survey',
             survey_label='Historical completion settings survey',
             instructions='Synthetic migration fixture.',
