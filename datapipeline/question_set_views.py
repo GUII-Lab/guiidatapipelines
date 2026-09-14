@@ -104,6 +104,7 @@ def _status_for_error(code):
         'revision_not_found': 404,
         'preview_not_found': 404,
         'preview_expired': 410,
+        'preview_preparing': 425,
         'stale_draft': 409,
         'preview_required': 409,
         'preview_incomplete': 409,
@@ -117,6 +118,8 @@ def _error(exc):
     payload = {'error': exc.code}
     if exc.message != exc.code:
         payload['message'] = exc.message
+    if exc.timing:
+        payload.update(exc.timing)
     return _private_json(payload, _status_for_error(exc.code))
 
 
@@ -298,6 +301,7 @@ def question_set_preview_capability(request, revision_id):
         return _private_json({
             'token': raw_token,
             'expires_at': preview.expires_at.isoformat(),
+            'ready_at': preview.ready_at.isoformat(),
             'preview_url': f'feedback.html?preview={raw_token}',
         }, 201)
     except QuestionSetError as exc:

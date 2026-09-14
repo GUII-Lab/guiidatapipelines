@@ -2,7 +2,7 @@ import hashlib
 import json
 import threading
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone as datetime_timezone
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -187,6 +187,9 @@ class QuestionSetWizardApiTests(TestCase):
         )
         self.assertEqual(capability.status_code, 201)
         token = capability.json()['token']
+        PreviewSession.objects.filter(token_digest=hashlib.sha256(
+            token.encode('utf-8'),
+        ).hexdigest()).update(ready_at=timezone.now())
         stored_revision = QuestionSetRevision.objects.get(public_id=revision['id'])
         for section in stored_revision.compiled_protocol['sections']:
             for field in section['fields']:
@@ -255,7 +258,11 @@ class QuestionSetWizardApiTests(TestCase):
             token=self.token,
         )
         self.assertEqual(capability.status_code, 201)
-        return capability.json()['token']
+        token = capability.json()['token']
+        PreviewSession.objects.filter(token_digest=hashlib.sha256(
+            token.encode('utf-8'),
+        ).hexdigest()).update(ready_at=timezone.now())
+        return token
 
     def create_survey(self):
         draft = self.create_draft()
@@ -812,6 +819,8 @@ class QuestionSetWizardApiTests(TestCase):
             session.token_digest,
         )
         self.assertLessEqual(session.expires_at, timezone.now() + timedelta(hours=24))
+        self.assertIn('ready_at', capability.json())
+        PreviewSession.objects.filter(pk=session.pk).update(ready_at=timezone.now())
 
         loaded = self.client.get(
             f'/datapipeline/api/question_set_preview/{raw_token}/'
@@ -829,6 +838,110 @@ class QuestionSetWizardApiTests(TestCase):
         self.assertEqual(saved.status_code, 201)
         self.assertEqual(PreviewMessage.objects.count(), 1)
         self.assertEqual(FeedbackMessage.objects.count(), 0)
+
+    def test_preview_capability_assigns_random_ready_at_at_both_boundaries(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        created_at = datetime(2026, 9, 13, 12, 0, tzinfo=datetime_timezone.utc)
+
+        with patch(
+            'datapipeline.question_sets.timezone.now',
+            return_value=created_at,
+        ), patch(
+            'datapipeline.question_sets.secrets.randbelow',
+            side_effect=[0, 1200],
+        ):
+            first = self.post_json(
+                f"/datapipeline/api/question_set_revisions/{revision['id']}/preview_capability/",
+                {},
+                token=self.token,
+            )
+            second = self.post_json(
+                f"/datapipeline/api/question_set_revisions/{revision['id']}/preview_capability/",
+                {},
+                token=self.token,
+            )
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        ready_times = list(
+            PreviewSession.objects.order_by('id').values_list('ready_at', flat=True),
+        )
+        self.assertEqual(ready_times, [
+            created_at + timedelta(seconds=2.6),
+            created_at + timedelta(seconds=3.8),
+        ])
+
+    def test_public_preview_access_is_preparing_until_ready_at(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        created_at = datetime(2026, 9, 13, 12, 0, tzinfo=datetime_timezone.utc)
+
+        with patch(
+            'datapipeline.question_sets.timezone.now',
+            return_value=created_at,
+        ), patch('datapipeline.question_sets.secrets.randbelow', return_value=0):
+            capability = self.post_json(
+                f"/datapipeline/api/question_set_revisions/{revision['id']}/preview_capability/",
+                {},
+                token=self.token,
+            )
+
+        self.assertEqual(capability.status_code, 201)
+        raw_token = capability.json()['token']
+        with patch(
+            'datapipeline.question_sets.timezone.now',
+            return_value=created_at + timedelta(seconds=2.599),
+        ):
+            loaded = self.client.get(
+                f'/datapipeline/api/question_set_preview/{raw_token}/',
+            )
+            saved = self.post_json(
+                f'/datapipeline/api/question_set_preview/{raw_token}/messages/',
+                {'role': 'user', 'content': 'Cannot be saved yet.'},
+            )
+            completed = self.post_json(
+                f'/datapipeline/api/question_set_preview/{raw_token}/complete/',
+                {},
+            )
+
+        for response in (loaded, saved, completed):
+            self.assertEqual(response.status_code, 425)
+            self.assertEqual(response.json()['error'], 'preview_preparing')
+            self.assertEqual(
+                response.json()['ready_at'],
+                (created_at + timedelta(seconds=2.6)).isoformat(),
+            )
+            self.assertEqual(response.json()['retry_after_ms'], 1)
+        self.assertEqual(PreviewMessage.objects.count(), 0)
+        self.assertIsNone(PreviewSession.objects.get().completed_at)
+
+    def test_public_preview_access_succeeds_at_ready_at(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        created_at = datetime(2026, 9, 13, 12, 0, tzinfo=datetime_timezone.utc)
+
+        with patch(
+            'datapipeline.question_sets.timezone.now',
+            return_value=created_at,
+        ), patch('datapipeline.question_sets.secrets.randbelow', return_value=0):
+            capability = self.post_json(
+                f"/datapipeline/api/question_set_revisions/{revision['id']}/preview_capability/",
+                {},
+                token=self.token,
+            )
+
+        raw_token = capability.json()['token']
+        with patch(
+            'datapipeline.question_sets.timezone.now',
+            return_value=created_at + timedelta(seconds=2.6),
+        ):
+            loaded = self.client.get(
+                f'/datapipeline/api/question_set_preview/{raw_token}/',
+            )
+
+        self.assertEqual(loaded.status_code, 200)
+        self.assertEqual(loaded.json()['mode'], 'form')
 
     def test_preview_cannot_complete_without_full_stored_conversation_evidence(self):
         draft = self.create_draft()
@@ -1218,6 +1331,8 @@ class QuestionSetWizardApiTests(TestCase):
 
         self.assertEqual(loaded.status_code, 410)
         self.assertEqual(completed.status_code, 410)
+        self.assertEqual(loaded.json()['error'], 'preview_expired')
+        self.assertEqual(completed.json()['error'], 'preview_expired')
 
     def test_legacy_edit_endpoint_cannot_mutate_question_set_survey(self):
         survey = self.create_survey()
@@ -1477,6 +1592,7 @@ class QuestionSetSurveyRaceTests(TransactionTestCase):
             instructor=self.account,
             token_digest=hashlib.sha256(b'race-preview').hexdigest(),
             expires_at=timezone.now() + timedelta(hours=1),
+            ready_at=timezone.now(),
             completed_at=timezone.now(),
         )
         self.winner_survey = FeedbackGPT.objects.create(

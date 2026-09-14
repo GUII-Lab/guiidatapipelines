@@ -993,6 +993,7 @@ class PreviewSession(models.Model):
     )
     token_digest = models.CharField(max_length=64, unique=True)
     expires_at = models.DateTimeField()
+    ready_at = models.DateTimeField()
     completed_at = models.DateTimeField(null=True, blank=True)
     next_message_sequence = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)

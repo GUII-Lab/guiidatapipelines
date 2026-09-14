@@ -128,6 +128,7 @@ _COURSE_SCENARIOS = (
     ('qa-completed-course', 'QA Completed Course'),
 )
 _FIXED_PREVIEW_EXPIRY = datetime(2099, 1, 1, tzinfo=datetime_timezone.utc)
+_FIXED_PREVIEW_READY_AT = datetime(2000, 1, 1, tzinfo=datetime_timezone.utc)
 
 
 class QASeedError(RuntimeError):
@@ -480,6 +481,7 @@ def _ensure_preview(*, revision, primary, allow_inactive_history=False):
         )
         PreviewSession.objects.filter(pk=preview.pk).update(
             expires_at=_FIXED_PREVIEW_EXPIRY,
+            ready_at=_FIXED_PREVIEW_READY_AT,
         )
         preview.refresh_from_db()
         for role, content, attribution in _preview_payloads(revision):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import secrets
 import string
 import uuid
@@ -32,6 +33,8 @@ from .models import (
 COMPILER_VERSION = '1'
 ENGINE_VERSION = 'formmode-v1'
 PREVIEW_TTL = timedelta(hours=12)
+PREVIEW_READY_DELAY_MIN_MS = 2600
+PREVIEW_READY_DELAY_MAX_MS = 3800
 MAX_TEXT_LENGTH = 4000
 
 # Question-set surveys deliberately start with the smallest anonymous student
@@ -212,10 +215,11 @@ SYSTEM_TEMPLATES = (
 
 
 class QuestionSetError(Exception):
-    def __init__(self, code, message=None):
+    def __init__(self, code, message=None, timing=None):
         super().__init__(message or code)
         self.code = code
         self.message = message or code
+        self.timing = timing
 
 
 def list_templates():
@@ -660,12 +664,17 @@ def issue_preview_capability(
         question_set,
         allow_inactive_history=allow_inactive_history,
     )
+    created_at = timezone.now()
+    ready_delay_ms = PREVIEW_READY_DELAY_MIN_MS + secrets.randbelow(
+        PREVIEW_READY_DELAY_MAX_MS - PREVIEW_READY_DELAY_MIN_MS + 1,
+    )
     raw_token = secrets.token_urlsafe(32)
     preview_values = {
         'revision': revision,
         'instructor': actor,
         'token_digest': token_digest(raw_token),
-        'expires_at': timezone.now() + PREVIEW_TTL,
+        'expires_at': created_at + PREVIEW_TTL,
+        'ready_at': created_at + timedelta(milliseconds=ready_delay_ms),
     }
     if preview_public_id is not None:
         preview_values['public_id'] = preview_public_id
@@ -689,8 +698,21 @@ def get_preview(raw_token):
     )
     if preview is None:
         raise QuestionSetError('preview_not_found')
-    if not preview.is_valid:
+    now = timezone.now()
+    if preview.expires_at <= now:
         raise QuestionSetError('preview_expired')
+    if preview.ready_at > now:
+        retry_after_ms = max(
+            1,
+            math.ceil((preview.ready_at - now).total_seconds() * 1000),
+        )
+        raise QuestionSetError(
+            'preview_preparing',
+            timing={
+                'ready_at': preview.ready_at.isoformat(),
+                'retry_after_ms': retry_after_ms,
+            },
+        )
     return preview
 
 
