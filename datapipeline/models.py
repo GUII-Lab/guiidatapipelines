@@ -362,6 +362,8 @@ class InstructorAuditEvent(models.Model):
     ACTION_QUESTION_SET_REVISION_FROZEN = 'question_set.revision_frozen'
     ACTION_QUESTION_SET_PREVIEW_STARTED = 'question_set.preview_started'
     ACTION_QUESTION_SET_PREVIEW_COMPLETED = 'question_set.preview_completed'
+    ACTION_QUESTION_SET_WORKFLOW_ABANDONED = 'question_set.workflow_abandoned'
+    ACTION_QUESTION_SET_WORKFLOW_COMPLETED = 'question_set.workflow_completed'
     ACTION_AUTHORIZATION_DENIED = 'authorization.denied'
 
     ACTION_CHOICES = [
@@ -398,6 +400,8 @@ class InstructorAuditEvent(models.Model):
         (ACTION_QUESTION_SET_REVISION_FROZEN, 'Question set revision frozen'),
         (ACTION_QUESTION_SET_PREVIEW_STARTED, 'Question set preview started'),
         (ACTION_QUESTION_SET_PREVIEW_COMPLETED, 'Question set preview completed'),
+        (ACTION_QUESTION_SET_WORKFLOW_ABANDONED, 'Question set workflow abandoned'),
+        (ACTION_QUESTION_SET_WORKFLOW_COMPLETED, 'Question set workflow completed'),
         (ACTION_AUTHORIZATION_DENIED, 'Authorization denied'),
     ]
 
@@ -774,6 +778,14 @@ class QuestionSet(models.Model):
     AUDIENCE_CHOICES = [
         (AUDIENCE_INDIVIDUAL, 'Individual structured reflection'),
     ]
+    WORKFLOW_ACTIVE = 'active'
+    WORKFLOW_COMPLETED = 'completed'
+    WORKFLOW_ABANDONED = 'abandoned'
+    WORKFLOW_STATUS_CHOICES = [
+        (WORKFLOW_ACTIVE, 'Active'),
+        (WORKFLOW_COMPLETED, 'Completed'),
+        (WORKFLOW_ABANDONED, 'Abandoned'),
+    ]
 
     public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     course = models.ForeignKey(
@@ -793,6 +805,11 @@ class QuestionSet(models.Model):
         choices=AUDIENCE_CHOICES,
         default=AUDIENCE_INDIVIDUAL,
     )
+    workflow_status = models.CharField(
+        max_length=16,
+        choices=WORKFLOW_STATUS_CHOICES,
+        default=WORKFLOW_ACTIVE,
+    )
     archived_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -803,6 +820,10 @@ class QuestionSet(models.Model):
             models.Index(
                 fields=['course', 'archived_at', '-updated_at'],
                 name='leai_qset_course_active',
+            ),
+            models.Index(
+                fields=['course', 'workflow_status', '-updated_at'],
+                name='leai_qset_course_workflow',
             ),
         ]
 

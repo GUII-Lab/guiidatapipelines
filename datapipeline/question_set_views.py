@@ -108,6 +108,8 @@ def _status_for_error(code):
         'preview_required': 409,
         'preview_incomplete': 409,
         'idempotency_key_conflict': 409,
+        'active_draft_exists': 409,
+        'workflow_not_active': 409,
     }.get(code, 400)
 
 
@@ -140,6 +142,11 @@ def _draft_for_id(draft_id):
         )
     except (QuestionSetDraft.DoesNotExist, ValueError):
         raise QuestionSetError('draft_not_found')
+
+
+def _require_active_workflow(question_set):
+    if question_set.workflow_status != 'active':
+        raise QuestionSetError('workflow_not_active')
 
 
 def _revision_for_id(revision_id):
@@ -179,7 +186,9 @@ def question_set_drafts(request):
                 .filter(
                     question_set__course=course,
                     question_set__archived_at__isnull=True,
+                    question_set__workflow_status='active',
                 )
+                .order_by('-updated_at', '-id')[:1]
             )
             return _private_json({
                 'drafts': [serialize_draft(draft) for draft in drafts],
@@ -198,6 +207,9 @@ def question_set_drafts(request):
                 actor=account,
                 instructor_session=session,
                 template_id=str(payload.get('template_id') or ''),
+                confirm_abandon_active=payload.get(
+                    'confirm_abandon_active', False,
+                ),
             )
             return _private_json(serialize_draft(draft), 201)
         return HttpResponse(status=405)
@@ -214,6 +226,7 @@ def question_set_draft_detail(request, draft_id):
         )
         if error is not None:
             return error
+        _require_active_workflow(draft.question_set)
         if request.method == 'GET':
             return _private_json(serialize_draft(draft))
         if request.method == 'PATCH':
@@ -246,6 +259,7 @@ def question_set_draft_freeze(request, draft_id):
         )
         if error is not None:
             return error
+        _require_active_workflow(draft.question_set)
         payload = _body(request)
         expected_version = payload.get('expected_version')
         if type(expected_version) is not int:

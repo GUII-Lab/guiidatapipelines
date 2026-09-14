@@ -16,6 +16,7 @@ from django.utils import timezone
 from .instructor_audit import record_instructor_event
 from .instructor_auth import token_digest
 from .models import (
+    Course,
     FeedbackGPT,
     InstructorAuditEvent,
     PreviewMessage,
@@ -311,6 +312,7 @@ def serialize_draft(draft):
         'template_id': question_set.template_id,
         'title': question_set.title,
         'audience': question_set.audience,
+        'workflow_status': question_set.workflow_status,
         'body': copy.deepcopy(draft.body),
         'version': draft.version,
         'base_revision_id': (
@@ -369,6 +371,35 @@ def _validate_optional_uuid(value, *, field_name, conflict_model=None):
         raise QuestionSetError(f'{field_name}_conflict')
 
 
+def _active_question_sets_for_course(course):
+    return (
+        QuestionSet.objects
+        .select_for_update()
+        .filter(
+            course=course,
+            archived_at__isnull=True,
+            workflow_status=QuestionSet.WORKFLOW_ACTIVE,
+            draft__isnull=False,
+        )
+        .order_by('-draft__updated_at', '-updated_at', '-id')
+    )
+
+
+def abandon_active_draft(*, course, actor, instructor_session):
+    abandoned = []
+    for question_set in _active_question_sets_for_course(course):
+        question_set.workflow_status = QuestionSet.WORKFLOW_ABANDONED
+        question_set.save(update_fields=['workflow_status', 'updated_at'])
+        _record_question_set_event(
+            action=InstructorAuditEvent.ACTION_QUESTION_SET_WORKFLOW_ABANDONED,
+            actor=actor,
+            instructor_session=instructor_session,
+            question_set=question_set,
+        )
+        abandoned.append(question_set)
+    return abandoned
+
+
 @transaction.atomic
 def create_draft(
     *,
@@ -379,7 +410,11 @@ def create_draft(
     question_set_public_id=None,
     draft_public_id=None,
     audit_event_id=None,
+    confirm_abandon_active=False,
 ):
+    if type(confirm_abandon_active) is not bool:
+        raise QuestionSetError('invalid_abandon_confirmation')
+    course = Course.objects.select_for_update().get(pk=course.pk)
     _validate_optional_uuid(
         question_set_public_id,
         field_name='question_set_public_id',
@@ -392,6 +427,14 @@ def create_draft(
     )
     template = get_template(template_id)
     body, _result = validate_body(template['body'])
+    if _active_question_sets_for_course(course).exists():
+        if not confirm_abandon_active:
+            raise QuestionSetError('active_draft_exists')
+        abandon_active_draft(
+            course=course,
+            actor=actor,
+            instructor_session=instructor_session,
+        )
     question_set_values = {
         'course': course,
         'owner': actor,
@@ -833,6 +876,11 @@ def create_survey_from_revision(
             audit_event_id=audit_event_id,
         )
         return existing, False
+    question_set = QuestionSet.objects.select_for_update().get(
+        pk=revision.question_set_id,
+    )
+    if question_set.workflow_status != QuestionSet.WORKFLOW_ACTIVE:
+        raise QuestionSetError('workflow_not_active')
     if not revision.preview_sessions.filter(completed_at__isnull=False).exists():
         raise QuestionSetError('preview_required')
     if week_number is not None and (
@@ -910,6 +958,14 @@ def create_survey_from_revision(
         target_type='survey',
         target_id=survey.pk,
         metadata={'mode': 'form'},
+    )
+    question_set.workflow_status = QuestionSet.WORKFLOW_COMPLETED
+    question_set.save(update_fields=['workflow_status', 'updated_at'])
+    _record_question_set_event(
+        action=InstructorAuditEvent.ACTION_QUESTION_SET_WORKFLOW_COMPLETED,
+        actor=actor,
+        instructor_session=instructor_session,
+        question_set=question_set,
     )
     return link, True
 

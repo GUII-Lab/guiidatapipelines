@@ -29,6 +29,7 @@ from datapipeline.models import (
     QuestionSetDraft,
     QuestionSetRevision,
     QuestionSetSurvey,
+    QuestionSet,
 )
 from datapipeline.instructor_audit import record_instructor_event
 from datapipeline.question_sets import (
@@ -408,6 +409,85 @@ class QuestionSetWizardApiTests(TestCase):
         self.assertEqual(event.actor, self.account)
         self.assertEqual(event.course, self.course)
 
+    def test_replacing_an_active_draft_requires_confirmation_and_keeps_history(self):
+        first = self.create_draft()
+
+        unconfirmed = self.post_json(
+            '/datapipeline/api/question_set_drafts/',
+            {
+                'course_id': self.course.course_id,
+                'template_id': 'mid-course-check-in',
+            },
+            token=self.token,
+        )
+
+        self.assertEqual(unconfirmed.status_code, 409)
+        self.assertEqual(unconfirmed.json()['error'], 'active_draft_exists')
+
+        confirmed = self.post_json(
+            '/datapipeline/api/question_set_drafts/',
+            {
+                'course_id': self.course.course_id,
+                'template_id': 'mid-course-check-in',
+                'confirm_abandon_active': True,
+            },
+            token=self.token,
+        )
+
+        self.assertEqual(confirmed.status_code, 201)
+        first_row = QuestionSetDraft.objects.select_related('question_set').get(
+            public_id=first['id'],
+        )
+        self.assertEqual(
+            getattr(first_row.question_set, 'workflow_status', None),
+            'abandoned',
+        )
+        self.assertTrue(QuestionSetDraft.objects.filter(pk=first_row.pk).exists())
+        listed = self.get_auth(
+            '/datapipeline/api/question_set_drafts/'
+            f'?course_id={self.course.course_id}'
+        )
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(
+            [item['id'] for item in listed.json()['drafts']],
+            [confirmed.json()['id']],
+        )
+        self.assertTrue(InstructorAuditEvent.objects.filter(
+            action='question_set.workflow_abandoned',
+            target_id=str(first_row.question_set.public_id),
+        ).exists())
+
+    def test_successful_publication_completes_its_workflow(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        self.complete_preview(revision)
+
+        published = self.post_json(
+            f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
+            {
+                'course_id': self.course.course_id,
+                'idempotency_key': 'lifecycle-publication-survey',
+                'survey_label': 'Lifecycle publication',
+                'week_number': 4,
+                'opens_at': None,
+                'expires_at': None,
+            },
+            token=self.token,
+        )
+
+        self.assertEqual(published.status_code, 201)
+        question_set = QuestionSetRevision.objects.get(
+            public_id=revision['id'],
+        ).question_set
+        self.assertEqual(
+            getattr(question_set, 'workflow_status', None),
+            'completed',
+        )
+        self.assertTrue(InstructorAuditEvent.objects.filter(
+            action='question_set.workflow_completed',
+            target_id=str(question_set.public_id),
+        ).exists())
+
     def test_save_uses_optimistic_concurrency_and_preserves_protocol_structure(self):
         draft = self.create_draft()
         body = draft['body']
@@ -527,6 +607,7 @@ class QuestionSetWizardApiTests(TestCase):
             actor=self.account,
             instructor_session=None,
             template_id='weekly-reflection',
+            confirm_abandon_active=True,
         )
 
         with self.assertRaises(QuestionSetError) as raised:

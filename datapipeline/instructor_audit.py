@@ -47,6 +47,8 @@ ALLOWED_METADATA_KEYS = {
     InstructorAuditEvent.ACTION_QUESTION_SET_REVISION_FROZEN: frozenset(),
     InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_STARTED: frozenset(),
     InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_COMPLETED: frozenset(),
+    InstructorAuditEvent.ACTION_QUESTION_SET_WORKFLOW_ABANDONED: frozenset(),
+    InstructorAuditEvent.ACTION_QUESTION_SET_WORKFLOW_COMPLETED: frozenset(),
     InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED: frozenset({'reason_code'}),
 }
 
@@ -147,6 +149,8 @@ TARGET_TYPE_BY_ACTION = {
     InstructorAuditEvent.ACTION_QUESTION_SET_REVISION_FROZEN: 'question_set',
     InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_STARTED: 'question_set',
     InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_COMPLETED: 'question_set',
+    InstructorAuditEvent.ACTION_QUESTION_SET_WORKFLOW_ABANDONED: 'question_set',
+    InstructorAuditEvent.ACTION_QUESTION_SET_WORKFLOW_COMPLETED: 'question_set',
     InstructorAuditEvent.ACTION_AUTHORIZATION_DENIED: 'course',
 }
 
