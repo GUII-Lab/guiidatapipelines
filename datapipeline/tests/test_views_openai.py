@@ -10,6 +10,14 @@ from django.test import Client, TestCase
 from datapipeline import openai_client
 
 
+class TestLegacyOpenAIKeyEndpoint(TestCase):
+    def test_get_oai_endpoint_is_decommissioned(self):
+        response = Client().get("/datapipeline/api/getOAI/")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn(b'"key"', response.content)
+
+
 class TestOpenAIChatView(TestCase):
     url = "/datapipeline/api/openai-chat/"
 
