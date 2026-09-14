@@ -1,5 +1,7 @@
+import hashlib
 import json
 import threading
+from datetime import timedelta
 from io import BytesIO
 from unittest import mock
 
@@ -7,6 +9,7 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError, connection, connections, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import Client, TestCase, TransactionTestCase
+from django.utils import timezone
 from pypdf import PdfReader
 
 from datapipeline.leai_completion import (
@@ -22,6 +25,9 @@ from datapipeline.models import (
     FeedbackGPT,
     FeedbackMessage,
     InstructorAccount,
+    InstructorAuditEvent,
+    PreviewMessage,
+    PreviewSession,
     QuestionSet,
     QuestionSetRevision,
     QuestionSetSurvey,
@@ -1220,6 +1226,123 @@ class CertificateIssuanceApiTest(TestCase):
         self.assertNotIn(self.survey.public_id, response.content.decode("utf-8"))
         self.assertNotIn("session-1", response.content.decode("utf-8"))
         self.assertNotIn("certificate-uuid", response.content.decode("utf-8"))
+
+
+class PreviewCompletionCertificateApiTest(TestCase):
+    url = "/datapipeline/api/question_set_preview/{token}/completion_certificate/"
+
+    def setUp(self):
+        self.client = Client()
+        self.course = _make_course(course_id="preview-certificate-course")
+        user = get_user_model().objects.create_user(
+            username="preview-certificate@qa.invalid",
+            email="preview-certificate@qa.invalid",
+        )
+        self.instructor = InstructorAccount.objects.create(
+            user=user,
+            email="preview-certificate@qa.invalid",
+            display_name="Preview Certificate Instructor",
+            must_change_password=False,
+        )
+        self.question_set = QuestionSet.objects.create(
+            course=self.course,
+            owner=self.instructor,
+            template_id="weekly-reflection",
+            title="Preview Certificate Reflection",
+        )
+        self.revision = QuestionSetRevision.objects.create(
+            question_set=self.question_set,
+            revision_number=1,
+            source_draft_version=1,
+            canonical_body={"title": self.question_set.title},
+            compiled_protocol={"title": self.question_set.title},
+            content_hash="p" * 64,
+            created_by=self.instructor,
+        )
+        self.raw_token = "preview-certificate-raw-capability"
+        self.preview = PreviewSession.objects.create(
+            revision=self.revision,
+            instructor=self.instructor,
+            token_digest=hashlib.sha256(
+                self.raw_token.encode("utf-8")
+            ).hexdigest(),
+            expires_at=timezone.now() + timedelta(hours=1),
+            ready_at=timezone.now() - timedelta(seconds=1),
+            completion_certificate_enabled=True,
+        )
+
+    def _request(self):
+        return self.client.post(self.url.format(token=self.raw_token))
+
+    def _save_preview_response(self, content="Private preview response"):
+        PreviewMessage.objects.create(
+            preview_session=self.preview,
+            sequence=1,
+            role=PreviewMessage.ROLE_USER,
+            content=content,
+            attribution={},
+        )
+
+    def test_raw_ready_capability_downloads_watermarked_pdf_without_a_record_or_code(self):
+        self._save_preview_response()
+        before_certificates = _certificate_rows_snapshot()
+        before_events = list(InstructorAuditEvent.objects.values())
+
+        with mock.patch(
+            "datapipeline.leai_completion.generate_code",
+            side_effect=AssertionError("Preview downloads must not allocate verification codes"),
+        ):
+            response = self._request()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertEqual(response["Cache-Control"], "no-store, private")
+        self.assertIn("completion-certificate", response["Content-Disposition"])
+        text = _pdf_text(response.content)
+        self.assertIn("Instructor preview - not valid", text)
+        self.assertIn(self.course.course_name, text)
+        self.assertIn(self.question_set.title, text)
+        self.assertNotIn("CERTIFICATE VERIFICATION CODE", text)
+        self.assertNotIn("Private preview response", text)
+        self.assertEqual(_certificate_rows_snapshot(), before_certificates)
+        self.assertEqual(list(InstructorAuditEvent.objects.values()), before_events)
+
+    def test_preview_certificate_requires_a_persisted_preview_user_response(self):
+        response = self._request()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json(),
+            {"error": "No persisted preview user response found"},
+        )
+        self.assertEqual(SurveyCompletionCertificate.objects.count(), 0)
+
+    def test_preview_certificate_rejects_disabled_expired_and_unready_capabilities(self):
+        self._save_preview_response()
+        cases = (
+            ("disabled", {"completion_certificate_enabled": False}, 403,
+             "Completion certificates are not enabled for this preview"),
+            ("expired", {"expires_at": timezone.now() - timedelta(seconds=1)}, 410,
+             "preview_expired"),
+            ("preparing", {"ready_at": timezone.now() + timedelta(seconds=30)}, 425,
+             "preview_preparing"),
+        )
+
+        for name, updates, status, error in cases:
+            with self.subTest(name=name):
+                PreviewSession.objects.filter(pk=self.preview.pk).update(**updates)
+
+                response = self._request()
+
+                self.assertEqual(response.status_code, status)
+                self.assertEqual(response.json()["error"], error)
+                self.assertEqual(SurveyCompletionCertificate.objects.count(), 0)
+
+                PreviewSession.objects.filter(pk=self.preview.pk).update(
+                    completion_certificate_enabled=True,
+                    expires_at=timezone.now() + timedelta(hours=1),
+                    ready_at=timezone.now() - timedelta(seconds=1),
+                )
 
 
 class CompletionCertificateConcurrencyTest(TransactionTestCase):

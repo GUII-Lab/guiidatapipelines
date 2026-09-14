@@ -39,6 +39,7 @@ urlpatterns = [
     path('api/get_course_customization/', get_course_customization, name='get_course_customization'),
     path('api/update_course_customization/', update_course_customization, name='update_course_customization'),
     path('api/issue_completion_certificate/', issue_completion_certificate, name='issue_completion_certificate'),
+    path('api/question_set_preview/<str:raw_token>/completion_certificate/', issue_preview_completion_certificate, name='issue_preview_completion_certificate'),
     path('api/verify_completion_certificates/', verify_completion_certificates, name='verify_completion_certificates'),
     path('api/register_session_identity/', register_session_identity, name='register_session_identity'),
     path('api/create_feedback_gpt/', create_feedback_gpt, name='create_feedback_gpt'),

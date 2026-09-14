@@ -89,6 +89,25 @@ def build_display_snapshot(survey: FeedbackGPT) -> dict:
     return snapshot
 
 
+def build_preview_display_snapshot(preview: object) -> dict:
+    revision = preview.revision
+    question_set = revision.question_set
+    course = question_set.course
+    protocol = revision.compiled_protocol if isinstance(revision.compiled_protocol, dict) else {}
+    return {
+        "course_name": _certificate_text(
+            course.course_name if course else None,
+            fallback="Course unavailable",
+        )[:200],
+        "survey_name": _certificate_text(
+            protocol.get("title") or question_set.title,
+            fallback="Preview unavailable",
+        )[:100],
+        "week_label": "Instructor preview",
+        "canvas_guidance": CANVAS_GUIDANCE,
+    }
+
+
 def _persist_display_snapshot_if_missing(
     certificate: SurveyCompletionCertificate,
     survey: FeedbackGPT,
@@ -259,8 +278,13 @@ def _draw_wrapped_pdf_text(
     return y
 
 
-def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
-    display = _resolved_display_snapshot(certificate)
+def _render_completion_certificate_pdf(
+    display: dict,
+    *,
+    verification_code: str | None,
+    issued_on: str = "",
+    preview: bool = False,
+) -> bytes:
 
     buffer = BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter, invariant=1)
@@ -289,7 +313,11 @@ def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
     pdf.drawString(58, 735, "LEARNING EXPERIENCE AI (LEAI)")
     pdf.setFont("Helvetica", 7.5)
     pdf.setFillColor(muted)
-    pdf.drawRightString(554, 735, "ANONYMOUS PARTICIPATION RECORD")
+    pdf.drawRightString(
+        554,
+        735,
+        "INSTRUCTOR PREVIEW" if preview else "ANONYMOUS PARTICIPATION RECORD",
+    )
     pdf.setStrokeColor(accent)
     pdf.setLineWidth(0.8)
     pdf.line(58, 720, 554, 720)
@@ -302,20 +330,31 @@ def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
     pdf.setFont("Helvetica-Bold", 8)
     pdf.drawCentredString(526, 672, "LEAI")
     pdf.setFont("Helvetica", 5.8)
-    pdf.drawCentredString(526, 663, "CODED")
+    pdf.drawCentredString(526, 663, "PREVIEW" if preview else "CODED")
 
     pdf.setFont("Times-Bold", 26)
     pdf.drawCentredString(page_width / 2, 665, "LEAI Completion Certificate")
     pdf.setFillColor(accent)
     pdf.setFont("Helvetica-Bold", 8.5)
-    pdf.drawCentredString(page_width / 2, 640, "A UNIQUE CODED RECORD FOR INSTRUCTOR VERIFICATION")
+    pdf.drawCentredString(
+        page_width / 2,
+        640,
+        (
+            "INSTRUCTOR PREVIEW - NOT VALID FOR VERIFICATION"
+            if preview else "A UNIQUE CODED RECORD FOR INSTRUCTOR VERIFICATION"
+        ),
+    )
     pdf.setStrokeColor(accent)
     pdf.setLineWidth(1.2)
     pdf.line(200, 627, 412, 627)
 
     _draw_wrapped_pdf_text(
         pdf,
-        "This certificate confirms that LEAI issued a unique code for the survey below after at least one response was saved. It does not reveal the student’s identity or survey responses.",
+        (
+            "This instructor preview is available after at least one practice response was saved. It does not reveal the student’s identity or survey responses, and it cannot be verified."
+            if preview else
+            "This certificate confirms that LEAI issued a unique code for the survey below after at least one response was saved. It does not reveal the student’s identity or survey responses."
+        ),
         x=90,
         y=595,
         width=432,
@@ -354,19 +393,31 @@ def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
     pdf.roundRect(72, 304, 468, 79, 5, fill=1, stroke=0)
     pdf.setFillColor(colors.white)
     pdf.setFont("Helvetica-Bold", 7.5)
-    pdf.drawString(94, 360, "CERTIFICATE VERIFICATION CODE")
+    pdf.drawString(
+        94,
+        360,
+        "INSTRUCTOR PREVIEW" if preview else "CERTIFICATE VERIFICATION CODE",
+    )
     pdf.setFont("Courier-Bold", 19)
-    pdf.drawString(94, 327, certificate.code)
+    pdf.drawString(94, 327, "NOT VALID" if preview else verification_code)
     pdf.setFillColor(colors.HexColor("#D7E3E7"))
     pdf.setFont("Helvetica", 7.5)
-    pdf.drawRightString(518, 360, "KEEP THIS CODE WITH YOUR SUBMISSION")
+    pdf.drawRightString(
+        518,
+        360,
+        "NO VERIFICATION RECORD" if preview else "KEEP THIS CODE WITH YOUR SUBMISSION",
+    )
 
     pdf.setFillColor(ink)
     pdf.setFont("Helvetica-Bold", 9)
-    pdf.drawString(90, 263, "Verification required")
+    pdf.drawString(90, 263, "Preview only" if preview else "Verification required")
     _draw_wrapped_pdf_text(
         pdf,
-        "Instructors must check this code in LEAI for the named survey. A visual copy alone is not proof of issuance.",
+        (
+            "Preview copies cannot be verified or used as proof of completion."
+            if preview else
+            "Instructors must check this code in LEAI for the named survey. A visual copy alone is not proof of issuance."
+        ),
         x=90,
         y=247,
         width=432,
@@ -376,19 +427,52 @@ def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
         color=muted,
     )
 
-    issued_on = certificate.issued_at.strftime("%B %-d, %Y") if certificate.issued_at else ""
     pdf.setStrokeColor(colors.HexColor("#C6D0D3"))
     pdf.setLineWidth(0.6)
     pdf.line(72, 148, 540, 148)
     pdf.setFillColor(ink)
     pdf.setFont("Helvetica-Bold", 9)
-    pdf.drawString(72, 126, display["canvas_guidance"])
+    pdf.drawString(
+        72,
+        126,
+        "Instructor preview - not valid" if preview else display["canvas_guidance"],
+    )
     pdf.setFillColor(muted)
     pdf.setFont("Helvetica", 7.5)
-    pdf.drawString(72, 108, "Issued by Learning Experience AI (LEAI)")
+    pdf.drawString(
+        72,
+        108,
+        "Previewed in Learning Experience AI (LEAI)" if preview else "Issued by Learning Experience AI (LEAI)",
+    )
     if issued_on:
         pdf.drawRightString(540, 108, f"Code issued {issued_on}")
+
+    if preview:
+        pdf.saveState()
+        pdf.translate(page_width / 2, page_height / 2)
+        pdf.rotate(34)
+        pdf.setFillColor(colors.HexColor("#C47D62"))
+        pdf.setFont("Helvetica-Bold", 22)
+        pdf.drawCentredString(0, 0, "Instructor preview - not valid")
+        pdf.restoreState()
 
     pdf.showPage()
     pdf.save()
     return buffer.getvalue()
+
+
+def render_certificate_pdf(certificate: SurveyCompletionCertificate) -> bytes:
+    issued_on = certificate.issued_at.strftime("%B %-d, %Y") if certificate.issued_at else ""
+    return _render_completion_certificate_pdf(
+        _resolved_display_snapshot(certificate),
+        verification_code=certificate.code,
+        issued_on=issued_on,
+    )
+
+
+def render_preview_certificate_pdf(preview: object) -> bytes:
+    return _render_completion_certificate_pdf(
+        build_preview_display_snapshot(preview),
+        verification_code=None,
+        preview=True,
+    )

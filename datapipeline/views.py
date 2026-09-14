@@ -11,6 +11,7 @@ from .leai_completion import (
     issue_or_get_certificate,
     normalize_code,
     render_certificate_pdf,
+    render_preview_certificate_pdf,
 )
 from .instructor_audit import record_instructor_event
 from .instructor_auth import authorize_instructor_course
@@ -18,7 +19,7 @@ from .response_sessions import (
     ResponseWriteValidationError,
     persist_feedback_messages,
 )
-from .question_sets import QUESTION_SET_EFFECTIVE_SETTINGS
+from .question_sets import QUESTION_SET_EFFECTIVE_SETTINGS, QuestionSetError, get_preview
 import json
 import secrets
 import string
@@ -869,6 +870,50 @@ def issue_completion_certificate(request):
     response = HttpResponse(pdf_bytes, content_type='application/pdf')
     response['Content-Disposition'] = (
         f'attachment; filename="{_certificate_download_filename(certificate.survey)}"'
+    )
+    response['Cache-Control'] = 'no-store, private'
+    return response
+
+
+@csrf_exempt
+def issue_preview_completion_certificate(request, raw_token):
+    if request.method != 'POST':
+        return HttpResponse(status=405, content='Method not allowed')
+    try:
+        preview = get_preview(raw_token)
+    except QuestionSetError as exc:
+        status = {
+            'preview_not_found': 404,
+            'preview_expired': 410,
+            'preview_preparing': 425,
+        }.get(exc.code, 400)
+        payload = {'error': exc.code}
+        if exc.timing:
+            payload.update(exc.timing)
+        return _private_json_response(payload, status=status)
+
+    if not preview.completion_certificate_enabled:
+        return _private_json_response(
+            {'error': 'Completion certificates are not enabled for this preview'},
+            status=403,
+        )
+    if not preview.messages.filter(role=PreviewMessage.ROLE_USER).exists():
+        return _private_json_response(
+            {'error': 'No persisted preview user response found'},
+            status=409,
+        )
+
+    try:
+        pdf_bytes = render_preview_certificate_pdf(preview)
+    except Exception:
+        return _private_json_response(
+            {'error': 'Unable to issue preview completion certificate'},
+            status=500,
+        )
+
+    response = HttpResponse(pdf_bytes, content_type='application/pdf')
+    response['Content-Disposition'] = (
+        'attachment; filename="guii-lab-completion-certificate-preview.pdf"'
     )
     response['Cache-Control'] = 'no-store, private'
     return response
