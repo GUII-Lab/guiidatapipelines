@@ -4,6 +4,28 @@ from django.db import migrations, models
 import django.db.models.deletion
 
 
+def backfill_question_set_survey_completion_settings(apps, schema_editor):
+    QuestionSetSurvey = apps.get_model('datapipeline', 'QuestionSetSurvey')
+
+    for link in QuestionSetSurvey.objects.select_related('revision').all():
+        protocol = link.revision.compiled_protocol
+        effective_settings = (
+            protocol.get('effective_settings', {})
+            if isinstance(protocol, dict)
+            else {}
+        )
+        link.completion_certificate_enabled = (
+            effective_settings.get('completion_certificate_enabled') is True
+        )
+        link.parsed_document_download_enabled = (
+            effective_settings.get('parsed_document_download_enabled') is True
+        )
+        link.save(update_fields=[
+            'completion_certificate_enabled',
+            'parsed_document_download_enabled',
+        ])
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -41,6 +63,10 @@ class Migration(migrations.Migration):
                 related_name='survey_links',
                 to='datapipeline.previewsession',
             ),
+        ),
+        migrations.RunPython(
+            backfill_question_set_survey_completion_settings,
+            migrations.RunPython.noop,
         ),
         migrations.AlterField(
             model_name='instructorauditevent',

@@ -1,6 +1,5 @@
 import hashlib
 import json
-import threading
 import uuid
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from unittest.mock import patch
@@ -24,6 +23,7 @@ from datapipeline.models import (
     InstructorAccount,
     InstructorAuditEvent,
     InstructorSession,
+    ImmutableQuestionSetSurveyQuerySet,
     PreviewMessage,
     PreviewSession,
     QuestionSetDraft,
@@ -68,6 +68,9 @@ def _survey_persistence_state():
                 'pk',
                 'survey_id',
                 'revision_id',
+                'preview_session_id',
+                'completion_certificate_enabled',
+                'parsed_document_download_enabled',
                 'idempotency_key',
                 'created_by_id',
             )
@@ -1038,6 +1041,70 @@ class QuestionSetWizardApiTests(TestCase):
         self.assertTrue(preview.completion_certificate_enabled)
         self.assertFalse(preview.parsed_document_download_enabled)
 
+    def test_preview_settings_rechecks_expiry_after_lock(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        raw_token = self.issue_preview(revision)
+
+        from datapipeline.question_sets import _preview_for_settings
+
+        def expire_after_initial_lookup(token):
+            preview = _preview_for_settings(token)
+            PreviewSession.objects.filter(pk=preview.pk).update(
+                expires_at=timezone.now() - timedelta(seconds=1),
+            )
+            return preview
+
+        with patch(
+            'datapipeline.question_sets._preview_for_settings',
+            side_effect=expire_after_initial_lookup,
+        ):
+            response = self.patch_json(
+                f'/datapipeline/api/question_set_preview/{raw_token}/settings/',
+                {'completion_certificate_enabled': False},
+            )
+
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.json()['error'], 'preview_expired')
+        self.assertTrue(PreviewSession.objects.get().completion_certificate_enabled)
+
+    def test_publication_rechecks_readiness_after_lock(self):
+        draft = self.create_draft()
+        revision_payload = self.freeze_draft(draft)
+        raw_token = self.complete_preview(revision_payload)
+        revision = QuestionSetRevision.objects.get(public_id=revision_payload['id'])
+
+        from datapipeline.question_sets import get_preview
+
+        def defer_after_initial_lookup(token):
+            preview = get_preview(token)
+            PreviewSession.objects.filter(pk=preview.pk).update(
+                ready_at=timezone.now() + timedelta(seconds=30),
+            )
+            return preview
+
+        with patch(
+            'datapipeline.question_sets.get_preview',
+            side_effect=defer_after_initial_lookup,
+        ):
+            response = self.post_json(
+                f'/datapipeline/api/question_set_revisions/{revision.public_id}/surveys/',
+                {
+                    'course_id': self.course.course_id,
+                    'idempotency_key': 'lock-readiness-race',
+                    'preview_token': raw_token,
+                    'survey_label': 'Readiness race',
+                    'week_number': 4,
+                    'opens_at': None,
+                    'expires_at': None,
+                },
+                token=self.token,
+            )
+
+        self.assertEqual(response.status_code, 425)
+        self.assertEqual(response.json()['error'], 'preview_preparing')
+        self.assertEqual(FeedbackGPT.objects.count(), 0)
+
     def test_preview_settings_patch_requires_the_preview_owner(self):
         draft = self.create_draft()
         revision = self.freeze_draft(draft)
@@ -1792,6 +1859,96 @@ class QuestionSetWorkflowMigrationTests(TransactionTestCase):
         })
 
 
+class QuestionSetCompletionSettingsMigrationTests(TransactionTestCase):
+    migrate_from = [('datapipeline', '0050_preview_session_ready_at')]
+    migrate_to = [('datapipeline', '0051_question_set_completion_settings')]
+
+    def setUp(self):
+        super().setUp()
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_from)
+        old_apps = executor.loader.project_state(self.migrate_from).apps
+        User = old_apps.get_model('auth', 'User')
+        Institution = old_apps.get_model('datapipeline', 'Institution')
+        InstructorAccount = old_apps.get_model('datapipeline', 'InstructorAccount')
+        Course = old_apps.get_model('datapipeline', 'Course')
+        QuestionSet = old_apps.get_model('datapipeline', 'QuestionSet')
+        QuestionSetRevision = old_apps.get_model(
+            'datapipeline', 'QuestionSetRevision',
+        )
+        QuestionSetSurvey = old_apps.get_model('datapipeline', 'QuestionSetSurvey')
+        FeedbackGPT = old_apps.get_model('datapipeline', 'FeedbackGPT')
+
+        institution = Institution.objects.create(
+            slug='completion-settings-migration',
+            name='Completion Settings Migration University',
+        )
+        user = User.objects.create(username='completion-settings-migration-user')
+        owner = InstructorAccount.objects.create(
+            user=user,
+            email='completion-settings-migration@example.invalid',
+            display_name='Completion Settings Migration Owner',
+            must_change_password=False,
+        )
+        course = Course.objects.create(
+            course_id='completion-settings-migration-course',
+            course_name='Completion Settings Migration Course',
+            instructor_name='Completion Settings Migration Owner',
+            password='!',
+            institution=institution,
+        )
+        question_set = QuestionSet.objects.create(
+            course=course,
+            owner=owner,
+            template_id='weekly-reflection',
+            title='Historical settings',
+            audience='individual',
+        )
+        revision = QuestionSetRevision.objects.create(
+            question_set=question_set,
+            revision_number=1,
+            source_draft_version=1,
+            canonical_body={'title': 'Historical settings'},
+            compiled_protocol={
+                'title': 'Historical settings',
+                'effective_settings': {
+                    'completion_certificate_enabled': False,
+                    'parsed_document_download_enabled': False,
+                },
+            },
+            content_hash='b' * 64,
+            created_by=owner,
+        )
+        survey = FeedbackGPT.objects.create(
+            public_id='completion-migrate-01',
+            name='Historical completion settings survey',
+            survey_label='Historical completion settings survey',
+            instructions='Synthetic migration fixture.',
+            created_by=owner.display_name,
+            course=course,
+            mode='form',
+        )
+        link = QuestionSetSurvey.objects.create(
+            survey=survey,
+            revision=revision,
+            idempotency_key='completion-settings-migration-key',
+            created_by=owner,
+        )
+        self.link_id = link.pk
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_to)
+        self.apps = executor.loader.project_state(self.migrate_to).apps
+
+    def test_migration_backfills_historical_revision_settings(self):
+        QuestionSetSurvey = self.apps.get_model('datapipeline', 'QuestionSetSurvey')
+
+        link = QuestionSetSurvey.objects.get(pk=self.link_id)
+
+        self.assertFalse(link.completion_certificate_enabled)
+        self.assertFalse(link.parsed_document_download_enabled)
+
+
 class QuestionSetSurveyRaceTests(TransactionTestCase):
     idempotency_key = 'concurrent-survey-idempotency'
 
@@ -1873,64 +2030,54 @@ class QuestionSetSurveyRaceTests(TransactionTestCase):
         winner_audit_event_id,
     ):
         original_create = QuestionSetSurvey.objects.create
-        thread_errors = []
-        winner_states = []
+        preview = PreviewSession.objects.get(
+            token_digest=hashlib.sha256(self.preview_token.encode('utf-8')).hexdigest(),
+        )
+        original_create(
+            survey=self.winner_survey,
+            revision=self.revision,
+            preview_session=preview,
+            completion_certificate_enabled=True,
+            parsed_document_download_enabled=False,
+            idempotency_key=self.idempotency_key,
+            created_by=self.account,
+        )
+        record_instructor_event(
+            event_id=winner_audit_event_id,
+            action=InstructorAuditEvent.ACTION_SURVEY_CREATED,
+            outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+            actor=self.account,
+            session=None,
+            course=self.course,
+            target_type='survey',
+            target_id=self.winner_survey.pk,
+            metadata={'mode': 'form'},
+        )
+        self.race_winner_state = _survey_persistence_state()
+        original_filter = ImmutableQuestionSetSurveyQuerySet.filter
+        hidden_winner_lookups = 0
 
-        def persist_winner():
-            connections.close_all()
-            try:
-                revision = QuestionSetRevision.objects.get(pk=self.revision.pk)
-                actor = InstructorAccount.objects.get(pk=self.account.pk)
-                course = Course.objects.get(pk=self.course.pk)
-                survey = FeedbackGPT.objects.get(pk=self.winner_survey.pk)
-                original_create(
-                    survey=survey,
-                    revision=revision,
-                    preview_session=PreviewSession.objects.get(
-                        token_digest=hashlib.sha256(
-                            self.preview_token.encode('utf-8'),
-                        ).hexdigest(),
-                    ),
-                    completion_certificate_enabled=True,
-                    parsed_document_download_enabled=False,
-                    idempotency_key=self.idempotency_key,
-                    created_by=actor,
-                )
-                record_instructor_event(
-                    event_id=winner_audit_event_id,
-                    action=InstructorAuditEvent.ACTION_SURVEY_CREATED,
-                    outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
-                    actor=actor,
-                    session=None,
-                    course=course,
-                    target_type='survey',
-                    target_id=survey.pk,
-                    metadata={'mode': 'form'},
-                )
-                winner_states.append(_survey_persistence_state())
-            except Exception as exc:  # pragma: no cover - asserted below
-                thread_errors.append(exc)
-            finally:
-                connections.close_all()
+        def hide_winner_until_insert_conflict(*args, **kwargs):
+            nonlocal hidden_winner_lookups
+            if kwargs.get('idempotency_key') == self.idempotency_key:
+                hidden_winner_lookups += 1
+                if hidden_winner_lookups <= 2:
+                    return original_filter(args[0], pk__in=[])
+            return original_filter(*args, **kwargs)
 
         def collide_at_link_create(**_kwargs):
-            worker = threading.Thread(target=persist_winner)
-            worker.start()
-            worker.join(timeout=10)
-            if worker.is_alive():
-                raise AssertionError('Concurrent winner did not finish.')
-            if thread_errors:
-                raise thread_errors[0]
-            self.assertEqual(len(winner_states), 1)
-            self.race_winner_state = winner_states[0]
             raise IntegrityError('forced concurrent link winner')
 
-        with patch.object(
-            QuestionSetSurvey.objects,
-            'create',
-            side_effect=collide_at_link_create,
+        with (
+            patch.object(
+                ImmutableQuestionSetSurveyQuerySet,
+                'filter',
+                autospec=True,
+                side_effect=hide_winner_until_insert_conflict,
+            ),
+            patch.object(QuestionSetSurvey.objects, 'create', side_effect=collide_at_link_create),
         ):
-            return create_survey_from_revision(
+            result = create_survey_from_revision(
                 revision=self.revision,
                 actor=self.account,
                 instructor_session=None,
@@ -1942,6 +2089,8 @@ class QuestionSetSurveyRaceTests(TransactionTestCase):
                 preview_token=self.preview_token,
                 audit_event_id=supplied_audit_event_id,
             )
+        self.assertEqual(hidden_winner_lookups, 3)
+        return result
 
     def test_concurrent_winner_retry_rejects_mismatched_audit_id_without_mutation(self):
         mismatched_event_id = uuid.UUID('0e4069ef-7875-465d-a2b7-a3911ae422a1')

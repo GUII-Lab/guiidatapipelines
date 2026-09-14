@@ -698,10 +698,15 @@ def get_preview(raw_token):
     )
     if preview is None:
         raise QuestionSetError('preview_not_found')
+    _require_preview_available(preview, require_ready=True)
+    return preview
+
+
+def _require_preview_available(preview, *, require_ready):
     now = timezone.now()
     if preview.expires_at <= now:
         raise QuestionSetError('preview_expired')
-    if preview.ready_at > now:
+    if require_ready and preview.ready_at > now:
         retry_after_ms = max(
             1,
             math.ceil((preview.ready_at - now).total_seconds() * 1000),
@@ -713,7 +718,6 @@ def get_preview(raw_token):
                 'retry_after_ms': retry_after_ms,
             },
         )
-    return preview
 
 
 def _preview_for_settings(raw_token):
@@ -725,8 +729,7 @@ def _preview_for_settings(raw_token):
     )
     if preview is None:
         raise QuestionSetError('preview_not_found')
-    if preview.expires_at <= timezone.now():
-        raise QuestionSetError('preview_expired')
+    _require_preview_available(preview, require_ready=False)
     return preview
 
 
@@ -757,6 +760,7 @@ def update_preview_settings(*, raw_token, actor, instructor_session, settings):
         .select_related('revision__question_set__course', 'instructor')
         .get(pk=preview.pk)
     )
+    _require_preview_available(preview, require_ready=False)
     if preview.instructor_id != actor.pk:
         raise QuestionSetError('preview_owner_mismatch')
     if preview.survey_links.exists():
@@ -976,6 +980,7 @@ def create_survey_from_revision(
         .select_related('revision__question_set__course', 'instructor')
         .get(pk=preview.pk)
     )
+    _require_preview_available(preview, require_ready=True)
     if preview.instructor_id != actor.pk:
         raise QuestionSetError('preview_owner_mismatch')
     if preview.revision_id != revision.pk:

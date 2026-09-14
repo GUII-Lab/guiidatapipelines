@@ -823,12 +823,21 @@ def issue_completion_certificate(request):
     public_id = public_id.strip()
     session_id = session_id.strip()
     try:
-        survey = FeedbackGPT.objects.select_related('course').get(public_id=public_id)
+        survey = FeedbackGPT.objects.select_related(
+            'course',
+            'question_set_link',
+        ).get(public_id=public_id)
     except FeedbackGPT.DoesNotExist:
         return JsonResponse({'error': 'Survey not found'}, status=404)
 
     course = survey.course
-    if not course or not course.completion_certificate_enabled:
+    question_set_link = getattr(survey, 'question_set_link', None)
+    certificate_enabled = (
+        question_set_link.completion_certificate_enabled
+        if question_set_link is not None
+        else bool(course and course.completion_certificate_enabled)
+    )
+    if not certificate_enabled:
         return JsonResponse(
             {'error': 'Completion certificates are not enabled for this course'},
             status=403,

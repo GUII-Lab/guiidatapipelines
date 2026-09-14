@@ -3,6 +3,7 @@ import threading
 from io import BytesIO
 from unittest import mock
 
+from django.contrib.auth import get_user_model
 from django.db import IntegrityError, connection, connections, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import Client, TestCase, TransactionTestCase
@@ -20,6 +21,10 @@ from datapipeline.models import (
     Course,
     FeedbackGPT,
     FeedbackMessage,
+    InstructorAccount,
+    QuestionSet,
+    QuestionSetRevision,
+    QuestionSetSurvey,
     SurveyCompletionCertificate,
 )
 
@@ -781,6 +786,57 @@ class CertificateIssuanceApiTest(TestCase):
             )
         return _post(self.client, self.url, payload)
 
+    def _link_survey_to_question_set(self, *, certificate_enabled):
+        user = get_user_model().objects.create_user(
+            username='certificate-question-set@qa.invalid',
+            email='certificate-question-set@qa.invalid',
+        )
+        owner = InstructorAccount.objects.create(
+            user=user,
+            email='certificate-question-set@qa.invalid',
+            display_name='Certificate Question Set Instructor',
+            must_change_password=False,
+        )
+        question_set = QuestionSet.objects.create(
+            course=self.course,
+            owner=owner,
+            template_id='weekly-reflection',
+            title='Certificate Question Set',
+        )
+        revision = QuestionSetRevision.objects.create(
+            question_set=question_set,
+            revision_number=1,
+            source_draft_version=1,
+            canonical_body={'title': 'Certificate Question Set'},
+            compiled_protocol={
+                'title': 'Certificate Question Set',
+                'effective_settings': {
+                    'completion_certificate_enabled': certificate_enabled,
+                    'parsed_document_download_enabled': False,
+                },
+            },
+            content_hash='c' * 64,
+            created_by=owner,
+        )
+        return QuestionSetSurvey.objects.create(
+            survey=self.survey,
+            revision=revision,
+            completion_certificate_enabled=certificate_enabled,
+            parsed_document_download_enabled=False,
+            idempotency_key='certificate-question-set-link',
+            created_by=owner,
+        )
+
+    def _persist_student_message(self):
+        FeedbackMessage.objects.create(
+            session_id='session-1',
+            student_id='anon',
+            sent_by='user',
+            content='Finished reflection',
+            gpt_used='test',
+            gpt_id=self.survey.pk,
+        )
+
     def test_issue_completion_certificate_rejects_non_post_requests(self):
         response = self.client.get(self.url)
 
@@ -865,6 +921,34 @@ class CertificateIssuanceApiTest(TestCase):
         self.assertEqual(
             response.json(),
             {"error": "Completion certificates are not enabled for this course"},
+        )
+
+    def test_question_set_certificate_enabled_overrides_disabled_course(self):
+        self.course.completion_certificate_enabled = False
+        self.course.save(update_fields=['completion_certificate_enabled'])
+        self._link_survey_to_question_set(certificate_enabled=True)
+        self._persist_student_message()
+
+        response = self._issue(
+            {'public_id': self.survey.public_id, 'session_id': 'session-1'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/pdf')
+        self.assertEqual(SurveyCompletionCertificate.objects.count(), 1)
+
+    def test_question_set_certificate_disabled_overrides_enabled_course(self):
+        self._link_survey_to_question_set(certificate_enabled=False)
+        self._persist_student_message()
+
+        response = self._issue(
+            {'public_id': self.survey.public_id, 'session_id': 'session-1'},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            response.json(),
+            {'error': 'Completion certificates are not enabled for this course'},
         )
 
     def test_issue_completion_certificate_returns_409_for_empty_session(self):
