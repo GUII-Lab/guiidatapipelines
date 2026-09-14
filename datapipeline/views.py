@@ -13,7 +13,6 @@ from .leai_completion import (
     render_certificate_pdf,
 )
 import json
-import os
 import secrets
 import string
 import csv
@@ -75,11 +74,6 @@ def _generate_public_id(length=12):
     raise RuntimeError('Could not generate a unique public_id after 10 attempts')
 
 
-
-@csrf_exempt
-def getOAI(request):
-    return JsonResponse({'key':os.environ.get('oaiKey')}, safe=False, status=201)
-    
 
 @csrf_exempt
 def message_create(request):
