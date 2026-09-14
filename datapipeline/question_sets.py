@@ -646,11 +646,19 @@ def issue_preview_capability(
     instructor_session,
     preview_public_id=None,
     audit_event_id=None,
+    allow_inactive_history=False,
 ):
     _validate_optional_uuid(
         preview_public_id,
         field_name='preview_public_id',
         conflict_model=PreviewSession,
+    )
+    question_set = QuestionSet.objects.select_for_update().get(
+        pk=revision.question_set_id,
+    )
+    _require_active_workflow(
+        question_set,
+        allow_inactive_history=allow_inactive_history,
     )
     raw_token = secrets.token_urlsafe(32)
     preview_values = {
@@ -666,7 +674,7 @@ def issue_preview_capability(
         action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_STARTED,
         actor=actor,
         instructor_session=instructor_session,
-        question_set=revision.question_set,
+        question_set=question_set,
         event_id=audit_event_id,
     )
     return raw_token, preview

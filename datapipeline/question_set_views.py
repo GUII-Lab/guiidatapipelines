@@ -290,7 +290,6 @@ def question_set_preview_capability(request, revision_id):
         )
         if error is not None:
             return error
-        _require_active_workflow(revision.question_set)
         raw_token, preview = issue_preview_capability(
             revision=revision,
             actor=account,

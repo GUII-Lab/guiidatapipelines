@@ -467,7 +467,7 @@ def _preview_payloads(revision):
     return payloads
 
 
-def _ensure_preview(*, revision, primary):
+def _ensure_preview(*, revision, primary, allow_inactive_history=False):
     preview = PreviewSession.objects.filter(public_id=QA_PREVIEW_PUBLIC_ID).first()
     if preview is None:
         raw_token, preview = issue_preview_capability(
@@ -476,6 +476,7 @@ def _ensure_preview(*, revision, primary):
             instructor_session=None,
             preview_public_id=QA_PREVIEW_PUBLIC_ID,
             audit_event_id=QA_AUDIT_EVENT_IDS[5],
+            allow_inactive_history=allow_inactive_history,
         )
         PreviewSession.objects.filter(pk=preview.pk).update(
             expires_at=_FIXED_PREVIEW_EXPIRY,
@@ -836,7 +837,11 @@ def seed_qa_data(
             primary=primary,
             reset=reset,
         )
-        _ensure_preview(revision=revision, primary=primary)
+        _ensure_preview(
+            revision=revision,
+            primary=primary,
+            allow_inactive_history=reset,
+        )
         survey, _link = _ensure_survey(
             revision=revision,
             primary=primary,

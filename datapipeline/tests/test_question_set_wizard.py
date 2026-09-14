@@ -37,6 +37,7 @@ from datapipeline.question_sets import (
     create_draft as create_draft_service,
     create_survey_from_revision,
     freeze_draft as freeze_draft_service,
+    issue_preview_capability,
     save_draft as save_draft_service,
 )
 
@@ -508,6 +509,43 @@ class QuestionSetWizardApiTests(TestCase):
 
                 self.assertEqual(response.status_code, 409)
                 self.assertEqual(response.json()['error'], 'workflow_not_active')
+
+    def test_preview_capability_rechecks_after_concurrent_publication(self):
+        draft = self.create_draft()
+        revision_payload = self.freeze_draft(draft)
+        self.complete_preview(revision_payload)
+        revision = QuestionSetRevision.objects.get(
+            public_id=revision_payload['id'],
+        )
+
+        def publish_before_preview_service(*args, **kwargs):
+            _link, created = create_survey_from_revision(
+                revision=revision,
+                actor=self.account,
+                instructor_session=None,
+                idempotency_key='preview-race-publication',
+                survey_label='Publication that wins the race',
+                week_number=4,
+                opens_at=None,
+                expires_at=None,
+            )
+            self.assertTrue(created)
+            return issue_preview_capability(*args, **kwargs)
+
+        with patch(
+            'datapipeline.question_set_views.issue_preview_capability',
+            side_effect=publish_before_preview_service,
+        ):
+            response = self.post_json(
+                f"/datapipeline/api/question_set_revisions/{revision.public_id}/preview_capability/",
+                {},
+                token=self.token,
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['error'], 'workflow_not_active')
+        self.assertEqual(QuestionSetSurvey.objects.count(), 1)
+        self.assertEqual(PreviewSession.objects.count(), 1)
 
     def test_inactive_workflow_service_mutations_require_explicit_history_bypass(self):
         draft = create_draft_service(
