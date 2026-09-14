@@ -152,6 +152,14 @@ class QuestionSetWizardApiTests(TestCase):
             HTTP_AUTHORIZATION=f'Bearer {self.token}',
         )
 
+    def patch_json_with_token(self, path, payload, token):
+        return self.client.patch(
+            path,
+            data=json.dumps(payload),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {token}',
+        )
+
     def get_auth(self, path):
         return self.client.get(
             path,
@@ -267,12 +275,13 @@ class QuestionSetWizardApiTests(TestCase):
     def create_survey(self):
         draft = self.create_draft()
         revision = self.freeze_draft(draft)
-        self.complete_preview(revision)
+        preview_token = self.complete_preview(revision)
         response = self.post_json(
             f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
             {
                 'course_id': self.course.course_id,
                 'idempotency_key': 'wizard-managed-survey',
+                'preview_token': preview_token,
                 'survey_label': 'Managed reflection',
                 'week_number': 4,
                 'opens_at': None,
@@ -286,7 +295,7 @@ class QuestionSetWizardApiTests(TestCase):
     def create_service_survey(self):
         draft = self.create_draft()
         revision_payload = self.freeze_draft(draft)
-        self.complete_preview(revision_payload)
+        self.service_preview_token = self.complete_preview(revision_payload)
         revision = QuestionSetRevision.objects.get(
             public_id=revision_payload['id'],
         )
@@ -300,6 +309,7 @@ class QuestionSetWizardApiTests(TestCase):
             week_number=4,
             opens_at=None,
             expires_at=None,
+            preview_token=self.service_preview_token,
             survey_public_id='service-a',
             audit_event_id=audit_event_id,
         )
@@ -313,6 +323,7 @@ class QuestionSetWizardApiTests(TestCase):
         instructor_session=None,
         survey_public_id=None,
         audit_event_id=None,
+        preview_token=None,
     ):
         return create_survey_from_revision(
             revision=revision,
@@ -323,6 +334,7 @@ class QuestionSetWizardApiTests(TestCase):
             week_number=9,
             opens_at=None,
             expires_at=None,
+            preview_token=preview_token or self.service_preview_token,
             survey_public_id=survey_public_id,
             audit_event_id=audit_event_id,
         )
@@ -469,13 +481,14 @@ class QuestionSetWizardApiTests(TestCase):
     def test_successful_publication_completes_its_workflow(self):
         draft = self.create_draft()
         revision = self.freeze_draft(draft)
-        self.complete_preview(revision)
+        preview_token = self.complete_preview(revision)
 
         published = self.post_json(
             f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
             {
                 'course_id': self.course.course_id,
                 'idempotency_key': 'lifecycle-publication-survey',
+                'preview_token': preview_token,
                 'survey_label': 'Lifecycle publication',
                 'week_number': 4,
                 'opens_at': None,
@@ -520,7 +533,7 @@ class QuestionSetWizardApiTests(TestCase):
     def test_preview_capability_rechecks_after_concurrent_publication(self):
         draft = self.create_draft()
         revision_payload = self.freeze_draft(draft)
-        self.complete_preview(revision_payload)
+        preview_token = self.complete_preview(revision_payload)
         revision = QuestionSetRevision.objects.get(
             public_id=revision_payload['id'],
         )
@@ -535,6 +548,7 @@ class QuestionSetWizardApiTests(TestCase):
                 week_number=4,
                 opens_at=None,
                 expires_at=None,
+                preview_token=preview_token,
             )
             self.assertTrue(created)
             return issue_preview_capability(*args, **kwargs)
@@ -596,7 +610,7 @@ class QuestionSetWizardApiTests(TestCase):
     def test_idempotent_publish_retry_rechecks_after_workflow_lock(self):
         draft = self.create_draft()
         revision_payload = self.freeze_draft(draft)
-        self.complete_preview(revision_payload)
+        preview_token = self.complete_preview(revision_payload)
         revision = QuestionSetRevision.objects.get(
             public_id=revision_payload['id'],
         )
@@ -610,6 +624,7 @@ class QuestionSetWizardApiTests(TestCase):
             week_number=4,
             opens_at=None,
             expires_at=None,
+            preview_token=preview_token,
         )
         self.assertTrue(created)
 
@@ -641,6 +656,7 @@ class QuestionSetWizardApiTests(TestCase):
                 week_number=9,
                 opens_at=None,
                 expires_at=None,
+                preview_token=preview_token,
             )
 
         self.assertFalse(created)
@@ -996,12 +1012,240 @@ class QuestionSetWizardApiTests(TestCase):
         self.assertEqual(completed.status_code, 409)
         self.assertEqual(completed.json()['error'], 'preview_incomplete')
 
+    def test_preview_completion_settings_default_to_certificate_only(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        self.issue_preview(revision)
+
+        preview = PreviewSession.objects.get()
+
+        self.assertTrue(preview.completion_certificate_enabled)
+        self.assertFalse(preview.parsed_document_download_enabled)
+
+    def test_preview_settings_patch_rejects_non_boolean_values(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        raw_token = self.issue_preview(revision)
+
+        response = self.patch_json(
+            f'/datapipeline/api/question_set_preview/{raw_token}/settings/',
+            {'completion_certificate_enabled': 'false'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['error'], 'invalid_preview_settings')
+        preview = PreviewSession.objects.get()
+        self.assertTrue(preview.completion_certificate_enabled)
+        self.assertFalse(preview.parsed_document_download_enabled)
+
+    def test_preview_settings_patch_requires_the_preview_owner(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        raw_token = self.issue_preview(revision)
+        other_user = get_user_model().objects.create_user(
+            username='other@ucsc.edu',
+            email='other@ucsc.edu',
+            password=self.password,
+        )
+        other_account = InstructorAccount.objects.create(
+            user=other_user,
+            email='other@ucsc.edu',
+            display_name='Other Instructor',
+            must_change_password=False,
+        )
+        other_membership = InstitutionMembership.objects.create(
+            institution=self.institution,
+            instructor=other_account,
+        )
+        CourseMembership.objects.create(
+            course=self.course,
+            institution_membership=other_membership,
+            role=CourseMembership.ROLE_INSTRUCTOR,
+            can_publish=True,
+        )
+        other_client = Client()
+        login = other_client.post(
+            '/datapipeline/api/instructor_sessions/',
+            data=json.dumps({
+                'email': other_account.email,
+                'password': self.password,
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(login.status_code, 201)
+
+        response = other_client.patch(
+            f'/datapipeline/api/question_set_preview/{raw_token}/settings/',
+            data=json.dumps({'completion_certificate_enabled': False}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f"Bearer {login.json()['token']}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error'], 'preview_owner_mismatch')
+        self.assertTrue(PreviewSession.objects.get().completion_certificate_enabled)
+
+    def test_public_preview_uses_saved_completion_settings_after_ready(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        raw_token = self.issue_preview(revision)
+
+        saved = self.patch_json(
+            f'/datapipeline/api/question_set_preview/{raw_token}/settings/',
+            {
+                'completion_certificate_enabled': False,
+                'parsed_document_download_enabled': True,
+            },
+        )
+        self.assertEqual(saved.status_code, 200)
+
+        public = self.client.get(
+            f'/datapipeline/api/question_set_preview/{raw_token}/',
+        )
+
+        self.assertEqual(public.status_code, 200)
+        self.assertFalse(public.json()['completion_certificate_enabled'])
+        self.assertTrue(public.json()['parsed_document_download_enabled'])
+        event = InstructorAuditEvent.objects.get(
+            action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_SETTINGS_UPDATED,
+        )
+        self.assertEqual(event.metadata, {
+            'completion_certificate_enabled': False,
+            'parsed_document_download_enabled': True,
+        })
+        self.assertNotIn(raw_token, json.dumps(event.metadata))
+
+    def test_publication_requires_the_exact_completed_preview_token(self):
+        draft = self.create_draft()
+        first_revision = self.freeze_draft(draft)
+        first_preview_token = self.complete_preview(first_revision)
+        changed_body = json.loads(json.dumps(draft['body']))
+        changed_body['title'] = 'A revised weekly reflection'
+        saved = self.patch_json(
+            f"/datapipeline/api/question_set_drafts/{draft['id']}/",
+            {'expected_version': draft['version'], 'body': changed_body},
+        )
+        self.assertEqual(saved.status_code, 200)
+        second_revision = self.freeze_draft(saved.json())
+
+        response = self.post_json(
+            f"/datapipeline/api/question_set_revisions/{second_revision['id']}/surveys/",
+            {
+                'course_id': self.course.course_id,
+                'idempotency_key': 'exact-preview-revision',
+                'preview_token': first_preview_token,
+                'survey_label': 'Second revision reflection',
+                'week_number': 4,
+                'opens_at': None,
+                'expires_at': None,
+            },
+            token=self.token,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['error'], 'preview_revision_mismatch')
+        self.assertEqual(QuestionSetSurvey.objects.count(), 0)
+
+    def test_idempotent_publication_rejects_a_different_preview_settings_snapshot(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        first_preview_token = self.complete_preview(revision)
+        second_preview_token = self.complete_preview(revision)
+        changed = self.patch_json(
+            f'/datapipeline/api/question_set_preview/{second_preview_token}/settings/',
+            {
+                'completion_certificate_enabled': False,
+                'parsed_document_download_enabled': True,
+            },
+        )
+        self.assertEqual(changed.status_code, 200)
+        payload = {
+            'course_id': self.course.course_id,
+            'idempotency_key': 'same-key-different-settings',
+            'preview_token': first_preview_token,
+            'survey_label': 'Published settings snapshot',
+            'week_number': 4,
+            'opens_at': None,
+            'expires_at': None,
+        }
+        created = self.post_json(
+            f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
+            payload,
+            token=self.token,
+        )
+        self.assertEqual(created.status_code, 201)
+        payload['preview_token'] = second_preview_token
+
+        repeated = self.post_json(
+            f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
+            payload,
+            token=self.token,
+        )
+
+        self.assertEqual(repeated.status_code, 409)
+        self.assertEqual(repeated.json()['error'], 'idempotency_key_conflict')
+        self.assertEqual(QuestionSetSurvey.objects.count(), 1)
+
+    def test_published_survey_uses_its_preview_completion_settings(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        preview_token = self.complete_preview(revision)
+        saved = self.patch_json(
+            f'/datapipeline/api/question_set_preview/{preview_token}/settings/',
+            {
+                'completion_certificate_enabled': False,
+                'parsed_document_download_enabled': True,
+            },
+        )
+        self.assertEqual(saved.status_code, 200)
+        published = self.post_json(
+            f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
+            {
+                'course_id': self.course.course_id,
+                'idempotency_key': 'published-preview-settings',
+                'preview_token': preview_token,
+                'survey_label': 'Published preview settings',
+                'week_number': 4,
+                'opens_at': None,
+                'expires_at': None,
+            },
+            token=self.token,
+        )
+        self.assertEqual(published.status_code, 201)
+        self.course.completion_certificate_enabled = True
+        self.course.parsed_document_download_enabled = False
+        self.course.save(update_fields=[
+            'completion_certificate_enabled',
+            'parsed_document_download_enabled',
+        ])
+
+        public = self.client.get(
+            '/datapipeline/api/get_feedback_gpt_by_public_id/',
+            {'public_id': published.json()['public_id']},
+        )
+
+        self.assertEqual(public.status_code, 200)
+        self.assertFalse(public.json()['completion_certificate_enabled'])
+        self.assertTrue(public.json()['parsed_document_download_enabled'])
+        link = QuestionSetSurvey.objects.get(survey_id=published.json()['id'])
+        link.completion_certificate_enabled = True
+        with self.assertRaises(ValidationError):
+            link.save()
+
     def test_survey_creation_requires_completed_exact_revision_and_is_idempotent(self):
         draft = self.create_draft()
         revision = self.freeze_draft(draft)
+        capability = self.post_json(
+            f"/datapipeline/api/question_set_revisions/{revision['id']}/preview_capability/",
+            {},
+            token=self.token,
+        )
+        self.assertEqual(capability.status_code, 201)
+        preview_token = capability.json()['token']
         payload = {
             'course_id': self.course.course_id,
             'idempotency_key': 'wizard-create-one-survey',
+            'preview_token': preview_token,
             'survey_label': 'Week 3 reflection',
             'week_number': 3,
             'opens_at': None,
@@ -1013,10 +1257,20 @@ class QuestionSetWizardApiTests(TestCase):
             payload,
             token=self.token,
         )
+        self.assertEqual(blocked.status_code, 425)
+        self.assertEqual(blocked.json()['error'], 'preview_preparing')
+        PreviewSession.objects.filter(token_digest=hashlib.sha256(
+            preview_token.encode('utf-8'),
+        ).hexdigest()).update(ready_at=timezone.now())
+        blocked = self.post_json(
+            f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
+            payload,
+            token=self.token,
+        )
         self.assertEqual(blocked.status_code, 409)
-        self.assertEqual(blocked.json()['error'], 'preview_required')
+        self.assertEqual(blocked.json()['error'], 'preview_incomplete')
 
-        self.complete_preview(revision)
+        payload['preview_token'] = self.complete_preview(revision)
         created = self.post_json(
             f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
             payload,
@@ -1404,7 +1658,7 @@ class QuestionSetWizardApiTests(TestCase):
         self.assertFalse(public.json()['referral_enabled'])
         self.assertEqual(public.json()['referral_text'], '')
         self.assertFalse(public.json()['identity_tracking_enabled'])
-        self.assertFalse(public.json()['completion_certificate_enabled'])
+        self.assertTrue(public.json()['completion_certificate_enabled'])
         self.assertFalse(public.json()['parsed_document_download_enabled'])
 
     def test_preview_and_default_label_use_frozen_revision_title(self):
@@ -1595,6 +1849,7 @@ class QuestionSetSurveyRaceTests(TransactionTestCase):
             ready_at=timezone.now(),
             completed_at=timezone.now(),
         )
+        self.preview_token = 'race-preview'
         self.winner_survey = FeedbackGPT.objects.create(
             public_id='race-winner',
             name='Concurrent winner',
@@ -1631,6 +1886,13 @@ class QuestionSetSurveyRaceTests(TransactionTestCase):
                 original_create(
                     survey=survey,
                     revision=revision,
+                    preview_session=PreviewSession.objects.get(
+                        token_digest=hashlib.sha256(
+                            self.preview_token.encode('utf-8'),
+                        ).hexdigest(),
+                    ),
+                    completion_certificate_enabled=True,
+                    parsed_document_download_enabled=False,
                     idempotency_key=self.idempotency_key,
                     created_by=actor,
                 )
@@ -1677,6 +1939,7 @@ class QuestionSetSurveyRaceTests(TransactionTestCase):
                 week_number=9,
                 opens_at=None,
                 expires_at=None,
+                preview_token=self.preview_token,
                 audit_event_id=supplied_audit_event_id,
             )
 

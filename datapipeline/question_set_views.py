@@ -27,9 +27,11 @@ from .question_sets import (
     list_templates,
     save_draft,
     save_preview_message,
+    serialize_preview_settings,
     serialize_draft,
     serialize_revision,
     serialize_survey_link,
+    update_preview_settings,
 )
 
 
@@ -108,6 +110,10 @@ def _status_for_error(code):
         'stale_draft': 409,
         'preview_required': 409,
         'preview_incomplete': 409,
+        'preview_token_required': 400,
+        'preview_revision_mismatch': 409,
+        'preview_owner_mismatch': 403,
+        'preview_published': 409,
         'idempotency_key_conflict': 409,
         'active_draft_exists': 409,
         'workflow_not_active': 409,
@@ -303,6 +309,7 @@ def question_set_preview_capability(request, revision_id):
             'expires_at': preview.expires_at.isoformat(),
             'ready_at': preview.ready_at.isoformat(),
             'preview_url': f'feedback.html?preview={raw_token}',
+            **serialize_preview_settings(preview),
         }, 201)
     except QuestionSetError as exc:
         return _error(exc)
@@ -346,10 +353,28 @@ def question_set_preview(request, raw_token):
             'referral_enabled': False,
             'referral_text': '',
             'identity_tracking_enabled': False,
-            'completion_certificate_enabled': False,
-            'parsed_document_download_enabled': False,
+            **serialize_preview_settings(preview),
             'team_snapshot': None,
         })
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_preview_settings(request, raw_token):
+    if request.method != 'PATCH':
+        return HttpResponse(status=405)
+    try:
+        account, session, error = _ready_account(request)
+        if error is not None:
+            return error
+        preview = update_preview_settings(
+            raw_token=raw_token,
+            actor=account,
+            instructor_session=session,
+            settings=_body(request),
+        )
+        return _private_json(serialize_preview_settings(preview))
     except QuestionSetError as exc:
         return _error(exc)
 
@@ -415,6 +440,7 @@ def question_set_revision_surveys(request, revision_id):
             week_number=payload.get('week_number'),
             opens_at=_parse_optional_datetime(payload.get('opens_at'), 'Opening time'),
             expires_at=_parse_optional_datetime(payload.get('expires_at'), 'Closing time'),
+            preview_token=payload.get('preview_token'),
         )
         return _private_json(
             serialize_survey_link(link),

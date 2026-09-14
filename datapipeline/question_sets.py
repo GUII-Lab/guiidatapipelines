@@ -716,6 +716,67 @@ def get_preview(raw_token):
     return preview
 
 
+def _preview_for_settings(raw_token):
+    preview = (
+        PreviewSession.objects
+        .select_related('revision__question_set__course', 'instructor')
+        .filter(token_digest=token_digest(raw_token))
+        .first()
+    )
+    if preview is None:
+        raise QuestionSetError('preview_not_found')
+    if preview.expires_at <= timezone.now():
+        raise QuestionSetError('preview_expired')
+    return preview
+
+
+def serialize_preview_settings(preview):
+    return {
+        'completion_certificate_enabled': preview.completion_certificate_enabled,
+        'parsed_document_download_enabled': preview.parsed_document_download_enabled,
+    }
+
+
+@transaction.atomic
+def update_preview_settings(*, raw_token, actor, instructor_session, settings):
+    if not isinstance(settings, dict):
+        raise QuestionSetError('invalid_preview_settings')
+    allowed = {
+        'completion_certificate_enabled',
+        'parsed_document_download_enabled',
+    }
+    if not settings or not set(settings).issubset(allowed):
+        raise QuestionSetError('invalid_preview_settings')
+    if any(type(value) is not bool for value in settings.values()):
+        raise QuestionSetError('invalid_preview_settings')
+
+    preview = _preview_for_settings(raw_token)
+    preview = (
+        PreviewSession.objects
+        .select_for_update()
+        .select_related('revision__question_set__course', 'instructor')
+        .get(pk=preview.pk)
+    )
+    if preview.instructor_id != actor.pk:
+        raise QuestionSetError('preview_owner_mismatch')
+    if preview.survey_links.exists():
+        raise QuestionSetError('preview_published')
+    for field_name, value in settings.items():
+        setattr(preview, field_name, value)
+    preview.save(update_fields=[*settings.keys()])
+    record_instructor_event(
+        action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_SETTINGS_UPDATED,
+        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+        actor=actor,
+        session=instructor_session,
+        course=preview.revision.question_set.course,
+        target_type='question_set',
+        target_id=preview.revision.question_set.public_id,
+        metadata=serialize_preview_settings(preview),
+    )
+    return preview
+
+
 @transaction.atomic
 def save_preview_message(*, raw_token, role, content, attribution=None):
     preview = get_preview(raw_token)
@@ -854,10 +915,17 @@ def _validate_existing_survey_retry(
     revision,
     actor,
     instructor_session,
+    preview,
     survey_public_id,
     audit_event_id,
 ):
-    if link.revision_id != revision.pk or link.created_by_id != actor.pk:
+    if (
+        link.revision_id != revision.pk
+        or link.created_by_id != actor.pk
+        or link.preview_session_id != preview.pk
+        or link.completion_certificate_enabled != preview.completion_certificate_enabled
+        or link.parsed_document_download_enabled != preview.parsed_document_download_enabled
+    ):
         raise QuestionSetError('idempotency_key_conflict')
     if (
         survey_public_id is not None
@@ -895,9 +963,25 @@ def create_survey_from_revision(
     week_number,
     opens_at,
     expires_at,
+    preview_token,
     survey_public_id=None,
     audit_event_id=None,
 ):
+    if not isinstance(preview_token, str) or not preview_token:
+        raise QuestionSetError('preview_token_required')
+    preview = get_preview(preview_token)
+    preview = (
+        PreviewSession.objects
+        .select_for_update()
+        .select_related('revision__question_set__course', 'instructor')
+        .get(pk=preview.pk)
+    )
+    if preview.instructor_id != actor.pk:
+        raise QuestionSetError('preview_owner_mismatch')
+    if preview.revision_id != revision.pk:
+        raise QuestionSetError('preview_revision_mismatch')
+    if preview.completed_at is None:
+        raise QuestionSetError('preview_incomplete')
     idempotency_key = _bounded_text(
         idempotency_key,
         'Idempotency key',
@@ -934,6 +1018,7 @@ def create_survey_from_revision(
             revision=revision,
             actor=actor,
             instructor_session=instructor_session,
+            preview=preview,
             survey_public_id=survey_public_id,
             audit_event_id=audit_event_id,
         )
@@ -953,13 +1038,12 @@ def create_survey_from_revision(
             revision=revision,
             actor=actor,
             instructor_session=instructor_session,
+            preview=preview,
             survey_public_id=survey_public_id,
             audit_event_id=audit_event_id,
         )
         return existing, False
     _require_active_workflow(question_set)
-    if not revision.preview_sessions.filter(completed_at__isnull=False).exists():
-        raise QuestionSetError('preview_required')
     if week_number is not None and (
         type(week_number) is not int or not 1 <= week_number <= 99
     ):
@@ -1003,6 +1087,9 @@ def create_survey_from_revision(
             link = QuestionSetSurvey.objects.create(
                 survey=survey,
                 revision=revision,
+                preview_session=preview,
+                completion_certificate_enabled=preview.completion_certificate_enabled,
+                parsed_document_download_enabled=preview.parsed_document_download_enabled,
                 idempotency_key=idempotency_key,
                 created_by=actor,
             )
@@ -1021,6 +1108,7 @@ def create_survey_from_revision(
             revision=revision,
             actor=actor,
             instructor_session=instructor_session,
+            preview=preview,
             survey_public_id=survey_public_id,
             audit_event_id=audit_event_id,
         )
@@ -1059,4 +1147,6 @@ def serialize_survey_link(link):
         'direct_url': f'feedback.html?id={survey.public_id}',
         'opens_at': survey.opens_at.isoformat() if survey.opens_at else None,
         'expires_at': survey.expires_at.isoformat() if survey.expires_at else None,
+        'completion_certificate_enabled': link.completion_certificate_enabled,
+        'parsed_document_download_enabled': link.parsed_document_download_enabled,
     }

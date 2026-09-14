@@ -362,6 +362,7 @@ class InstructorAuditEvent(models.Model):
     ACTION_QUESTION_SET_REVISION_FROZEN = 'question_set.revision_frozen'
     ACTION_QUESTION_SET_PREVIEW_STARTED = 'question_set.preview_started'
     ACTION_QUESTION_SET_PREVIEW_COMPLETED = 'question_set.preview_completed'
+    ACTION_QUESTION_SET_PREVIEW_SETTINGS_UPDATED = 'question_set.preview_settings_updated'
     ACTION_QUESTION_SET_WORKFLOW_ABANDONED = 'question_set.workflow_abandoned'
     ACTION_QUESTION_SET_WORKFLOW_COMPLETED = 'question_set.workflow_completed'
     ACTION_AUTHORIZATION_DENIED = 'authorization.denied'
@@ -400,6 +401,7 @@ class InstructorAuditEvent(models.Model):
         (ACTION_QUESTION_SET_REVISION_FROZEN, 'Question set revision frozen'),
         (ACTION_QUESTION_SET_PREVIEW_STARTED, 'Question set preview started'),
         (ACTION_QUESTION_SET_PREVIEW_COMPLETED, 'Question set preview completed'),
+        (ACTION_QUESTION_SET_PREVIEW_SETTINGS_UPDATED, 'Question set preview settings updated'),
         (ACTION_QUESTION_SET_WORKFLOW_ABANDONED, 'Question set workflow abandoned'),
         (ACTION_QUESTION_SET_WORKFLOW_COMPLETED, 'Question set workflow completed'),
         (ACTION_AUTHORIZATION_DENIED, 'Authorization denied'),
@@ -994,6 +996,8 @@ class PreviewSession(models.Model):
     token_digest = models.CharField(max_length=64, unique=True)
     expires_at = models.DateTimeField()
     ready_at = models.DateTimeField()
+    completion_certificate_enabled = models.BooleanField(default=True)
+    parsed_document_download_enabled = models.BooleanField(default=False)
     completed_at = models.DateTimeField(null=True, blank=True)
     next_message_sequence = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1041,7 +1045,19 @@ class PreviewMessage(models.Model):
         ]
 
 
+class ImmutableQuestionSetSurveyQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError('Question set survey links are immutable.')
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError('Question set survey links are immutable.')
+
+    def delete(self):
+        raise ValidationError('Question set survey links are immutable.')
+
+
 class QuestionSetSurvey(models.Model):
+    objects = ImmutableQuestionSetSurveyQuerySet.as_manager()
     survey = models.OneToOneField(
         FeedbackGPT,
         on_delete=models.PROTECT,
@@ -1052,6 +1068,15 @@ class QuestionSetSurvey(models.Model):
         on_delete=models.PROTECT,
         related_name='survey_links',
     )
+    preview_session = models.ForeignKey(
+        PreviewSession,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='survey_links',
+    )
+    completion_certificate_enabled = models.BooleanField(default=True)
+    parsed_document_download_enabled = models.BooleanField(default=False)
     idempotency_key = models.CharField(max_length=100, unique=True)
     created_by = models.ForeignKey(
         InstructorAccount,
@@ -1062,6 +1087,35 @@ class QuestionSetSurvey(models.Model):
 
     class Meta:
         ordering = ['-created_at', '-id']
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self).objects.filter(pk=self.pk).values(
+                'survey_id',
+                'revision_id',
+                'preview_session_id',
+                'completion_certificate_enabled',
+                'parsed_document_download_enabled',
+                'idempotency_key',
+                'created_by_id',
+                'created_at',
+            ).first()
+            current = {
+                'survey_id': self.survey_id,
+                'revision_id': self.revision_id,
+                'preview_session_id': self.preview_session_id,
+                'completion_certificate_enabled': self.completion_certificate_enabled,
+                'parsed_document_download_enabled': self.parsed_document_download_enabled,
+                'idempotency_key': self.idempotency_key,
+                'created_by_id': self.created_by_id,
+                'created_at': self.created_at,
+            }
+            if stored is not None and stored != current:
+                raise ValidationError('Question set survey links are immutable.')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError('Question set survey links are immutable.')
 
 
 # ================= In-Group feedback models =================

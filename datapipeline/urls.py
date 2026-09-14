@@ -54,6 +54,7 @@ urlpatterns = [
     path('api/question_set_preview/<str:raw_token>/', question_set_views.question_set_preview, name='question_set_preview'),
     path('api/question_set_preview/<str:raw_token>/messages/', question_set_views.question_set_preview_messages, name='question_set_preview_messages'),
     path('api/question_set_preview/<str:raw_token>/complete/', question_set_views.question_set_preview_complete, name='question_set_preview_complete'),
+    path('api/question_set_preview/<str:raw_token>/settings/', question_set_views.question_set_preview_settings, name='question_set_preview_settings'),
     # Form-mode schema registry (read-only for now; edits via Django admin)
     path('api/form_schemas/', list_form_schemas, name='list_form_schemas'),
     path('api/form_schemas/<str:schema_id>/', get_form_schema, name='get_form_schema'),

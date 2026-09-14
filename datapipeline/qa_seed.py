@@ -470,6 +470,7 @@ def _preview_payloads(revision):
 
 def _ensure_preview(*, revision, primary, allow_inactive_history=False):
     preview = PreviewSession.objects.filter(public_id=QA_PREVIEW_PUBLIC_ID).first()
+    raw_token = None
     if preview is None:
         raw_token, preview = issue_preview_capability(
             revision=revision,
@@ -497,7 +498,7 @@ def _ensure_preview(*, revision, primary, allow_inactive_history=False):
         )
     if preview.revision_id != revision.pk or preview.completed_at is None:
         raise QASeedError('QA preview does not prove the seeded revision.')
-    return preview
+    return preview, raw_token
 
 
 def _survey_values(*, revision, primary):
@@ -523,7 +524,7 @@ def _survey_values(*, revision, primary):
     }
 
 
-def _ensure_survey(*, revision, primary, reset):
+def _ensure_survey(*, revision, primary, reset, preview_token):
     expected_survey = _survey_values(revision=revision, primary=primary)
     survey = FeedbackGPT.objects.filter(public_id=QA_SURVEY_PUBLIC_ID).first()
     if survey is None:
@@ -531,6 +532,8 @@ def _ensure_survey(*, revision, primary, reset):
             idempotency_key=QA_SURVEY_IDEMPOTENCY_KEY,
         ).exists():
             raise QASeedError('QA survey idempotency key conflicts with existing data.')
+        if preview_token is None:
+            raise QASeedError('QA survey requires its freshly issued preview capability.')
         link, created = create_survey_from_revision(
             revision=revision,
             actor=primary,
@@ -540,6 +543,7 @@ def _ensure_survey(*, revision, primary, reset):
             week_number=4,
             opens_at=None,
             expires_at=None,
+            preview_token=preview_token,
             survey_public_id=QA_SURVEY_PUBLIC_ID,
             audit_event_id=QA_AUDIT_EVENT_IDS[7],
         )
@@ -839,7 +843,7 @@ def seed_qa_data(
             primary=primary,
             reset=reset,
         )
-        _ensure_preview(
+        _preview, preview_token = _ensure_preview(
             revision=revision,
             primary=primary,
             allow_inactive_history=reset,
@@ -848,6 +852,7 @@ def seed_qa_data(
             revision=revision,
             primary=primary,
             reset=reset,
+            preview_token=preview_token,
         )
         response = _ensure_response(revision=revision, survey=survey)
         analysis = _ensure_analysis(

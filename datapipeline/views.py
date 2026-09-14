@@ -1176,6 +1176,13 @@ def get_feedback_gpt_by_public_id(request):
             )
             if question_set_protocol else None
         )
+        question_set_completion_settings = (
+            {
+                'completion_certificate_enabled': question_set_link.completion_certificate_enabled,
+                'parsed_document_download_enabled': question_set_link.parsed_document_download_enabled,
+            }
+            if question_set_link else None
+        )
         course_banner = (
             question_set_settings.get('course_banner')
             if question_set_settings is not None else None
@@ -1229,13 +1236,13 @@ def get_feedback_gpt_by_public_id(request):
                 else bool(gpt.course.identity_tracking_enabled) if gpt.course else False
             ),
             'completion_certificate_enabled': (
-                bool(question_set_settings['completion_certificate_enabled'])
-                if question_set_settings is not None
+                bool(question_set_completion_settings['completion_certificate_enabled'])
+                if question_set_completion_settings is not None
                 else bool(gpt.course.completion_certificate_enabled) if gpt.course else False
             ),
             'parsed_document_download_enabled': (
-                bool(question_set_settings['parsed_document_download_enabled'])
-                if question_set_settings is not None
+                bool(question_set_completion_settings['parsed_document_download_enabled'])
+                if question_set_completion_settings is not None
                 else bool(gpt.course.parsed_document_download_enabled) if gpt.course else False
             ),
             'team_snapshot': _survey_snapshot_to_dict(snap) if snap else None,
