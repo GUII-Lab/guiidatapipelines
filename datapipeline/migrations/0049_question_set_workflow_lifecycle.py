@@ -3,6 +3,34 @@
 from django.db import migrations, models
 
 
+def normalize_question_set_workflows(apps, schema_editor):
+    QuestionSet = apps.get_model('datapipeline', 'QuestionSet')
+    QuestionSetSurvey = apps.get_model('datapipeline', 'QuestionSetSurvey')
+
+    published_ids = QuestionSetSurvey.objects.values_list(
+        'revision__question_set_id',
+        flat=True,
+    ).distinct()
+    QuestionSet.objects.filter(pk__in=published_ids).update(
+        workflow_status='completed',
+    )
+
+    eligible = (
+        QuestionSet.objects
+        .filter(archived_at__isnull=True, draft__isnull=False)
+        .exclude(revisions__survey_links__isnull=False)
+    )
+    for course_id in eligible.values_list('course_id', flat=True).distinct():
+        newest = eligible.filter(course_id=course_id).order_by(
+            '-draft__updated_at',
+            '-updated_at',
+            '-id',
+        ).first()
+        eligible.filter(course_id=course_id).exclude(pk=newest.pk).update(
+            workflow_status='abandoned',
+        )
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -29,6 +57,10 @@ class Migration(migrations.Migration):
                 fields=['course', 'workflow_status', '-updated_at'],
                 name='leai_qset_course_workflow',
             ),
+        ),
+        migrations.RunPython(
+            normalize_question_set_workflows,
+            migrations.RunPython.noop,
         ),
         migrations.AlterField(
             model_name='instructorauditevent',

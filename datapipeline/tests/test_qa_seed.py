@@ -324,12 +324,14 @@ class QASeedTests(TestCase):
             instructor_session=None,
             expected_version=draft.version,
             body=later_body,
+            allow_inactive_history=True,
         )
         later_revision, created = freeze_draft(
             draft_id=draft.public_id,
             actor=draft.updated_by,
             instructor_session=None,
             expected_version=draft.version,
+            allow_inactive_history=True,
         )
         self.assertTrue(created)
         later_revision_pk = later_revision.pk

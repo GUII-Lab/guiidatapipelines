@@ -8,7 +8,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, connections
+from django.db import IntegrityError, connection, connections
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models.deletion import ProtectedError
 from django.test import Client, TestCase, TransactionTestCase
@@ -37,6 +37,7 @@ from datapipeline.question_sets import (
     create_draft as create_draft_service,
     create_survey_from_revision,
     freeze_draft as freeze_draft_service,
+    save_draft as save_draft_service,
 )
 
 
@@ -487,6 +488,119 @@ class QuestionSetWizardApiTests(TestCase):
             action='question_set.workflow_completed',
             target_id=str(question_set.public_id),
         ).exists())
+
+    def test_inactive_workflow_cannot_start_another_preview(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        for workflow_status in (
+            QuestionSet.WORKFLOW_COMPLETED,
+            QuestionSet.WORKFLOW_ABANDONED,
+        ):
+            with self.subTest(workflow_status=workflow_status):
+                QuestionSet.objects.filter(
+                    public_id=draft['question_set_id'],
+                ).update(workflow_status=workflow_status)
+                response = self.post_json(
+                    f"/datapipeline/api/question_set_revisions/{revision['id']}/preview_capability/",
+                    {},
+                    token=self.token,
+                )
+
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json()['error'], 'workflow_not_active')
+
+    def test_inactive_workflow_service_mutations_require_explicit_history_bypass(self):
+        draft = create_draft_service(
+            course=self.course,
+            actor=self.account,
+            instructor_session=None,
+            template_id='weekly-reflection',
+        )
+        QuestionSet.objects.filter(pk=draft.question_set_id).update(
+            workflow_status=QuestionSet.WORKFLOW_ABANDONED,
+        )
+
+        with self.assertRaises(QuestionSetError) as saved:
+            save_draft_service(
+                draft_id=draft.public_id,
+                actor=self.account,
+                instructor_session=None,
+                expected_version=draft.version,
+                body=draft.body,
+            )
+        with self.assertRaises(QuestionSetError) as frozen:
+            freeze_draft_service(
+                draft_id=draft.public_id,
+                actor=self.account,
+                instructor_session=None,
+                expected_version=draft.version,
+            )
+
+        self.assertEqual(saved.exception.code, 'workflow_not_active')
+        self.assertEqual(frozen.exception.code, 'workflow_not_active')
+        revision, created = freeze_draft_service(
+            draft_id=draft.public_id,
+            actor=self.account,
+            instructor_session=None,
+            expected_version=draft.version,
+            allow_inactive_history=True,
+        )
+        self.assertTrue(created)
+        self.assertEqual(revision.question_set_id, draft.question_set_id)
+
+    def test_idempotent_publish_retry_rechecks_after_workflow_lock(self):
+        draft = self.create_draft()
+        revision_payload = self.freeze_draft(draft)
+        self.complete_preview(revision_payload)
+        revision = QuestionSetRevision.objects.get(
+            public_id=revision_payload['id'],
+        )
+        key = 'publish-recheck-after-lock'
+        first, created = create_survey_from_revision(
+            revision=revision,
+            actor=self.account,
+            instructor_session=None,
+            idempotency_key=key,
+            survey_label='First publication',
+            week_number=4,
+            opens_at=None,
+            expires_at=None,
+        )
+        self.assertTrue(created)
+
+        original_filter = type(QuestionSetSurvey.objects.all()).filter
+        calls = 0
+
+        def hide_only_the_prelock_lookup(queryset, *args, **kwargs):
+            nonlocal calls
+            if (
+                queryset.model is QuestionSetSurvey
+                and kwargs.get('idempotency_key') == key
+            ):
+                calls += 1
+                if calls == 1:
+                    return QuestionSetSurvey.objects.none()
+            return original_filter(queryset, *args, **kwargs)
+
+        with patch.object(
+            type(QuestionSetSurvey.objects.all()),
+            'filter',
+            new=hide_only_the_prelock_lookup,
+        ):
+            retry, created = create_survey_from_revision(
+                revision=revision,
+                actor=self.account,
+                instructor_session=None,
+                idempotency_key=key,
+                survey_label='Ignored retry values',
+                week_number=9,
+                opens_at=None,
+                expires_at=None,
+            )
+
+        self.assertFalse(created)
+        self.assertEqual(retry.pk, first.pk)
+        self.assertEqual(calls, 2)
 
     def test_save_uses_optimistic_concurrency_and_preserves_protocol_structure(self):
         draft = self.create_draft()
@@ -1156,6 +1270,119 @@ class QuestionSetWizardApiTests(TestCase):
 
         self.assertEqual(preview.status_code, 200)
         self.assertEqual(preview.json()['name'], draft['body']['title'])
+
+
+class QuestionSetWorkflowMigrationTests(TransactionTestCase):
+    migrate_from = [('datapipeline', '0048_question_set_wizard')]
+    migrate_to = [('datapipeline', '0049_question_set_workflow_lifecycle')]
+
+    def setUp(self):
+        super().setUp()
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_from)
+        old_apps = executor.loader.project_state(self.migrate_from).apps
+        User = old_apps.get_model('auth', 'User')
+        Institution = old_apps.get_model('datapipeline', 'Institution')
+        InstructorAccount = old_apps.get_model('datapipeline', 'InstructorAccount')
+        Course = old_apps.get_model('datapipeline', 'Course')
+        QuestionSet = old_apps.get_model('datapipeline', 'QuestionSet')
+        QuestionSetDraft = old_apps.get_model('datapipeline', 'QuestionSetDraft')
+        QuestionSetRevision = old_apps.get_model(
+            'datapipeline', 'QuestionSetRevision',
+        )
+        QuestionSetSurvey = old_apps.get_model('datapipeline', 'QuestionSetSurvey')
+        FeedbackGPT = old_apps.get_model('datapipeline', 'FeedbackGPT')
+
+        institution = Institution.objects.create(
+            slug='lifecycle-migration',
+            name='Lifecycle Migration University',
+        )
+        user = User.objects.create(username='lifecycle-migration-user')
+        owner = InstructorAccount.objects.create(
+            user=user,
+            email='lifecycle-migration@example.invalid',
+            display_name='Lifecycle Migration Owner',
+            must_change_password=False,
+        )
+        course = Course.objects.create(
+            course_id='lifecycle-migration-course',
+            course_name='Lifecycle Migration Course',
+            instructor_name='Lifecycle Migration Owner',
+            password='!',
+            institution=institution,
+        )
+
+        def old_workflow(title):
+            question_set = QuestionSet.objects.create(
+                course=course,
+                owner=owner,
+                template_id='weekly-reflection',
+                title=title,
+                audience='individual',
+            )
+            draft = QuestionSetDraft.objects.create(
+                question_set=question_set,
+                body={'title': title, 'sections': []},
+                updated_by=owner,
+            )
+            return question_set, draft
+
+        older, older_draft = old_workflow('Older unfinished')
+        newest, newest_draft = old_workflow('Newest unfinished')
+        published, _published_draft = old_workflow('Published workflow')
+        QuestionSetDraft.objects.filter(pk=older_draft.pk).update(
+            updated_at=timezone.now() - timedelta(days=2),
+        )
+        QuestionSetDraft.objects.filter(pk=newest_draft.pk).update(
+            updated_at=timezone.now() - timedelta(days=1),
+        )
+        revision = QuestionSetRevision.objects.create(
+            question_set=published,
+            revision_number=1,
+            source_draft_version=1,
+            canonical_body={'title': 'Published workflow'},
+            compiled_protocol={'title': 'Published workflow'},
+            content_hash='a' * 64,
+            created_by=owner,
+        )
+        survey = FeedbackGPT.objects.create(
+            public_id='life-migrate-01',
+            name='Lifecycle migration survey',
+            survey_label='Lifecycle migration survey',
+            instructions='Synthetic migration fixture.',
+            created_by=owner.display_name,
+            course=course,
+            mode='form',
+        )
+        QuestionSetSurvey.objects.create(
+            survey=survey,
+            revision=revision,
+            idempotency_key='lifecycle-migration-key',
+            created_by=owner,
+        )
+        self.question_set_ids = {
+            'older': older.pk,
+            'newest': newest.pk,
+            'published': published.pk,
+        }
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_to)
+        self.apps = executor.loader.project_state(self.migrate_to).apps
+
+    def test_migration_completes_published_workflows_and_keeps_one_unpublished_active(self):
+        QuestionSet = self.apps.get_model('datapipeline', 'QuestionSet')
+
+        statuses = {
+            name: QuestionSet.objects.get(pk=pk).workflow_status
+            for name, pk in self.question_set_ids.items()
+        }
+
+        self.assertEqual(statuses, {
+            'older': 'abandoned',
+            'newest': 'active',
+            'published': 'completed',
+        })
 
 
 class QuestionSetSurveyRaceTests(TransactionTestCase):

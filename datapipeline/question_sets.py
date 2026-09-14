@@ -385,6 +385,15 @@ def _active_question_sets_for_course(course):
     )
 
 
+def _require_active_workflow(question_set, *, allow_inactive_history=False):
+    if (
+        not allow_inactive_history
+        and question_set.workflow_status != QuestionSet.WORKFLOW_ACTIVE
+    ):
+        raise QuestionSetError('workflow_not_active')
+
+
+@transaction.atomic
 def abandon_active_draft(*, course, actor, instructor_session):
     abandoned = []
     for question_set in _active_question_sets_for_course(course):
@@ -471,12 +480,27 @@ def create_draft(
 
 
 @transaction.atomic
-def save_draft(*, draft_id, actor, instructor_session, expected_version, body):
+def save_draft(
+    *,
+    draft_id,
+    actor,
+    instructor_session,
+    expected_version,
+    body,
+    allow_inactive_history=False,
+):
     draft = (
         QuestionSetDraft.objects
         .select_for_update()
         .select_related('question_set__course')
         .get(public_id=draft_id)
+    )
+    question_set = QuestionSet.objects.select_for_update().get(
+        pk=draft.question_set_id,
+    )
+    _require_active_workflow(
+        question_set,
+        allow_inactive_history=allow_inactive_history,
     )
     if draft.version != expected_version:
         raise QuestionSetError('stale_draft')
@@ -485,8 +509,8 @@ def save_draft(*, draft_id, actor, instructor_session, expected_version, body):
     draft.version += 1
     draft.updated_by = actor
     draft.save(update_fields=['body', 'version', 'updated_by', 'updated_at'])
-    draft.question_set.title = normalized['title']
-    draft.question_set.save(update_fields=['title', 'updated_at'])
+    question_set.title = normalized['title']
+    question_set.save(update_fields=['title', 'updated_at'])
     QuestionSetValidationRun.objects.create(
         draft=draft,
         is_valid=True,
@@ -496,7 +520,7 @@ def save_draft(*, draft_id, actor, instructor_session, expected_version, body):
         action=InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_SAVED,
         actor=actor,
         instructor_session=instructor_session,
-        question_set=draft.question_set,
+        question_set=question_set,
     )
     return draft
 
@@ -518,6 +542,7 @@ def freeze_draft(
     expected_version,
     revision_public_id=None,
     audit_event_id=None,
+    allow_inactive_history=False,
 ):
     _validate_optional_uuid(
         revision_public_id,
@@ -528,6 +553,13 @@ def freeze_draft(
         .select_for_update()
         .select_related('question_set__course')
         .get(public_id=draft_id)
+    )
+    question_set = QuestionSet.objects.select_for_update().get(
+        pk=draft.question_set_id,
+    )
+    _require_active_workflow(
+        question_set,
+        allow_inactive_history=allow_inactive_history,
     )
     if draft.version != expected_version:
         raise QuestionSetError('stale_draft')
@@ -541,7 +573,7 @@ def freeze_draft(
         _canonical_json(revision_identity).encode('utf-8')
     ).hexdigest()
     existing = QuestionSetRevision.objects.filter(
-        question_set=draft.question_set,
+        question_set=question_set,
         content_hash=content_hash,
     ).first()
     if existing is not None:
@@ -560,21 +592,21 @@ def freeze_draft(
 
     latest_number = (
         QuestionSetRevision.objects
-        .filter(question_set=draft.question_set)
+        .filter(question_set=question_set)
         .aggregate(value=Max('revision_number'))['value']
         or 0
     )
     revision_number = latest_number + 1
     compiled = copy.deepcopy(canonical)
     compiled['schema_id'] = (
-        f'question-set:{draft.question_set.public_id}:v{revision_number}'
+        f'question-set:{question_set.public_id}:v{revision_number}'
     )
     compiled['version'] = str(revision_number)
     compiled['effective_settings'] = copy.deepcopy(
         QUESTION_SET_EFFECTIVE_SETTINGS
     )
     revision_values = {
-        'question_set': draft.question_set,
+        'question_set': question_set,
         'revision_number': revision_number,
         'source_draft_version': draft.version,
         'canonical_body': canonical,
@@ -600,7 +632,7 @@ def freeze_draft(
         action=InstructorAuditEvent.ACTION_QUESTION_SET_REVISION_FROZEN,
         actor=actor,
         instructor_session=instructor_session,
-        question_set=draft.question_set,
+        question_set=question_set,
         event_id=audit_event_id,
     )
     return revision, True
@@ -879,8 +911,23 @@ def create_survey_from_revision(
     question_set = QuestionSet.objects.select_for_update().get(
         pk=revision.question_set_id,
     )
-    if question_set.workflow_status != QuestionSet.WORKFLOW_ACTIVE:
-        raise QuestionSetError('workflow_not_active')
+    existing = (
+        QuestionSetSurvey.objects
+        .select_related('survey', 'revision')
+        .filter(idempotency_key=idempotency_key)
+        .first()
+    )
+    if existing is not None:
+        _validate_existing_survey_retry(
+            link=existing,
+            revision=revision,
+            actor=actor,
+            instructor_session=instructor_session,
+            survey_public_id=survey_public_id,
+            audit_event_id=audit_event_id,
+        )
+        return existing, False
+    _require_active_workflow(question_set)
     if not revision.preview_sessions.filter(completed_at__isnull=False).exists():
         raise QuestionSetError('preview_required')
     if week_number is not None and (

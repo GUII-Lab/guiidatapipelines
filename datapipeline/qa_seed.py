@@ -388,6 +388,7 @@ def _ensure_question_set_graph(*, course, primary, reset):
             expected_version=draft.version,
             revision_public_id=QA_REVISION_PUBLIC_ID,
             audit_event_id=QA_AUDIT_EVENT_IDS[4],
+            allow_inactive_history=reset,
         )
         if not created:
             raise QASeedError('QA revision was not created from the current compiler.')
