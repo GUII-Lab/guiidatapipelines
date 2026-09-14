@@ -362,6 +362,7 @@ class InstructorAuditEvent(models.Model):
     ACTION_QUESTION_SET_REVISION_FROZEN = 'question_set.revision_frozen'
     ACTION_QUESTION_SET_PREVIEW_STARTED = 'question_set.preview_started'
     ACTION_QUESTION_SET_PREVIEW_COMPLETED = 'question_set.preview_completed'
+    ACTION_QUESTION_SET_PREVIEW_SKIPPED = 'question_set.preview_skipped'
     ACTION_QUESTION_SET_PREVIEW_SETTINGS_UPDATED = 'question_set.preview_settings_updated'
     ACTION_QUESTION_SET_WORKFLOW_ABANDONED = 'question_set.workflow_abandoned'
     ACTION_QUESTION_SET_WORKFLOW_COMPLETED = 'question_set.workflow_completed'
@@ -401,6 +402,7 @@ class InstructorAuditEvent(models.Model):
         (ACTION_QUESTION_SET_REVISION_FROZEN, 'Question set revision frozen'),
         (ACTION_QUESTION_SET_PREVIEW_STARTED, 'Question set preview started'),
         (ACTION_QUESTION_SET_PREVIEW_COMPLETED, 'Question set preview completed'),
+        (ACTION_QUESTION_SET_PREVIEW_SKIPPED, 'Question set preview skipped'),
         (ACTION_QUESTION_SET_PREVIEW_SETTINGS_UPDATED, 'Question set preview settings updated'),
         (ACTION_QUESTION_SET_WORKFLOW_ABANDONED, 'Question set workflow abandoned'),
         (ACTION_QUESTION_SET_WORKFLOW_COMPLETED, 'Question set workflow completed'),
@@ -999,6 +1001,7 @@ class PreviewSession(models.Model):
     completion_certificate_enabled = models.BooleanField(default=True)
     parsed_document_download_enabled = models.BooleanField(default=False)
     completed_at = models.DateTimeField(null=True, blank=True)
+    skipped_at = models.DateTimeField(null=True, blank=True)
     next_message_sequence = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
 

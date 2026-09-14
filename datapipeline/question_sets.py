@@ -740,6 +740,13 @@ def serialize_preview_settings(preview):
     }
 
 
+def serialize_preview_status(preview):
+    return {
+        'preview_completed': preview.completed_at is not None,
+        'preview_skipped': preview.skipped_at is not None,
+    }
+
+
 @transaction.atomic
 def update_preview_settings(*, raw_token, actor, instructor_session, settings):
     if not isinstance(settings, dict):
@@ -904,6 +911,45 @@ def complete_preview(*, raw_token, audit_event_id=None):
     return preview
 
 
+@transaction.atomic
+def skip_preview(*, raw_token, actor, instructor_session, acknowledge_warning):
+    preview = get_preview(raw_token)
+    preview = (
+        PreviewSession.objects
+        .select_for_update()
+        .select_related('revision__question_set__course', 'instructor')
+        .get(pk=preview.pk)
+    )
+    _require_preview_available(preview, require_ready=True)
+    if preview.instructor_id != actor.pk:
+        raise QuestionSetError('preview_owner_mismatch')
+    if preview.survey_links.exists():
+        raise QuestionSetError('preview_published')
+    if preview.completed_at is not None:
+        return preview
+
+    previously_confirmed = InstructorAuditEvent.objects.filter(
+        action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_SKIPPED,
+        actor=actor,
+        outcome=InstructorAuditEvent.OUTCOME_SUCCESS,
+    ).exists()
+    if not previously_confirmed and acknowledge_warning is not True:
+        raise QuestionSetError(
+            'preview_skip_confirmation_required',
+            'Confirm that you want to skip the student preview.',
+        )
+    if preview.skipped_at is None:
+        preview.skipped_at = timezone.now()
+        preview.save(update_fields=['skipped_at'])
+        _record_question_set_event(
+            action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_SKIPPED,
+            actor=actor,
+            instructor_session=instructor_session,
+            question_set=preview.revision.question_set,
+        )
+    return preview
+
+
 def _new_survey_public_id():
     alphabet = string.ascii_lowercase + string.digits
     for _attempt in range(20):
@@ -985,7 +1031,7 @@ def create_survey_from_revision(
         raise QuestionSetError('preview_owner_mismatch')
     if preview.revision_id != revision.pk:
         raise QuestionSetError('preview_revision_mismatch')
-    if preview.completed_at is None:
+    if preview.completed_at is None and preview.skipped_at is None:
         raise QuestionSetError('preview_incomplete')
     idempotency_key = _bounded_text(
         idempotency_key,

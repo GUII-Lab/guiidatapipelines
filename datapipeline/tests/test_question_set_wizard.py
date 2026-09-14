@@ -1371,6 +1371,56 @@ class QuestionSetWizardApiTests(TestCase):
             f'question-set:{link.revision.question_set.public_id}:v1',
         )
 
+    def test_first_preview_skip_requires_confirmation_then_allows_exact_revision_publish(self):
+        draft = self.create_draft()
+        revision = self.freeze_draft(draft)
+        preview_token = self.issue_preview(revision)
+        skip_url = f'/datapipeline/api/question_set_preview/{preview_token}/skip/'
+
+        blocked = self.post_json(skip_url, {}, token=self.token)
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.json()['error'], 'preview_skip_confirmation_required')
+        self.assertIsNone(PreviewSession.objects.get().skipped_at)
+
+        skipped = self.post_json(
+            skip_url,
+            {'acknowledge_warning': True},
+            token=self.token,
+        )
+        self.assertEqual(skipped.status_code, 200)
+        self.assertTrue(skipped.json()['preview_skipped'])
+        preview = PreviewSession.objects.get()
+        self.assertIsNotNone(preview.skipped_at)
+        self.assertTrue(InstructorAuditEvent.objects.filter(
+            action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_SKIPPED,
+            actor=self.account,
+            target_id=str(preview.revision.question_set.public_id),
+        ).exists())
+
+        later_preview_token = self.issue_preview(revision)
+        later_skip = self.post_json(
+            f'/datapipeline/api/question_set_preview/{later_preview_token}/skip/',
+            {'acknowledge_warning': False},
+            token=self.token,
+        )
+        self.assertEqual(later_skip.status_code, 200)
+        self.assertTrue(later_skip.json()['preview_skipped'])
+
+        published = self.post_json(
+            f"/datapipeline/api/question_set_revisions/{revision['id']}/surveys/",
+            {
+                'course_id': self.course.course_id,
+                'idempotency_key': 'first-skip-may-publish',
+                'preview_token': later_preview_token,
+                'survey_label': 'Skipped preview survey',
+                'week_number': None,
+                'opens_at': None,
+                'expires_at': None,
+            },
+            token=self.token,
+        )
+        self.assertEqual(published.status_code, 201)
+
     def test_service_survey_retry_accepts_matching_optional_ids(self):
         revision, link, audit_event_id = self.create_service_survey()
         counts_before = (

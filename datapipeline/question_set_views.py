@@ -28,10 +28,12 @@ from .question_sets import (
     save_draft,
     save_preview_message,
     serialize_preview_settings,
+    serialize_preview_status,
     serialize_draft,
     serialize_revision,
     serialize_survey_link,
     update_preview_settings,
+    skip_preview,
 )
 
 
@@ -110,6 +112,7 @@ def _status_for_error(code):
         'stale_draft': 409,
         'preview_required': 409,
         'preview_incomplete': 409,
+        'preview_skip_confirmation_required': 409,
         'preview_token_required': 400,
         'preview_revision_mismatch': 409,
         'preview_owner_mismatch': 403,
@@ -310,6 +313,7 @@ def question_set_preview_capability(request, revision_id):
             'ready_at': preview.ready_at.isoformat(),
             'preview_url': f'feedback.html?preview={raw_token}',
             **serialize_preview_settings(preview),
+            **serialize_preview_status(preview),
         }, 201)
     except QuestionSetError as exc:
         return _error(exc)
@@ -339,7 +343,7 @@ def question_set_preview(request, raw_token):
             'reason': None,
             'anonymity_mode': 'anonymous',
             'is_preview': True,
-            'preview_completed': preview.completed_at is not None,
+            **serialize_preview_status(preview),
             'question_set_revision_id': str(revision.public_id),
             'form_schema_id': protocol['schema_id'],
             'form_schema': {
@@ -410,6 +414,25 @@ def question_set_preview_complete(request, raw_token):
             'completed_at': preview.completed_at.isoformat(),
             'question_set_revision_id': str(preview.revision.public_id),
         })
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_preview_skip(request, raw_token):
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        account, session, error = _ready_account(request)
+        if error is not None:
+            return error
+        preview = skip_preview(
+            raw_token=raw_token,
+            actor=account,
+            instructor_session=session,
+            acknowledge_warning=_body(request).get('acknowledge_warning'),
+        )
+        return _private_json(serialize_preview_status(preview))
     except QuestionSetError as exc:
         return _error(exc)
 
