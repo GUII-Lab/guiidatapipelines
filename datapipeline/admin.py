@@ -222,6 +222,92 @@ class QuestionSetRevisionAdmin(ImmutableQuestionSetAdmin):
     list_select_related = ('question_set', 'created_by')
 
 
+@admin.register(QuestionSetDraftVersion)
+class QuestionSetDraftVersionAdmin(ImmutableQuestionSetAdmin):
+    list_display = (
+        'public_id',
+        'question_set',
+        'version_number',
+        'author_kind',
+        'author',
+        'created_at',
+    )
+    list_filter = ('author_kind', 'created_at')
+    search_fields = ('=public_id', 'question_set__title', 'summary', 'content_hash')
+    list_select_related = ('question_set', 'author', 'parent_version', 'restored_from')
+
+
+@admin.register(QuestionSetTemplate)
+class QuestionSetTemplateAdmin(ImmutableQuestionSetAdmin):
+    list_display = (
+        'public_id',
+        'name',
+        'scope',
+        'visibility',
+        'audience',
+        'collection_style',
+        'owner',
+        'is_active',
+    )
+    list_filter = ('scope', 'visibility', 'audience', 'collection_style', 'is_active')
+    search_fields = ('=public_id', 'name', 'description', 'owner__email')
+    list_select_related = ('owner', 'institution', 'community_revision', 'origin_revision')
+
+
+@admin.register(QuestionSetTemplateRevision)
+class QuestionSetTemplateRevisionAdmin(ImmutableQuestionSetAdmin):
+    list_display = (
+        'public_id',
+        'template',
+        'revision_number',
+        'provenance',
+        'created_by',
+        'created_at',
+    )
+    list_filter = ('provenance', 'created_at')
+    search_fields = ('=public_id', 'template__name', 'content_hash')
+    list_select_related = ('template', 'created_by')
+
+
+@admin.register(QuestionSetMutationReceipt)
+class QuestionSetMutationReceiptAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('idempotency_key', 'operation_kind', 'scope', 'outcome', 'created_at')
+    list_filter = ('operation_kind', 'outcome', 'created_at')
+    search_fields = ('idempotency_key', 'scope', 'error_code')
+    list_select_related = ('result_version', 'published_link')
+
+
+@admin.register(AuthoringConversation)
+class AuthoringConversationAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('public_id', 'question_set', 'created_by', 'created_at', 'updated_at')
+    search_fields = ('=public_id', 'question_set__title', 'created_by__email')
+    list_select_related = ('question_set', 'created_by')
+
+
+@admin.register(AuthoringMessage)
+class AuthoringMessageAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('conversation', 'sequence', 'role', 'created_at')
+    list_filter = ('role', 'created_at')
+    search_fields = ('conversation__question_set__title', 'content')
+    list_select_related = ('conversation',)
+
+
+@admin.register(AuthoringRun)
+class AuthoringRunAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('public_id', 'conversation', 'status', 'model', 'created_at', 'completed_at')
+    list_filter = ('status', 'created_at', 'completed_at')
+    search_fields = ('=public_id', 'conversation__question_set__title', 'idempotency_key')
+    list_select_related = ('conversation', 'request_message', 'base_version', 'applied_version')
+
+
+@admin.register(AuthoringRunSource)
+class AuthoringRunSourceAdmin(ImmutableQuestionSetAdmin):
+    list_display = ('run', 'source_type', 'stable_identifier', 'created_at')
+    list_filter = ('source_type', 'created_at')
+    search_fields = ('stable_identifier', 'run__conversation__question_set__title')
+    list_select_related = ('run',)
+
+
 @admin.register(PreviewSession)
 class PreviewSessionAdmin(ImmutableQuestionSetAdmin):
     list_display = ('public_id', 'revision', 'instructor', 'created_at', 'expires_at', 'completed_at')

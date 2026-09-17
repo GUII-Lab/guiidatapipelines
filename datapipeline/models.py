@@ -779,8 +779,36 @@ class FormSchema(models.Model):
 
 class QuestionSet(models.Model):
     AUDIENCE_INDIVIDUAL = 'individual'
+    AUDIENCE_TEAM = 'team'
     AUDIENCE_CHOICES = [
-        (AUDIENCE_INDIVIDUAL, 'Individual structured reflection'),
+        (AUDIENCE_INDIVIDUAL, 'Individual feedback'),
+        (AUDIENCE_TEAM, 'Team feedback'),
+    ]
+    COLLECTION_GUIDED = 'guided'
+    COLLECTION_OPEN = 'open'
+    COLLECTION_STYLE_CHOICES = [
+        (COLLECTION_GUIDED, 'Guided feedback'),
+        (COLLECTION_OPEN, 'Open conversation'),
+    ]
+    SOURCE_TEMPLATE = 'template'
+    SOURCE_BLANK = 'blank'
+    SOURCE_COPIED_REVISION = 'copied_revision'
+    SOURCE_LEGACY = 'legacy'
+    SOURCE_KIND_CHOICES = [
+        (SOURCE_TEMPLATE, 'Template'),
+        (SOURCE_BLANK, 'Blank'),
+        (SOURCE_COPIED_REVISION, 'Copied revision'),
+        (SOURCE_LEGACY, 'Legacy'),
+    ]
+    RESPONSE_INDIVIDUAL = 'individual'
+    RESPONSE_UNIT_CHOICES = [
+        (RESPONSE_INDIVIDUAL, 'Individual response'),
+    ]
+    AGGREGATION_COURSE = 'course'
+    AGGREGATION_TEAM = 'team'
+    AGGREGATION_SCOPE_CHOICES = [
+        (AGGREGATION_COURSE, 'Course'),
+        (AGGREGATION_TEAM, 'Team'),
     ]
     WORKFLOW_ACTIVE = 'active'
     WORKFLOW_COMPLETED = 'completed'
@@ -802,12 +830,48 @@ class QuestionSet(models.Model):
         on_delete=models.PROTECT,
         related_name='owned_question_sets',
     )
-    template_id = models.CharField(max_length=64)
+    # Compatibility handle for the first-release Wizard templates. V12 sources
+    # are pinned through source_template_revision instead, so blank is valid.
+    template_id = models.CharField(max_length=64, blank=True, default='')
     title = models.CharField(max_length=200)
     audience = models.CharField(
         max_length=20,
         choices=AUDIENCE_CHOICES,
         default=AUDIENCE_INDIVIDUAL,
+    )
+    collection_style = models.CharField(
+        max_length=16,
+        choices=COLLECTION_STYLE_CHOICES,
+        default=COLLECTION_GUIDED,
+    )
+    source_kind = models.CharField(
+        max_length=24,
+        choices=SOURCE_KIND_CHOICES,
+        default=SOURCE_LEGACY,
+    )
+    source_template_revision = models.ForeignKey(
+        'QuestionSetTemplateRevision',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='created_question_sets',
+    )
+    source_question_set_revision = models.ForeignKey(
+        'QuestionSetRevision',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='copied_question_sets',
+    )
+    response_unit = models.CharField(
+        max_length=16,
+        choices=RESPONSE_UNIT_CHOICES,
+        default=RESPONSE_INDIVIDUAL,
+    )
+    aggregation_scope = models.CharField(
+        max_length=16,
+        choices=AGGREGATION_SCOPE_CHOICES,
+        default=AGGREGATION_COURSE,
     )
     workflow_status = models.CharField(
         max_length=16,
@@ -830,6 +894,78 @@ class QuestionSet(models.Model):
                 name='leai_qset_course_workflow',
             ),
         ]
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        audience='individual',
+                        collection_style__in=['guided', 'open'],
+                        aggregation_scope='course',
+                    )
+                    | models.Q(
+                        audience='team',
+                        collection_style='guided',
+                        aggregation_scope='team',
+                    )
+                ),
+                name='leai_qset_supported_taxonomy',
+            ),
+            models.CheckConstraint(
+                check=models.Q(response_unit='individual'),
+                name='leai_qset_individual_response_unit',
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        source_kind='template',
+                        source_template_revision__isnull=False,
+                        source_question_set_revision__isnull=True,
+                    )
+                    | models.Q(
+                        source_kind='copied_revision',
+                        source_template_revision__isnull=True,
+                        source_question_set_revision__isnull=False,
+                    )
+                    | models.Q(
+                        source_kind__in=['blank', 'legacy'],
+                        source_template_revision__isnull=True,
+                        source_question_set_revision__isnull=True,
+                    )
+                ),
+                name='leai_qset_source_matches_kind',
+            ),
+            models.UniqueConstraint(
+                fields=['course'],
+                condition=(
+                    models.Q(workflow_status='active')
+                    & models.Q(archived_at__isnull=True)
+                ),
+                name='leai_one_active_qset_per_course',
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if self.response_unit != self.RESPONSE_INDIVIDUAL:
+            errors['response_unit'] = 'V12 responses are always individual.'
+        if self.audience == self.AUDIENCE_INDIVIDUAL:
+            if self.collection_style not in {
+                self.COLLECTION_GUIDED,
+                self.COLLECTION_OPEN,
+            }:
+                errors['collection_style'] = 'Unsupported individual collection style.'
+            if self.aggregation_scope != self.AGGREGATION_COURSE:
+                errors['aggregation_scope'] = 'Individual feedback aggregates by course.'
+        elif self.audience == self.AUDIENCE_TEAM:
+            if self.collection_style != self.COLLECTION_GUIDED:
+                errors['collection_style'] = 'Team feedback must be guided.'
+            if self.aggregation_scope != self.AGGREGATION_TEAM:
+                errors['aggregation_scope'] = 'Team feedback aggregates by team.'
+        else:
+            errors['audience'] = 'Unsupported feedback audience.'
+        if errors:
+            raise ValidationError(errors)
 
     def __str__(self):
         return f'{self.title} ({self.course.course_id})'
@@ -856,11 +992,32 @@ class QuestionSetRevision(models.Model):
     )
     revision_number = models.PositiveIntegerField()
     source_draft_version = models.PositiveIntegerField()
+    source_checkpoint = models.ForeignKey(
+        'QuestionSetDraftVersion',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='frozen_revisions',
+    )
     canonical_body = models.JSONField()
     compiled_protocol = models.JSONField()
     content_hash = models.CharField(max_length=64)
     compiler_version = models.CharField(max_length=32, default='1')
     engine_version = models.CharField(max_length=32, default='formmode-v1')
+    author_kind = models.CharField(
+        max_length=16,
+        choices=[
+            ('instructor', 'Instructor'),
+            ('ai', 'AI'),
+            ('system', 'System'),
+            ('restore', 'Restore'),
+        ],
+        default='instructor',
+    )
+    protocol_schema_version = models.CharField(
+        max_length=32,
+        default='guided-feedback-v1',
+    )
     created_by = models.ForeignKey(
         InstructorAccount,
         on_delete=models.PROTECT,
@@ -888,11 +1045,14 @@ class QuestionSetRevision(models.Model):
                 'question_set_id',
                 'revision_number',
                 'source_draft_version',
+                'source_checkpoint_id',
                 'canonical_body',
                 'compiled_protocol',
                 'content_hash',
                 'compiler_version',
                 'engine_version',
+                'author_kind',
+                'protocol_schema_version',
                 'created_by_id',
                 'created_at',
             ).first()
@@ -901,11 +1061,14 @@ class QuestionSetRevision(models.Model):
                 'question_set_id': self.question_set_id,
                 'revision_number': self.revision_number,
                 'source_draft_version': self.source_draft_version,
+                'source_checkpoint_id': self.source_checkpoint_id,
                 'canonical_body': self.canonical_body,
                 'compiled_protocol': self.compiled_protocol,
                 'content_hash': self.content_hash,
                 'compiler_version': self.compiler_version,
                 'engine_version': self.engine_version,
+                'author_kind': self.author_kind,
+                'protocol_schema_version': self.protocol_schema_version,
                 'created_by_id': self.created_by_id,
                 'created_at': self.created_at,
             }
@@ -934,6 +1097,13 @@ class QuestionSetDraft(models.Model):
         blank=True,
         related_name='based_drafts',
     )
+    current_checkpoint = models.ForeignKey(
+        'QuestionSetDraftVersion',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='current_for_drafts',
+    )
     body = models.JSONField()
     version = models.PositiveIntegerField(default=1)
     updated_by = models.ForeignKey(
@@ -949,6 +1119,481 @@ class QuestionSetDraft(models.Model):
 
     def __str__(self):
         return f'Draft for {self.question_set.title}'
+
+
+class ImmutableQuestionSetTemplateRevisionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError('Question set template revisions are immutable.')
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError('Question set template revisions are immutable.')
+
+    def delete(self):
+        raise ValidationError('Question set template revisions are immutable.')
+
+
+class QuestionSetTemplate(models.Model):
+    SCOPE_GLOBAL = 'global'
+    SCOPE_INSTRUCTOR = 'instructor'
+    SCOPE_INSTITUTION = 'institution'
+    SCOPE_CHOICES = [
+        (SCOPE_GLOBAL, 'Global'),
+        (SCOPE_INSTRUCTOR, 'Instructor'),
+        (SCOPE_INSTITUTION, 'Institution'),
+    ]
+    VISIBILITY_PRIVATE = 'private'
+    VISIBILITY_COMMUNITY = 'community'
+    VISIBILITY_CHOICES = [
+        (VISIBILITY_PRIVATE, 'Private'),
+        (VISIBILITY_COMMUNITY, 'Community'),
+    ]
+
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True, default='')
+    scope = models.CharField(max_length=16, choices=SCOPE_CHOICES)
+    owner = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='question_set_templates',
+    )
+    institution = models.ForeignKey(
+        Institution,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='question_set_templates',
+    )
+    audience = models.CharField(max_length=20, choices=QuestionSet.AUDIENCE_CHOICES)
+    collection_style = models.CharField(
+        max_length=16,
+        choices=QuestionSet.COLLECTION_STYLE_CHOICES,
+    )
+    visibility = models.CharField(
+        max_length=16,
+        choices=VISIBILITY_CHOICES,
+        default=VISIBILITY_PRIVATE,
+    )
+    community_revision = models.ForeignKey(
+        'QuestionSetTemplateRevision',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='+',
+    )
+    community_published_at = models.DateTimeField(null=True, blank=True)
+    community_withdrawn_at = models.DateTimeField(null=True, blank=True)
+    forked_from_revision = models.ForeignKey(
+        'QuestionSetTemplateRevision',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='direct_forks',
+    )
+    origin_revision = models.ForeignKey(
+        'QuestionSetTemplateRevision',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='origin_templates',
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name', 'id']
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(scope='global', owner__isnull=True)
+                    | models.Q(scope='instructor', owner__isnull=False)
+                    | models.Q(scope='institution')
+                ),
+                name='leai_qset_template_scope_owner',
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(audience='individual')
+                    | models.Q(audience='team', collection_style='guided')
+                ),
+                name='leai_qset_template_supported_style',
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if self.scope == self.SCOPE_GLOBAL and self.owner_id is not None:
+            errors['owner'] = 'Global templates cannot have an instructor owner.'
+        if self.scope == self.SCOPE_INSTRUCTOR and self.owner_id is None:
+            errors['owner'] = 'Instructor templates require an owner.'
+        if (
+            self.audience == QuestionSet.AUDIENCE_TEAM
+            and self.collection_style != QuestionSet.COLLECTION_GUIDED
+        ):
+            errors['collection_style'] = 'Team templates must be guided.'
+        if (
+            self.community_revision_id is not None
+            and self.pk is not None
+            and self.community_revision.template_id != self.pk
+        ):
+            errors['community_revision'] = 'Community revision must belong to this template.'
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored_origin = type(self).objects.filter(pk=self.pk).values_list(
+                'origin_revision_id', flat=True,
+            ).first()
+            if stored_origin is not None and stored_origin != self.origin_revision_id:
+                raise ValidationError('Template origin revision is immutable.')
+        super().save(*args, **kwargs)
+
+
+class QuestionSetTemplateRevision(models.Model):
+    objects = ImmutableQuestionSetTemplateRevisionQuerySet.as_manager()
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    template = models.ForeignKey(
+        QuestionSetTemplate,
+        on_delete=models.PROTECT,
+        related_name='revisions',
+    )
+    revision_number = models.PositiveIntegerField()
+    canonical_body = models.JSONField()
+    content_hash = models.CharField(max_length=64)
+    protocol_schema_version = models.CharField(max_length=32)
+    created_by = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='created_question_set_template_revisions',
+    )
+    source_question_set_revision = models.ForeignKey(
+        QuestionSetRevision,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='saved_template_revisions',
+    )
+    source_checkpoint = models.ForeignKey(
+        'QuestionSetDraftVersion',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='saved_template_revisions',
+    )
+    provenance = models.CharField(
+        max_length=24,
+        choices=[
+            ('seed', 'Seed'),
+            ('instructor_saved', 'Instructor saved'),
+            ('imported', 'Imported'),
+        ],
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['template_id', 'revision_number']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['template', 'revision_number'],
+                name='leai_unique_template_revision_number',
+            ),
+            models.UniqueConstraint(
+                fields=['template', 'content_hash'],
+                name='leai_unique_template_revision_hash',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            field_names = (
+                'public_id', 'template_id', 'revision_number', 'canonical_body',
+                'content_hash', 'protocol_schema_version', 'created_by_id',
+                'source_question_set_revision_id', 'source_checkpoint_id',
+                'provenance', 'created_at',
+            )
+            stored = type(self).objects.filter(pk=self.pk).values(*field_names).first()
+            current = {name: getattr(self, name) for name in field_names}
+            if stored is not None and stored != current:
+                raise ValidationError('Question set template revisions are immutable.')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError('Question set template revisions are immutable.')
+
+
+class ImmutableQuestionSetDraftVersionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError('Question set draft versions are immutable.')
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError('Question set draft versions are immutable.')
+
+    def delete(self):
+        raise ValidationError('Question set draft versions are immutable.')
+
+
+class QuestionSetDraftVersion(models.Model):
+    objects = ImmutableQuestionSetDraftVersionQuerySet.as_manager()
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    question_set = models.ForeignKey(
+        QuestionSet,
+        on_delete=models.PROTECT,
+        related_name='draft_versions',
+    )
+    version_number = models.PositiveIntegerField()
+    parent_version = models.ForeignKey(
+        'self',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='child_versions',
+    )
+    restored_from = models.ForeignKey(
+        'self',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='restore_versions',
+    )
+    canonical_body = models.JSONField()
+    content_hash = models.CharField(max_length=64)
+    author_kind = models.CharField(
+        max_length=16,
+        choices=[
+            ('instructor', 'Instructor'),
+            ('ai', 'AI'),
+            ('system', 'System'),
+            ('restore', 'Restore'),
+        ],
+    )
+    author = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='question_set_draft_versions',
+    )
+    source_template_revision = models.ForeignKey(
+        QuestionSetTemplateRevision,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='source_draft_versions',
+    )
+    change_set = models.JSONField(default=list)
+    summary = models.CharField(max_length=240, blank=True, default='')
+    rationale = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['question_set_id', 'version_number']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['question_set', 'version_number'],
+                name='leai_unique_draft_version_number',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError('Question set draft versions are immutable.')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError('Question set draft versions are immutable.')
+
+
+class QuestionSetMutationReceipt(models.Model):
+    scope = models.CharField(max_length=100)
+    operation_kind = models.CharField(max_length=32)
+    idempotency_key = models.CharField(max_length=100)
+    request_hash = models.CharField(max_length=64)
+    result_version = models.ForeignKey(
+        QuestionSetDraftVersion,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='mutation_receipts',
+    )
+    result_draft_version = models.PositiveIntegerField(null=True, blank=True)
+    published_link = models.ForeignKey(
+        'QuestionSetSurvey',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='mutation_receipts',
+    )
+    outcome = models.CharField(max_length=16, default='success')
+    error_code = models.CharField(max_length=64, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['scope', 'idempotency_key'],
+                name='leai_unique_mutation_idempotency',
+            ),
+        ]
+
+
+class AuthoringConversation(models.Model):
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    question_set = models.OneToOneField(
+        QuestionSet,
+        on_delete=models.PROTECT,
+        related_name='authoring_conversation',
+    )
+    course = models.ForeignKey(
+        Course,
+        on_delete=models.PROTECT,
+        related_name='authoring_conversations',
+    )
+    created_by = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        related_name='authoring_conversations',
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=[
+            ('active', 'Active'),
+            ('completed', 'Completed'),
+            ('abandoned', 'Abandoned'),
+        ],
+        default='active',
+    )
+    next_message_sequence = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class AuthoringMessage(models.Model):
+    conversation = models.ForeignKey(
+        AuthoringConversation,
+        on_delete=models.PROTECT,
+        related_name='messages',
+    )
+    sequence = models.PositiveIntegerField()
+    role = models.CharField(
+        max_length=16,
+        choices=[
+            ('instructor', 'Instructor'),
+            ('assistant', 'Assistant'),
+            ('system', 'System'),
+        ],
+    )
+    content = models.TextField()
+    author = models.ForeignKey(
+        InstructorAccount,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='authoring_messages',
+    )
+    resulting_version = models.ForeignKey(
+        QuestionSetDraftVersion,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='authoring_messages',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['sequence', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['conversation', 'sequence'],
+                name='leai_unique_authoring_message_sequence',
+            ),
+        ]
+
+
+class AuthoringRun(models.Model):
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    conversation = models.ForeignKey(
+        AuthoringConversation,
+        on_delete=models.PROTECT,
+        related_name='runs',
+    )
+    request_message = models.ForeignKey(
+        AuthoringMessage,
+        on_delete=models.PROTECT,
+        related_name='requested_runs',
+    )
+    base_version = models.ForeignKey(
+        QuestionSetDraftVersion,
+        on_delete=models.PROTECT,
+        related_name='based_authoring_runs',
+    )
+    status = models.CharField(
+        max_length=24,
+        choices=[
+            ('queued', 'Queued'),
+            ('running', 'Running'),
+            ('applied', 'Applied'),
+            ('conflict', 'Conflict'),
+            ('failed', 'Failed'),
+            ('cancelled', 'Cancelled'),
+        ],
+        default='queued',
+    )
+    provider = models.CharField(max_length=32, default='openai')
+    model = models.CharField(max_length=100, blank=True, default='')
+    prompt_policy_version = models.CharField(max_length=32, default='v12-1')
+    requested_operations = models.JSONField(default=list)
+    validated_operations = models.JSONField(default=list)
+    change_summary = models.CharField(max_length=240, blank=True, default='')
+    rationale = models.TextField(blank=True, default='')
+    applied_version = models.OneToOneField(
+        QuestionSetDraftVersion,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='applied_authoring_run',
+    )
+    error_code = models.CharField(max_length=64, blank=True, default='')
+    idempotency_key = models.CharField(max_length=100)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['conversation', 'idempotency_key'],
+                name='leai_unique_authoring_run_idempotency',
+            ),
+        ]
+
+
+class AuthoringRunSource(models.Model):
+    run = models.ForeignKey(
+        AuthoringRun,
+        on_delete=models.PROTECT,
+        related_name='sources',
+    )
+    source_type = models.CharField(
+        max_length=32,
+        choices=[
+            ('template_revision', 'Template revision'),
+            ('question_set_revision', 'Question set revision'),
+            ('authoring_rule', 'Authoring rule'),
+        ],
+    )
+    stable_identifier = models.CharField(max_length=200)
+    content_hash = models.CharField(max_length=64)
+    label = models.CharField(max_length=200)
+    rank = models.PositiveIntegerField(null=True, blank=True)
+    relevance_score = models.FloatField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class QuestionSetValidationRun(models.Model):
@@ -1080,6 +1725,14 @@ class QuestionSetSurvey(models.Model):
     )
     completion_certificate_enabled = models.BooleanField(default=True)
     parsed_document_download_enabled = models.BooleanField(default=False)
+    team_configuration = models.ForeignKey(
+        'TeamConfiguration',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='question_set_surveys',
+    )
+    publication_manifest = models.JSONField(default=dict)
     idempotency_key = models.CharField(max_length=100, unique=True)
     created_by = models.ForeignKey(
         InstructorAccount,
@@ -1099,6 +1752,8 @@ class QuestionSetSurvey(models.Model):
                 'preview_session_id',
                 'completion_certificate_enabled',
                 'parsed_document_download_enabled',
+                'team_configuration_id',
+                'publication_manifest',
                 'idempotency_key',
                 'created_by_id',
                 'created_at',
@@ -1109,6 +1764,8 @@ class QuestionSetSurvey(models.Model):
                 'preview_session_id': self.preview_session_id,
                 'completion_certificate_enabled': self.completion_certificate_enabled,
                 'parsed_document_download_enabled': self.parsed_document_download_enabled,
+                'team_configuration_id': self.team_configuration_id,
+                'publication_manifest': self.publication_manifest,
                 'idempotency_key': self.idempotency_key,
                 'created_by_id': self.created_by_id,
                 'created_at': self.created_at,

@@ -10,30 +10,50 @@ from .instructor_auth import (
     authorize_instructor_course,
 )
 from .instructor_audit import record_instructor_event
+from .feedback_authoring import (
+    run_authoring_request,
+    serialize_authoring_conversation,
+    serialize_authoring_run,
+)
 from .models import (
+    AuthoringConversation,
+    AuthoringRun,
     Course,
     InstructorAuditEvent,
     QuestionSetDraft,
+    QuestionSetDraftVersion,
     QuestionSetRevision,
+    QuestionSetTemplate,
+    QuestionSetTemplateRevision,
+    TeamConfiguration,
 )
 from .question_sets import (
     QuestionSetError,
     complete_preview,
     create_draft,
+    create_feedback_draft,
     create_survey_from_revision,
     freeze_draft,
     get_preview,
     issue_preview_capability,
     list_templates,
+    restore_feedback_draft,
     save_draft,
+    save_feedback_draft,
     save_preview_message,
+    save_private_template,
     serialize_preview_settings,
     serialize_preview_status,
     serialize_draft,
+    serialize_draft_version,
+    serialize_draft_versions,
     serialize_revision,
     serialize_survey_link,
+    serialize_template,
     update_preview_settings,
+    publish_template_to_community,
     skip_preview,
+    withdraw_template_from_community,
 )
 
 
@@ -104,7 +124,10 @@ def _status_for_error(code):
         'capability_denied': 403,
         'course_not_found': 404,
         'template_not_found': 404,
+        'template_access_denied': 403,
         'draft_not_found': 404,
+        'draft_version_not_found': 404,
+        'authoring_run_not_found': 404,
         'revision_not_found': 404,
         'preview_not_found': 404,
         'preview_expired': 410,
@@ -120,6 +143,8 @@ def _status_for_error(code):
         'idempotency_key_conflict': 409,
         'active_draft_exists': 409,
         'workflow_not_active': 409,
+        'authoring_conflict': 409,
+        'authoring_provider_error': 502,
     }.get(code, 400)
 
 
@@ -149,7 +174,12 @@ def _draft_for_id(draft_id):
     try:
         return (
             QuestionSetDraft.objects
-            .select_related('question_set__course', 'base_revision')
+            .select_related(
+                'question_set__course',
+                'question_set__source_template_revision',
+                'base_revision',
+                'current_checkpoint',
+            )
             .get(public_id=draft_id)
         )
     except (QuestionSetDraft.DoesNotExist, ValueError):
@@ -172,14 +202,31 @@ def _revision_for_id(revision_id):
         raise QuestionSetError('revision_not_found')
 
 
+def _template_for_id(template_id):
+    try:
+        return QuestionSetTemplate.objects.get(public_id=template_id)
+    except (QuestionSetTemplate.DoesNotExist, ValueError):
+        raise QuestionSetError('template_not_found')
+
+
 @csrf_exempt
 def question_set_templates(request):
     if request.method != 'GET':
         return HttpResponse(status=405)
-    _account, _session, error = _ready_account(request)
+    account, _session, error = _ready_account(request)
     if error is not None:
         return error
-    return _private_json({'templates': list_templates()})
+    audience = request.GET.get('audience')
+    collection_style = request.GET.get('collection_style')
+    try:
+        templates = list_templates(
+            actor=account if audience is not None or collection_style is not None else None,
+            audience=audience,
+            collection_style=collection_style,
+        )
+    except QuestionSetError as exc:
+        return _error(exc)
+    return _private_json({'templates': templates})
 
 
 @csrf_exempt
@@ -194,7 +241,12 @@ def question_set_drafts(request):
                 return error
             drafts = (
                 QuestionSetDraft.objects
-                .select_related('question_set__course', 'base_revision')
+                .select_related(
+                    'question_set__course',
+                    'question_set__source_template_revision',
+                    'base_revision',
+                    'current_checkpoint',
+                )
                 .filter(
                     question_set__course=course,
                     question_set__archived_at__isnull=True,
@@ -214,15 +266,29 @@ def question_set_drafts(request):
             )
             if error is not None:
                 return error
-            draft = create_draft(
-                course=course,
-                actor=account,
-                instructor_session=session,
-                template_id=str(payload.get('template_id') or ''),
-                confirm_abandon_active=payload.get(
-                    'confirm_abandon_active', False,
-                ),
-            )
+            if 'audience' in payload or 'collection_style' in payload or 'source_kind' in payload:
+                draft = create_feedback_draft(
+                    course=course,
+                    actor=account,
+                    instructor_session=session,
+                    audience=payload.get('audience'),
+                    collection_style=payload.get('collection_style'),
+                    source_kind=payload.get('source_kind'),
+                    source_template_revision_id=payload.get('source_template_revision_id'),
+                    confirm_abandon_active=payload.get(
+                        'confirm_abandon_active', False,
+                    ),
+                )
+            else:
+                draft = create_draft(
+                    course=course,
+                    actor=account,
+                    instructor_session=session,
+                    template_id=str(payload.get('template_id') or ''),
+                    confirm_abandon_active=payload.get(
+                        'confirm_abandon_active', False,
+                    ),
+                )
             return _private_json(serialize_draft(draft), 201)
         return HttpResponse(status=405)
     except QuestionSetError as exc:
@@ -246,15 +312,166 @@ def question_set_draft_detail(request, draft_id):
             expected_version = payload.get('expected_version')
             if type(expected_version) is not int:
                 raise QuestionSetError('expected_version_required')
-            draft = save_draft(
-                draft_id=draft.public_id,
-                actor=account,
-                instructor_session=session,
-                expected_version=expected_version,
-                body=payload.get('body'),
-            )
+            if 'idempotency_key' in payload:
+                draft = save_feedback_draft(
+                    draft_id=draft.public_id,
+                    actor=account,
+                    instructor_session=session,
+                    expected_version=expected_version,
+                    body=payload.get('body'),
+                    idempotency_key=payload.get('idempotency_key'),
+                    checkpoint_reason=payload.get('checkpoint_reason'),
+                )
+            else:
+                draft = save_draft(
+                    draft_id=draft.public_id,
+                    actor=account,
+                    instructor_session=session,
+                    expected_version=expected_version,
+                    body=payload.get('body'),
+                )
             return _private_json(serialize_draft(draft))
         return HttpResponse(status=405)
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_draft_versions(request, draft_id):
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    try:
+        draft = _draft_for_id(draft_id)
+        _account, _session, _membership, error = _authorize_course(
+            request,
+            draft.question_set.course,
+        )
+        if error is not None:
+            return error
+        _require_active_workflow(draft.question_set)
+        payload = {'versions': serialize_draft_versions(draft.question_set)}
+        selected_id = request.GET.get('version_id')
+        if selected_id:
+            try:
+                selected = QuestionSetDraftVersion.objects.get(
+                    public_id=selected_id,
+                    question_set=draft.question_set,
+                )
+            except (QuestionSetDraftVersion.DoesNotExist, ValueError):
+                raise QuestionSetError('draft_version_not_found')
+            payload['selected'] = serialize_draft_version(selected)
+        return _private_json(payload)
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_draft_restore(request, draft_id):
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        draft = _draft_for_id(draft_id)
+        account, session, _membership, error = _authorize_course(
+            request,
+            draft.question_set.course,
+        )
+        if error is not None:
+            return error
+        _require_active_workflow(draft.question_set)
+        payload = _body(request)
+        expected_version = payload.get('expected_version')
+        if type(expected_version) is not int:
+            raise QuestionSetError('expected_version_required')
+        draft = restore_feedback_draft(
+            draft_id=draft.public_id,
+            actor=account,
+            instructor_session=session,
+            expected_version=expected_version,
+            version_id=payload.get('version_id'),
+            idempotency_key=payload.get('idempotency_key'),
+        )
+        return _private_json(serialize_draft(draft))
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_authoring_conversation(request, draft_id):
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    try:
+        draft = _draft_for_id(draft_id)
+        _account, _session, _membership, error = _authorize_course(
+            request,
+            draft.question_set.course,
+        )
+        if error is not None:
+            return error
+        conversation = AuthoringConversation.objects.filter(
+            question_set=draft.question_set,
+        ).first()
+        return _private_json({
+            'conversation': (
+                serialize_authoring_conversation(conversation)
+                if conversation else None
+            ),
+        })
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_authoring_runs(request, draft_id):
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        draft = _draft_for_id(draft_id)
+        account, session, _membership, error = _authorize_course(
+            request,
+            draft.question_set.course,
+        )
+        if error is not None:
+            return error
+        payload = _body(request)
+        expected_version = payload.get('expected_version')
+        if type(expected_version) is not int:
+            raise QuestionSetError('expected_version_required')
+        run = run_authoring_request(
+            draft_id=draft.public_id,
+            actor=account,
+            instructor_session=session,
+            instruction=payload.get('instruction'),
+            expected_version=expected_version,
+            idempotency_key=payload.get('idempotency_key'),
+        )
+        return _private_json({'run': serialize_authoring_run(run)}, 201)
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_authoring_run_detail(request, run_id):
+    if request.method != 'GET':
+        return HttpResponse(status=405)
+    try:
+        try:
+            run = (
+                AuthoringRun.objects
+                .select_related(
+                    'conversation__question_set__course',
+                    'applied_version',
+                )
+                .get(public_id=run_id)
+            )
+        except (AuthoringRun.DoesNotExist, ValueError):
+            raise QuestionSetError('authoring_run_not_found')
+        _account, _session, _membership, error = _authorize_course(
+            request,
+            run.conversation.question_set.course,
+        )
+        if error is not None:
+            return error
+        return _private_json({'run': serialize_authoring_run(run)})
     except QuestionSetError as exc:
         return _error(exc)
 
@@ -327,13 +544,20 @@ def question_set_preview(request, raw_token):
         preview = get_preview(raw_token)
         revision = preview.revision
         protocol = revision.compiled_protocol
-        return _private_json({
+        is_open = protocol.get('schema_version') == 'open-conversation-v1'
+        payload = {
             'id': None,
             'public_id': f'preview-{preview.public_id}',
             'name': protocol['title'],
             'survey_label': protocol['title'],
-            'mode': 'form',
+            'mode': 'general' if is_open else 'form',
             'instructions': (
+                'You are LEAI, a supportive course-feedback facilitator. Begin '
+                f'by asking exactly: "{protocol["opening_prompt"]}" Listen for: '
+                f'{protocol["listening_goal"]} Before ending, ask exactly: '
+                f'"{protocol["closing_prompt"]}" After the student answers the '
+                'closing question, acknowledge them and emit [END] on its own line.'
+                if is_open else
                 'You are LEAI, a conversational reflection facilitator. Follow '
                 'the form-mode directives exactly, ask one question at a time, '
                 'and keep your responses concise and supportive.'
@@ -345,13 +569,6 @@ def question_set_preview(request, raw_token):
             'is_preview': True,
             **serialize_preview_status(preview),
             'question_set_revision_id': str(revision.public_id),
-            'form_schema_id': protocol['schema_id'],
-            'form_schema': {
-                'schema_id': protocol['schema_id'],
-                'version': protocol['version'],
-                'title': protocol['title'],
-                'body': protocol,
-            },
             'course_banner': None,
             'bot_display_name': 'LEAI',
             'referral_enabled': False,
@@ -359,7 +576,18 @@ def question_set_preview(request, raw_token):
             'identity_tracking_enabled': False,
             **serialize_preview_settings(preview),
             'team_snapshot': None,
-        })
+        }
+        if not is_open:
+            payload.update({
+                'form_schema_id': protocol['schema_id'],
+                'form_schema': {
+                    'schema_id': protocol['schema_id'],
+                    'version': protocol['version'],
+                    'title': protocol['title'],
+                    'body': protocol,
+                },
+            })
+        return _private_json(payload)
     except QuestionSetError as exc:
         return _error(exc)
 
@@ -454,6 +682,15 @@ def question_set_revision_surveys(request, revision_id):
         course_id = payload.get('course_id')
         if course_id != revision.question_set.course.course_id:
             raise QuestionSetError('course_mismatch')
+        team_configuration = None
+        team_configuration_id = payload.get('team_configuration_id')
+        if team_configuration_id not in (None, ''):
+            try:
+                team_configuration = TeamConfiguration.objects.get(
+                    pk=team_configuration_id,
+                )
+            except (TeamConfiguration.DoesNotExist, TypeError, ValueError):
+                raise QuestionSetError('invalid_team_configuration')
         link, created = create_survey_from_revision(
             revision=revision,
             actor=account,
@@ -464,10 +701,71 @@ def question_set_revision_surveys(request, revision_id):
             opens_at=_parse_optional_datetime(payload.get('opens_at'), 'Opening time'),
             expires_at=_parse_optional_datetime(payload.get('expires_at'), 'Closing time'),
             preview_token=payload.get('preview_token'),
+            team_configuration=team_configuration,
         )
         return _private_json(
             serialize_survey_link(link),
             201 if created else 200,
         )
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_revision_templates(request, revision_id):
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    try:
+        revision = _revision_for_id(revision_id)
+        account, _session, _membership, error = _authorize_course(
+            request,
+            revision.question_set.course,
+        )
+        if error is not None:
+            return error
+        payload = _body(request)
+        template, template_revision = save_private_template(
+            revision=revision,
+            actor=account,
+            name=payload.get('name'),
+            description=payload.get('description') or '',
+        )
+        return _private_json(
+            {'template': serialize_template(template, template_revision)},
+            201,
+        )
+    except QuestionSetError as exc:
+        return _error(exc)
+
+
+@csrf_exempt
+def question_set_template_community(request, template_id):
+    try:
+        template = _template_for_id(template_id)
+        account, _session, error = _ready_account(request)
+        if error is not None:
+            return error
+        if request.method == 'POST':
+            payload = _body(request)
+            try:
+                revision = QuestionSetTemplateRevision.objects.get(
+                    public_id=payload.get('revision_id'),
+                    template=template,
+                )
+            except (QuestionSetTemplateRevision.DoesNotExist, ValueError):
+                raise QuestionSetError('template_not_found')
+            template = publish_template_to_community(
+                template=template,
+                revision=revision,
+                actor=account,
+            )
+            return _private_json({'template': serialize_template(template, revision)})
+        if request.method == 'DELETE':
+            template = withdraw_template_from_community(
+                template=template,
+                actor=account,
+            )
+            return _private_json({'template': serialize_template(template)})
+        return HttpResponse(status=405)
     except QuestionSetError as exc:
         return _error(exc)

@@ -12,6 +12,7 @@ from datetime import timedelta
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Max
+from django.db.models import Q
 from django.utils import timezone
 
 from .instructor_audit import record_instructor_event
@@ -24,9 +25,16 @@ from .models import (
     PreviewSession,
     QuestionSet,
     QuestionSetDraft,
+    QuestionSetDraftVersion,
+    QuestionSetMutationReceipt,
     QuestionSetRevision,
     QuestionSetSurvey,
+    QuestionSetTemplate,
+    QuestionSetTemplateRevision,
     QuestionSetValidationRun,
+    SurveyTeam,
+    SurveyTeamSnapshot,
+    TeamConfiguration,
 )
 
 
@@ -36,6 +44,11 @@ PREVIEW_TTL = timedelta(hours=12)
 PREVIEW_READY_DELAY_MIN_MS = 2600
 PREVIEW_READY_DELAY_MAX_MS = 3800
 MAX_TEXT_LENGTH = 4000
+MAX_GUIDED_SECTIONS = 12
+MAX_GUIDED_QUESTIONS = 24
+MAX_CANONICAL_BODY_BYTES = 64 * 1024
+CHECKPOINT_INTERVAL = timedelta(seconds=30)
+FORCED_CHECKPOINT_REASONS = {'ai', 'preview', 'publish', 'leave', 'restore'}
 
 # Question-set surveys deliberately start with the smallest anonymous student
 # surface. These values are copied into every immutable compiled revision so a
@@ -222,8 +235,59 @@ class QuestionSetError(Exception):
         self.timing = timing
 
 
-def list_templates():
-    return copy.deepcopy(list(SYSTEM_TEMPLATES))
+def list_templates(*, actor=None, audience=None, collection_style=None):
+    """Return the legacy catalog or an authorized v12 revision catalog.
+
+    Calling without filters preserves the first-release Wizard response while
+    the v12 frontend is introduced. The filtered form is revision-pinned and
+    never exposes another instructor's private template.
+    """
+    if audience is None and collection_style is None:
+        return copy.deepcopy(list(SYSTEM_TEMPLATES))
+    _validate_feedback_taxonomy(audience, collection_style)
+    if actor is None:
+        raise QuestionSetError('authentication_required')
+    templates = (
+        QuestionSetTemplate.objects
+        .filter(
+            audience=audience,
+            collection_style=collection_style,
+            is_active=True,
+        )
+        .filter(
+            Q(scope=QuestionSetTemplate.SCOPE_GLOBAL)
+            | Q(owner=actor)
+            | Q(
+                visibility=QuestionSetTemplate.VISIBILITY_COMMUNITY,
+                community_revision__isnull=False,
+            )
+        )
+        .select_related('owner', 'community_revision')
+        .prefetch_related('revisions')
+        .order_by('name', 'id')
+    )
+    result = []
+    for template in templates:
+        if template.owner_id == actor.pk:
+            revision = template.revisions.order_by('-revision_number', '-id').first()
+            source = 'mine'
+        else:
+            revision = template.community_revision
+            source = 'leai' if template.scope == QuestionSetTemplate.SCOPE_GLOBAL else 'community'
+        if revision is None:
+            continue
+        result.append({
+            'id': str(template.public_id),
+            'revision_id': str(revision.public_id),
+            'name': template.name,
+            'description': template.description,
+            'audience': template.audience,
+            'collection_style': template.collection_style,
+            'source': source,
+            'owner_display_name': template.owner.display_name if template.owner_id else None,
+            'revision_number': revision.revision_number,
+        })
+    return result
 
 
 def get_template(template_id):
@@ -242,6 +306,197 @@ def _bounded_text(value, field_name, *, required=True, max_length=MAX_TEXT_LENGT
     if len(value) > max_length:
         raise QuestionSetError('invalid_question_set', f'{field_name} is too long.')
     return value
+
+
+def _validate_feedback_taxonomy(audience, collection_style):
+    valid = {
+        (QuestionSet.AUDIENCE_INDIVIDUAL, QuestionSet.COLLECTION_GUIDED),
+        (QuestionSet.AUDIENCE_INDIVIDUAL, QuestionSet.COLLECTION_OPEN),
+        (QuestionSet.AUDIENCE_TEAM, QuestionSet.COLLECTION_GUIDED),
+    }
+    if (audience, collection_style) not in valid:
+        raise QuestionSetError(
+            'invalid_feedback_type',
+            'Choose Individual Guided, Individual Open, or Team Guided feedback.',
+        )
+
+
+def _stable_uuid(value, field_name):
+    if value in (None, ''):
+        return str(uuid.uuid4())
+    if not isinstance(value, str):
+        raise QuestionSetError('invalid_question_set', f'{field_name} must be a UUID.')
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        raise QuestionSetError('invalid_question_set', f'{field_name} must be a UUID.')
+
+
+def _validate_body_size(body):
+    size = len(_canonical_json(body).encode('utf-8'))
+    if size > MAX_CANONICAL_BODY_BYTES:
+        raise QuestionSetError(
+            'invalid_question_set',
+            'Feedback design must be 64 KiB or smaller.',
+        )
+
+
+def _validate_guided_body(body):
+    if not isinstance(body, dict):
+        raise QuestionSetError('invalid_question_set', 'Feedback design must be an object.')
+    if body.get('schema_version') != 'guided-feedback-v2':
+        raise QuestionSetError('invalid_question_set', 'Guided feedback schema is invalid.')
+    sections = body.get('sections')
+    if not isinstance(sections, list) or not 1 <= len(sections) <= MAX_GUIDED_SECTIONS:
+        raise QuestionSetError(
+            'invalid_question_set',
+            f'Use between 1 and {MAX_GUIDED_SECTIONS} sections.',
+        )
+    result = {
+        'schema_version': 'guided-feedback-v2',
+        'title': _bounded_text(body.get('title'), 'Title', max_length=200),
+        'intro': _bounded_text(body.get('intro'), 'Introduction'),
+        'sections': [],
+    }
+    seen_ids = set()
+    question_count = 0
+    for section_index, section in enumerate(sections, start=1):
+        if not isinstance(section, dict):
+            raise QuestionSetError('invalid_question_set', 'Each section must be an object.')
+        section_id = _stable_uuid(section.get('id'), f'Section {section_index} ID')
+        if section_id in seen_ids:
+            raise QuestionSetError('invalid_question_set', 'Section and question IDs must be unique.')
+        seen_ids.add(section_id)
+        questions = section.get('questions')
+        if not isinstance(questions, list) or not questions:
+            raise QuestionSetError('invalid_question_set', 'Each section needs a question.')
+        normalized_questions = []
+        for question_index, question in enumerate(questions, start=1):
+            if not isinstance(question, dict):
+                raise QuestionSetError('invalid_question_set', 'Each question must be an object.')
+            question_count += 1
+            if question_count > MAX_GUIDED_QUESTIONS:
+                raise QuestionSetError(
+                    'invalid_question_set',
+                    f'Use at most {MAX_GUIDED_QUESTIONS} questions.',
+                )
+            question_id = _stable_uuid(
+                question.get('id'),
+                f'Question {question_count} ID',
+            )
+            if question_id in seen_ids:
+                raise QuestionSetError('invalid_question_set', 'Section and question IDs must be unique.')
+            seen_ids.add(question_id)
+            if question.get('response_kind') != 'long_text':
+                raise QuestionSetError(
+                    'invalid_question_set',
+                    'V12 questions use long-text responses only.',
+                )
+            follow_up = question.get('follow_up')
+            if not isinstance(follow_up, dict) or type(follow_up.get('enabled')) is not bool:
+                raise QuestionSetError('invalid_question_set', 'Follow-up settings are invalid.')
+            follow_up_prompt = _bounded_text(
+                follow_up.get('prompt', ''),
+                f'Question {question_count} follow-up',
+                required=follow_up['enabled'],
+            )
+            normalized_questions.append({
+                'id': question_id,
+                'short_label': _bounded_text(
+                    question.get('short_label'),
+                    f'Question {question_count} label',
+                    max_length=200,
+                ),
+                'prompt': _bounded_text(
+                    question.get('prompt'),
+                    f'Question {question_count}',
+                ),
+                'follow_up': {
+                    'enabled': follow_up['enabled'],
+                    'prompt': follow_up_prompt,
+                },
+                'response_kind': 'long_text',
+            })
+        result['sections'].append({
+            'id': section_id,
+            'title': _bounded_text(
+                section.get('title'),
+                f'Section {section_index} title',
+                max_length=200,
+            ),
+            'questions': normalized_questions,
+        })
+    closing = body.get('closing')
+    if not isinstance(closing, dict):
+        raise QuestionSetError('invalid_question_set', 'Closing question is required.')
+    result['closing'] = {
+        'prompt': _bounded_text(closing.get('prompt'), 'Closing question'),
+    }
+    _validate_body_size(result)
+    return result, {'errors': [], 'question_count': question_count}
+
+
+def _validate_open_body(body):
+    if not isinstance(body, dict):
+        raise QuestionSetError('invalid_question_set', 'Feedback design must be an object.')
+    if body.get('schema_version') != 'open-conversation-v1':
+        raise QuestionSetError('invalid_question_set', 'Open conversation schema is invalid.')
+    result = {
+        'schema_version': 'open-conversation-v1',
+        'title': _bounded_text(body.get('title'), 'Title', max_length=200),
+        'opening_prompt': _bounded_text(body.get('opening_prompt'), 'Opening question'),
+        'listening_goal': _bounded_text(body.get('listening_goal'), 'Listening goal'),
+        'closing_prompt': _bounded_text(body.get('closing_prompt'), 'Closing question'),
+    }
+    _validate_body_size(result)
+    return result, {'errors': [], 'question_count': 1}
+
+
+def validate_feedback_body(body, *, audience, collection_style):
+    _validate_feedback_taxonomy(audience, collection_style)
+    if collection_style == QuestionSet.COLLECTION_OPEN:
+        return _validate_open_body(body)
+    return _validate_guided_body(body)
+
+
+def _blank_feedback_body(*, audience, collection_style):
+    if collection_style == QuestionSet.COLLECTION_OPEN:
+        return {
+            'schema_version': 'open-conversation-v1',
+            'title': 'Course experience check-in',
+            'opening_prompt': 'How is your learning experience going right now?',
+            'listening_goal': 'Learning supports, blockers, expectations, workload, and suggestions.',
+            'closing_prompt': 'Is there anything else you want your instructor to know?',
+        }
+    team = audience == QuestionSet.AUDIENCE_TEAM
+    return {
+        'schema_version': 'guided-feedback-v2',
+        'title': 'Team collaboration feedback' if team else 'Untitled feedback',
+        'intro': (
+            'Private feedback about collaboration inside the team you select.'
+            if team else
+            'A guided conversation about your learning experience.'
+        ),
+        'sections': [{
+            'title': 'Team collaboration' if team else 'New focus area',
+            'questions': [{
+                'short_label': 'Collaboration experience' if team else 'First question',
+                'prompt': (
+                    'What is helping or getting in the way of collaboration inside your team?'
+                    if team else
+                    'What is one important experience you want to reflect on?'
+                ),
+                'follow_up': {
+                    'enabled': True,
+                    'prompt': 'Can you describe one concrete example?',
+                },
+                'response_kind': 'long_text',
+            }],
+        }],
+        'closing': {
+            'prompt': 'Is there anything else your instructor should understand?',
+        },
+    }
 
 
 def _structure_signature(body):
@@ -316,11 +571,21 @@ def serialize_draft(draft):
         'template_id': question_set.template_id,
         'title': question_set.title,
         'audience': question_set.audience,
+        'collection_style': question_set.collection_style,
+        'source_kind': question_set.source_kind,
+        'source_template_revision_id': (
+            str(question_set.source_template_revision.public_id)
+            if question_set.source_template_revision_id else None
+        ),
         'workflow_status': question_set.workflow_status,
         'body': copy.deepcopy(draft.body),
         'version': draft.version,
         'base_revision_id': (
             str(draft.base_revision.public_id) if draft.base_revision_id else None
+        ),
+        'current_checkpoint_id': (
+            str(draft.current_checkpoint.public_id)
+            if draft.current_checkpoint_id else None
         ),
         'updated_at': draft.updated_at.isoformat(),
     }
@@ -413,6 +678,154 @@ def abandon_active_draft(*, course, actor, instructor_session):
     return abandoned
 
 
+def _authorized_template_revision(*, actor, revision_id, audience, collection_style):
+    try:
+        revision_uuid = uuid.UUID(str(revision_id))
+    except (TypeError, ValueError, AttributeError):
+        raise QuestionSetError('template_not_found')
+    revision = (
+        QuestionSetTemplateRevision.objects
+        .select_related('template__owner')
+        .filter(public_id=revision_uuid)
+        .first()
+    )
+    if revision is None:
+        raise QuestionSetError('template_not_found')
+    template = revision.template
+    authorized = (
+        template.is_active
+        and template.audience == audience
+        and template.collection_style == collection_style
+        and (
+            template.owner_id == actor.pk
+            or (
+                template.visibility == QuestionSetTemplate.VISIBILITY_COMMUNITY
+                and template.community_revision_id == revision.pk
+            )
+        )
+    )
+    if not authorized:
+        raise QuestionSetError('template_not_found')
+    return revision
+
+
+@transaction.atomic
+def create_feedback_draft(
+    *,
+    course,
+    actor,
+    instructor_session,
+    audience,
+    collection_style,
+    source_kind,
+    source_template_revision_id=None,
+    question_set_public_id=None,
+    draft_public_id=None,
+    audit_event_id=None,
+    confirm_abandon_active=False,
+):
+    """Create one v12 draft while atomically replacing a confirmed old draft."""
+    _validate_feedback_taxonomy(audience, collection_style)
+    if type(confirm_abandon_active) is not bool:
+        raise QuestionSetError('invalid_abandon_confirmation')
+    if source_kind not in {QuestionSet.SOURCE_TEMPLATE, QuestionSet.SOURCE_BLANK}:
+        raise QuestionSetError('invalid_source_kind')
+    course = Course.objects.select_for_update().get(pk=course.pk)
+    _validate_optional_uuid(
+        question_set_public_id,
+        field_name='question_set_public_id',
+        conflict_model=QuestionSet,
+    )
+    _validate_optional_uuid(
+        draft_public_id,
+        field_name='draft_public_id',
+        conflict_model=QuestionSetDraft,
+    )
+    source_revision = None
+    if source_kind == QuestionSet.SOURCE_TEMPLATE:
+        source_revision = _authorized_template_revision(
+            actor=actor,
+            revision_id=source_template_revision_id,
+            audience=audience,
+            collection_style=collection_style,
+        )
+        proposed_body = copy.deepcopy(source_revision.canonical_body)
+    else:
+        if source_template_revision_id not in (None, ''):
+            raise QuestionSetError('invalid_source_kind')
+        proposed_body = _blank_feedback_body(
+            audience=audience,
+            collection_style=collection_style,
+        )
+    body, validation = validate_feedback_body(
+        proposed_body,
+        audience=audience,
+        collection_style=collection_style,
+    )
+    if _active_question_sets_for_course(course).exists():
+        if not confirm_abandon_active:
+            raise QuestionSetError('active_draft_exists')
+        abandon_active_draft(
+            course=course,
+            actor=actor,
+            instructor_session=instructor_session,
+        )
+    question_set_values = {
+        'course': course,
+        'owner': actor,
+        'template_id': '',
+        'title': body['title'],
+        'audience': audience,
+        'collection_style': collection_style,
+        'source_kind': source_kind,
+        'source_template_revision': source_revision,
+        'response_unit': QuestionSet.RESPONSE_INDIVIDUAL,
+        'aggregation_scope': (
+            QuestionSet.AGGREGATION_TEAM
+            if audience == QuestionSet.AUDIENCE_TEAM
+            else QuestionSet.AGGREGATION_COURSE
+        ),
+    }
+    if question_set_public_id is not None:
+        question_set_values['public_id'] = question_set_public_id
+    question_set = QuestionSet.objects.create(**question_set_values)
+    draft_values = {
+        'question_set': question_set,
+        'body': body,
+        'updated_by': actor,
+    }
+    if draft_public_id is not None:
+        draft_values['public_id'] = draft_public_id
+    draft = QuestionSetDraft.objects.create(**draft_values)
+    checkpoint = QuestionSetDraftVersion.objects.create(
+        question_set=question_set,
+        version_number=1,
+        canonical_body=body,
+        content_hash=hashlib.sha256(_canonical_json(body).encode('utf-8')).hexdigest(),
+        author_kind='system',
+        author=actor,
+        source_template_revision=source_revision,
+        change_set=[],
+        summary='Copied starting point' if source_revision else 'Started from scratch',
+        rationale='',
+    )
+    draft.current_checkpoint = checkpoint
+    draft.save(update_fields=['current_checkpoint', 'updated_at'])
+    QuestionSetValidationRun.objects.create(
+        draft=draft,
+        is_valid=True,
+        result=validation,
+    )
+    _record_question_set_event(
+        action=InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_CREATED,
+        actor=actor,
+        instructor_session=instructor_session,
+        question_set=question_set,
+        event_id=audit_event_id,
+    )
+    return draft
+
+
 @transaction.atomic
 def create_draft(
     *,
@@ -495,7 +908,7 @@ def save_draft(
 ):
     draft = (
         QuestionSetDraft.objects
-        .select_for_update()
+        .select_for_update(of=('self',))
         .select_related('question_set__course')
         .get(public_id=draft_id)
     )
@@ -529,12 +942,378 @@ def save_draft(
     return draft
 
 
+def _feedback_body_for_question_set(question_set, body):
+    schema_version = body.get('schema_version') if isinstance(body, dict) else None
+    if schema_version in {'guided-feedback-v2', 'open-conversation-v1'}:
+        return validate_feedback_body(
+            body,
+            audience=question_set.audience,
+            collection_style=question_set.collection_style,
+        )
+    normalized = editable_body(body, body)
+    return normalized, {
+        'errors': [],
+        'question_count': len(normalized['sections']),
+    }
+
+
+def _request_hash(payload):
+    return hashlib.sha256(_canonical_json(payload).encode('utf-8')).hexdigest()
+
+
+def _mutation_receipt(*, scope, idempotency_key, request_hash):
+    receipt = QuestionSetMutationReceipt.objects.filter(
+        scope=scope,
+        idempotency_key=idempotency_key,
+    ).first()
+    if receipt is not None and receipt.request_hash != request_hash:
+        raise QuestionSetError('idempotency_key_conflict')
+    return receipt
+
+
+def _checkpoint_if_needed(
+    *,
+    draft,
+    actor,
+    author_kind,
+    checkpoint_reason,
+    summary,
+    rationale='',
+    change_set=None,
+    restored_from=None,
+):
+    current = draft.current_checkpoint
+    body_hash = hashlib.sha256(_canonical_json(draft.body).encode('utf-8')).hexdigest()
+    if current is not None and current.content_hash == body_hash:
+        return current
+    force = checkpoint_reason in FORCED_CHECKPOINT_REASONS
+    interval_elapsed = (
+        current is None
+        or timezone.now() - current.created_at >= CHECKPOINT_INTERVAL
+    )
+    if not force and not interval_elapsed:
+        return current
+    next_number = (
+        QuestionSetDraftVersion.objects
+        .filter(question_set=draft.question_set)
+        .aggregate(value=Max('version_number'))['value']
+        or 0
+    ) + 1
+    checkpoint = QuestionSetDraftVersion.objects.create(
+        question_set=draft.question_set,
+        version_number=next_number,
+        parent_version=current,
+        restored_from=restored_from,
+        canonical_body=copy.deepcopy(draft.body),
+        content_hash=body_hash,
+        author_kind=author_kind,
+        author=actor,
+        source_template_revision=draft.question_set.source_template_revision,
+        change_set=change_set or [],
+        summary=summary[:240],
+        rationale=rationale,
+    )
+    draft.current_checkpoint = checkpoint
+    draft.save(update_fields=['current_checkpoint', 'updated_at'])
+    return checkpoint
+
+
+@transaction.atomic
+def save_feedback_draft(
+    *,
+    draft_id,
+    actor,
+    instructor_session,
+    expected_version,
+    body,
+    idempotency_key,
+    checkpoint_reason=None,
+    author_kind='instructor',
+    summary='Manual changes',
+    rationale='',
+    change_set=None,
+):
+    if checkpoint_reason is not None and checkpoint_reason not in FORCED_CHECKPOINT_REASONS:
+        raise QuestionSetError('invalid_checkpoint_reason')
+    idempotency_key = _bounded_text(
+        idempotency_key,
+        'Idempotency key',
+        max_length=100,
+    )
+    if len(idempotency_key) < 8:
+        raise QuestionSetError('invalid_idempotency_key')
+    request_digest = _request_hash({
+        'expected_version': expected_version,
+        'body': body,
+        'checkpoint_reason': checkpoint_reason,
+        'author_kind': author_kind,
+    })
+    scope = f'draft:{draft_id}'
+    existing_receipt = _mutation_receipt(
+        scope=scope,
+        idempotency_key=idempotency_key,
+        request_hash=request_digest,
+    )
+    draft = (
+        QuestionSetDraft.objects
+        .select_for_update(of=('self',))
+        .select_related(
+            'question_set__course',
+            'question_set__source_template_revision',
+            'current_checkpoint',
+        )
+        .get(public_id=draft_id)
+    )
+    if existing_receipt is not None:
+        return draft
+    question_set = QuestionSet.objects.select_for_update().get(pk=draft.question_set_id)
+    _require_active_workflow(question_set)
+    if draft.version != expected_version:
+        raise QuestionSetError('stale_draft')
+    normalized, validation = _feedback_body_for_question_set(question_set, body)
+    if _canonical_json(normalized) != _canonical_json(draft.body):
+        draft.body = normalized
+        draft.version += 1
+        draft.updated_by = actor
+        draft.save(update_fields=['body', 'version', 'updated_by', 'updated_at'])
+        question_set.title = normalized['title']
+        question_set.save(update_fields=['title', 'updated_at'])
+        QuestionSetValidationRun.objects.create(
+            draft=draft,
+            is_valid=True,
+            result=validation,
+        )
+    checkpoint = _checkpoint_if_needed(
+        draft=draft,
+        actor=actor,
+        author_kind=author_kind,
+        checkpoint_reason=checkpoint_reason,
+        summary=summary,
+        rationale=rationale,
+        change_set=change_set,
+    )
+    QuestionSetMutationReceipt.objects.create(
+        scope=scope,
+        operation_kind='draft_save',
+        idempotency_key=idempotency_key,
+        request_hash=request_digest,
+        result_version=(
+            checkpoint
+            if checkpoint is not None and checkpoint.content_hash == hashlib.sha256(
+                _canonical_json(draft.body).encode('utf-8')
+            ).hexdigest()
+            else None
+        ),
+        result_draft_version=draft.version,
+    )
+    _record_question_set_event(
+        action=InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_SAVED,
+        actor=actor,
+        instructor_session=instructor_session,
+        question_set=question_set,
+    )
+    return draft
+
+
+def serialize_draft_versions(question_set):
+    return [
+        {
+            'id': str(version.public_id),
+            'version_number': version.version_number,
+            'author_kind': version.author_kind,
+            'summary': version.summary,
+            'rationale': version.rationale,
+            'restored_from_id': (
+                str(version.restored_from.public_id)
+                if version.restored_from_id else None
+            ),
+            'created_at': version.created_at.isoformat(),
+        }
+        for version in question_set.draft_versions.select_related(
+            'restored_from',
+        ).order_by('-version_number')
+    ]
+
+
+def serialize_draft_version(version):
+    return {
+        **next(
+            row for row in serialize_draft_versions(version.question_set)
+            if row['id'] == str(version.public_id)
+        ),
+        'canonical_body': copy.deepcopy(version.canonical_body),
+        'change_set': copy.deepcopy(version.change_set),
+    }
+
+
+@transaction.atomic
+def restore_feedback_draft(
+    *,
+    draft_id,
+    actor,
+    instructor_session,
+    expected_version,
+    version_id,
+    idempotency_key,
+):
+    idempotency_key = _bounded_text(
+        idempotency_key,
+        'Idempotency key',
+        max_length=100,
+    )
+    request_digest = _request_hash({
+        'expected_version': expected_version,
+        'version_id': str(version_id),
+    })
+    scope = f'draft:{draft_id}'
+    existing_receipt = _mutation_receipt(
+        scope=scope,
+        idempotency_key=idempotency_key,
+        request_hash=request_digest,
+    )
+    draft = (
+        QuestionSetDraft.objects
+        .select_for_update(of=('self',))
+        .select_related(
+            'question_set__course',
+            'question_set__source_template_revision',
+            'current_checkpoint',
+        )
+        .get(public_id=draft_id)
+    )
+    if existing_receipt is not None:
+        return draft
+    question_set = QuestionSet.objects.select_for_update().get(pk=draft.question_set_id)
+    _require_active_workflow(question_set)
+    if draft.version != expected_version:
+        raise QuestionSetError('stale_draft')
+    try:
+        target = QuestionSetDraftVersion.objects.get(
+            public_id=version_id,
+            question_set=question_set,
+        )
+    except (QuestionSetDraftVersion.DoesNotExist, ValueError):
+        raise QuestionSetError('draft_version_not_found')
+    normalized, validation = _feedback_body_for_question_set(
+        question_set,
+        target.canonical_body,
+    )
+    draft.body = normalized
+    draft.version += 1
+    draft.updated_by = actor
+    draft.save(update_fields=['body', 'version', 'updated_by', 'updated_at'])
+    question_set.title = normalized['title']
+    question_set.save(update_fields=['title', 'updated_at'])
+    QuestionSetValidationRun.objects.create(
+        draft=draft,
+        is_valid=True,
+        result=validation,
+    )
+    checkpoint = _checkpoint_if_needed(
+        draft=draft,
+        actor=actor,
+        author_kind='restore',
+        checkpoint_reason='restore',
+        summary=f'Restored Version {target.version_number}',
+        restored_from=target,
+    )
+    QuestionSetMutationReceipt.objects.create(
+        scope=scope,
+        operation_kind='draft_restore',
+        idempotency_key=idempotency_key,
+        request_hash=request_digest,
+        result_version=checkpoint,
+        result_draft_version=draft.version,
+    )
+    _record_question_set_event(
+        action=InstructorAuditEvent.ACTION_QUESTION_SET_DRAFT_SAVED,
+        actor=actor,
+        instructor_session=instructor_session,
+        question_set=question_set,
+    )
+    return draft
+
+
 def _canonical_json(body):
     return json.dumps(body, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
 
 
 def _normalized_preview_text(value):
     return ' '.join(str(value or '').split()).casefold()
+
+
+def _compile_feedback_body(canonical, question_set, revision_number):
+    schema_id = f'question-set:{question_set.public_id}:v{revision_number}'
+    schema_version = canonical.get('schema_version')
+    if schema_version == 'guided-feedback-v2':
+        compiled_sections = []
+        for section in canonical['sections']:
+            for question in section['questions']:
+                follow_up = question['follow_up']
+                compiled_sections.append({
+                    'id': question['id'],
+                    'source_section_id': section['id'],
+                    'title': question['short_label'],
+                    'topic': section['title'].lower(),
+                    'one_line': question['short_label'].lower(),
+                    'opening_prompt': question['prompt'],
+                    'depth_probe': (
+                        follow_up['prompt'] if follow_up['enabled'] else None
+                    ),
+                    'fields': [{
+                        'id': question['id'],
+                        'kind': 'longform',
+                        'label': question['prompt'],
+                    }],
+                })
+        return {
+            'schema_id': schema_id,
+            'version': str(revision_number),
+            'schema_version': schema_version,
+            'title': canonical['title'],
+            'intro': canonical['intro'],
+            'transition_template': 'Thanks. Is there anything else before we move on?',
+            'advance_template': 'Got it. Next: {{next_section_title}}.',
+            'shallow_word_threshold': 25,
+            'max_probes_per_section': 1,
+            'sections': compiled_sections,
+            'closing': {
+                'behavior': (
+                    'After every question has a response, ask the closing question '
+                    'and then emit [END] on its own line.'
+                ),
+                'feedback_prompt': canonical['closing']['prompt'],
+            },
+            'ordering_rules': {
+                'strict_in_order': True,
+                'must_cover_all_sections': True,
+                'stop_warn_then_honor': True,
+            },
+            'audience': question_set.audience,
+            'response_unit': question_set.response_unit,
+            'aggregation_scope': question_set.aggregation_scope,
+            'effective_settings': copy.deepcopy(QUESTION_SET_EFFECTIVE_SETTINGS),
+        }
+    if schema_version == 'open-conversation-v1':
+        return {
+            **copy.deepcopy(canonical),
+            'schema_id': schema_id,
+            'version': str(revision_number),
+            'audience': question_set.audience,
+            'response_unit': question_set.response_unit,
+            'aggregation_scope': question_set.aggregation_scope,
+            'engine_policy': {
+                'follow_student_topics': True,
+                'stay_within_listening_goal': True,
+                'honor_stop': True,
+            },
+            'effective_settings': copy.deepcopy(QUESTION_SET_EFFECTIVE_SETTINGS),
+        }
+    compiled = copy.deepcopy(canonical)
+    compiled['schema_id'] = schema_id
+    compiled['version'] = str(revision_number)
+    compiled['effective_settings'] = copy.deepcopy(QUESTION_SET_EFFECTIVE_SETTINGS)
+    return compiled
 
 
 @transaction.atomic
@@ -567,11 +1346,27 @@ def freeze_draft(
     )
     if draft.version != expected_version:
         raise QuestionSetError('stale_draft')
-    canonical, validation = validate_body(draft.body)
+    canonical, validation = _feedback_body_for_question_set(question_set, draft.body)
+    checkpoint = _checkpoint_if_needed(
+        draft=draft,
+        actor=actor,
+        author_kind='instructor',
+        checkpoint_reason='preview',
+        summary='Ready for preview',
+    )
+    protocol_schema_version = canonical.get('schema_version', 'question-set-v1')
+    engine_version = (
+        'open-conversation-v1'
+        if protocol_schema_version == 'open-conversation-v1'
+        else ENGINE_VERSION
+    )
     revision_identity = {
         'canonical_body': canonical,
         'compiler_version': COMPILER_VERSION,
-        'engine_version': ENGINE_VERSION,
+        'engine_version': engine_version,
+        'protocol_schema_version': protocol_schema_version,
+        'audience': question_set.audience,
+        'collection_style': question_set.collection_style,
     }
     content_hash = hashlib.sha256(
         _canonical_json(revision_identity).encode('utf-8')
@@ -601,23 +1396,19 @@ def freeze_draft(
         or 0
     )
     revision_number = latest_number + 1
-    compiled = copy.deepcopy(canonical)
-    compiled['schema_id'] = (
-        f'question-set:{question_set.public_id}:v{revision_number}'
-    )
-    compiled['version'] = str(revision_number)
-    compiled['effective_settings'] = copy.deepcopy(
-        QUESTION_SET_EFFECTIVE_SETTINGS
-    )
+    compiled = _compile_feedback_body(canonical, question_set, revision_number)
     revision_values = {
         'question_set': question_set,
         'revision_number': revision_number,
         'source_draft_version': draft.version,
+        'source_checkpoint': checkpoint,
         'canonical_body': canonical,
         'compiled_protocol': compiled,
         'content_hash': content_hash,
         'compiler_version': COMPILER_VERSION,
-        'engine_version': ENGINE_VERSION,
+        'engine_version': engine_version,
+        'author_kind': 'instructor',
+        'protocol_schema_version': protocol_schema_version,
         'created_by': actor,
     }
     if revision_public_id is not None:
@@ -822,6 +1613,43 @@ def complete_preview(*, raw_token, audit_event_id=None):
         .get(pk=preview.pk)
     )
     protocol = preview.revision.compiled_protocol
+    if protocol.get('schema_version') == 'open-conversation-v1':
+        messages = list(preview.messages.order_by('sequence', 'id'))
+        closing_prompt = _normalized_preview_text(protocol.get('closing_prompt'))
+        closing_question = next((
+            message for message in messages
+            if message.role == PreviewMessage.ROLE_ASSISTANT
+            and closing_prompt
+            and closing_prompt in _normalized_preview_text(message.content)
+        ), None)
+        closing_answer = next((
+            message for message in messages
+            if closing_question is not None
+            and message.sequence > closing_question.sequence
+            and message.role == PreviewMessage.ROLE_USER
+        ), None)
+        final_assistant = next((
+            message for message in messages
+            if closing_answer is not None
+            and message.sequence > closing_answer.sequence
+            and message.role == PreviewMessage.ROLE_ASSISTANT
+        ), None)
+        if closing_question is None or closing_answer is None or final_assistant is None:
+            raise QuestionSetError(
+                'preview_incomplete',
+                'Complete the open conversation before continuing.',
+            )
+        if preview.completed_at is None:
+            preview.completed_at = timezone.now()
+            preview.save(update_fields=['completed_at'])
+            _record_question_set_event(
+                action=InstructorAuditEvent.ACTION_QUESTION_SET_PREVIEW_COMPLETED,
+                actor=preview.instructor,
+                instructor_session=None,
+                question_set=preview.revision.question_set,
+                event_id=audit_event_id,
+            )
+        return preview
     required_fields = [
         (
             str(section['id']),
@@ -968,6 +1796,7 @@ def _validate_existing_survey_retry(
     preview,
     survey_public_id,
     audit_event_id,
+    team_configuration=None,
 ):
     if (
         link.revision_id != revision.pk
@@ -975,6 +1804,7 @@ def _validate_existing_survey_retry(
         or link.preview_session_id != preview.pk
         or link.completion_certificate_enabled != preview.completion_certificate_enabled
         or link.parsed_document_download_enabled != preview.parsed_document_download_enabled
+        or link.team_configuration_id != getattr(team_configuration, 'pk', None)
     ):
         raise QuestionSetError('idempotency_key_conflict')
     if (
@@ -997,7 +1827,7 @@ def _validate_existing_survey_retry(
         or event.course_id_snapshot != course.course_id
         or event.target_type != 'survey'
         or event.target_id != str(link.survey.pk)
-        or event.metadata != {'mode': 'form'}
+        or event.metadata != {'mode': link.survey.mode}
     ):
         raise QuestionSetError('audit_event_id_conflict')
 
@@ -1016,6 +1846,7 @@ def create_survey_from_revision(
     preview_token,
     survey_public_id=None,
     audit_event_id=None,
+    team_configuration=None,
 ):
     if not isinstance(preview_token, str) or not preview_token:
         raise QuestionSetError('preview_token_required')
@@ -1072,6 +1903,7 @@ def create_survey_from_revision(
             preview=preview,
             survey_public_id=survey_public_id,
             audit_event_id=audit_event_id,
+            team_configuration=team_configuration,
         )
         return existing, False
     question_set = QuestionSet.objects.select_for_update().get(
@@ -1092,6 +1924,7 @@ def create_survey_from_revision(
             preview=preview,
             survey_public_id=survey_public_id,
             audit_event_id=audit_event_id,
+            team_configuration=team_configuration,
         )
         return existing, False
     _require_active_workflow(question_set)
@@ -1107,6 +1940,41 @@ def create_survey_from_revision(
     if opens_at is not None and expires_at is not None and opens_at >= expires_at:
         raise QuestionSetError('invalid_schedule', 'Closing time must be after opening time.')
 
+    if question_set.audience == QuestionSet.AUDIENCE_TEAM:
+        if team_configuration is None:
+            raise QuestionSetError('team_configuration_required')
+        if (
+            not isinstance(team_configuration, TeamConfiguration)
+            or team_configuration.course_id != question_set.course_id
+            or team_configuration.archived
+            or not team_configuration.teams.exists()
+        ):
+            raise QuestionSetError('invalid_team_configuration')
+        survey_mode = 'group'
+    elif question_set.collection_style == QuestionSet.COLLECTION_OPEN:
+        if team_configuration is not None:
+            raise QuestionSetError('invalid_team_configuration')
+        survey_mode = 'general'
+    else:
+        if team_configuration is not None:
+            raise QuestionSetError('invalid_team_configuration')
+        survey_mode = 'form'
+
+    if survey_mode == 'general':
+        protocol = revision.compiled_protocol
+        instructions = (
+            'You are LEAI, a supportive course-feedback facilitator. Begin with: '
+            f'"{protocol["opening_prompt"]}" Listen for: {protocol["listening_goal"]} '
+            f'Before ending, ask: "{protocol["closing_prompt"]}" After the student '
+            'answers the closing question, acknowledge them and emit [END] on its own line.'
+        )
+    else:
+        instructions = (
+            'You are LEAI, a conversational feedback facilitator. Follow the '
+            'provided guided questions exactly, ask one question at a time, '
+            'and keep your responses concise and supportive.'
+        )
+
     if (
         survey_public_id is not None
         and FeedbackGPT.objects.filter(public_id=survey_public_id).exists()
@@ -1117,11 +1985,7 @@ def create_survey_from_revision(
         public_id=survey_public_id or _new_survey_public_id(),
         name=survey_label,
         survey_label=survey_label,
-        instructions=(
-            'You are LEAI, a conversational reflection facilitator. Follow the '
-            'form-mode directives exactly, ask one question at a time, and keep '
-            'your responses concise and supportive.'
-        ),
+        instructions=instructions,
         created_by=actor.display_name,
         course=revision.question_set.course,
         week_number=week_number,
@@ -1130,7 +1994,7 @@ def create_survey_from_revision(
         is_closed=False,
         anonymity_mode='anonymous',
         reporting_structure='',
-        mode='form',
+        mode=survey_mode,
         form_schema=None,
     )
     try:
@@ -1141,9 +2005,38 @@ def create_survey_from_revision(
                 preview_session=preview,
                 completion_certificate_enabled=preview.completion_certificate_enabled,
                 parsed_document_download_enabled=preview.parsed_document_download_enabled,
+                team_configuration=team_configuration,
+                publication_manifest={
+                    'revision_id': str(revision.public_id),
+                    'mode': survey_mode,
+                    'audience': question_set.audience,
+                    'collection_style': question_set.collection_style,
+                    'anonymity_mode': 'anonymous',
+                    'completion_certificate_enabled': preview.completion_certificate_enabled,
+                    'parsed_document_download_enabled': preview.parsed_document_download_enabled,
+                    'opens_at': opens_at.isoformat() if opens_at else None,
+                    'expires_at': expires_at.isoformat() if expires_at else None,
+                    'team_configuration_id': team_configuration.pk if team_configuration else None,
+                    'team_selection': 'self_selected' if team_configuration else None,
+                },
                 idempotency_key=idempotency_key,
                 created_by=actor,
             )
+            if team_configuration is not None:
+                snapshot = SurveyTeamSnapshot.objects.create(
+                    survey=survey,
+                    source_configuration=team_configuration,
+                    name=team_configuration.name,
+                    label_prefix=team_configuration.label_prefix,
+                    color=team_configuration.color,
+                )
+                for team in team_configuration.teams.all():
+                    SurveyTeam.objects.create(
+                        snapshot=snapshot,
+                        number=team.number,
+                        size=team.size,
+                        display_name=team.display_name,
+                    )
     except IntegrityError:
         survey.delete()
         winner = (
@@ -1162,6 +2055,7 @@ def create_survey_from_revision(
             preview=preview,
             survey_public_id=survey_public_id,
             audit_event_id=audit_event_id,
+            team_configuration=team_configuration,
         )
         return winner, False
     record_instructor_event(
@@ -1173,7 +2067,7 @@ def create_survey_from_revision(
         course=revision.question_set.course,
         target_type='survey',
         target_id=survey.pk,
-        metadata={'mode': 'form'},
+        metadata={'mode': survey_mode},
     )
     question_set.workflow_status = QuestionSet.WORKFLOW_COMPLETED
     question_set.save(update_fields=['workflow_status', 'updated_at'])
@@ -1200,4 +2094,115 @@ def serialize_survey_link(link):
         'expires_at': survey.expires_at.isoformat() if survey.expires_at else None,
         'completion_certificate_enabled': link.completion_certificate_enabled,
         'parsed_document_download_enabled': link.parsed_document_download_enabled,
+        'team_configuration_id': link.team_configuration_id,
+    }
+
+
+def _template_body_hash(body):
+    return hashlib.sha256(_canonical_json(body).encode('utf-8')).hexdigest()
+
+
+@transaction.atomic
+def save_private_template(
+    *,
+    revision,
+    actor,
+    name,
+    description='',
+):
+    question_set = revision.question_set
+    if question_set.owner_id != actor.pk:
+        raise QuestionSetError('template_access_denied')
+    name = _bounded_text(name, 'Template name', max_length=200)
+    description = _bounded_text(
+        description or '',
+        'Template description',
+        required=False,
+        max_length=2000,
+    )
+    parent_revision = question_set.source_template_revision
+    origin_revision = None
+    if parent_revision is not None:
+        origin_revision = parent_revision.template.origin_revision or parent_revision
+    template = QuestionSetTemplate.objects.create(
+        name=name,
+        description=description,
+        scope=QuestionSetTemplate.SCOPE_INSTRUCTOR,
+        owner=actor,
+        institution=question_set.course.institution,
+        audience=question_set.audience,
+        collection_style=question_set.collection_style,
+        visibility=QuestionSetTemplate.VISIBILITY_PRIVATE,
+        forked_from_revision=parent_revision,
+        origin_revision=origin_revision,
+    )
+    template_revision = QuestionSetTemplateRevision.objects.create(
+        template=template,
+        revision_number=1,
+        canonical_body=copy.deepcopy(revision.canonical_body),
+        content_hash=_template_body_hash(revision.canonical_body),
+        protocol_schema_version=revision.protocol_schema_version,
+        created_by=actor,
+        source_question_set_revision=revision,
+        source_checkpoint=revision.source_checkpoint,
+        provenance='instructor_saved',
+    )
+    if template.origin_revision_id is None:
+        template.origin_revision = template_revision
+        template.save(update_fields=['origin_revision', 'updated_at'])
+    return template, template_revision
+
+
+@transaction.atomic
+def publish_template_to_community(*, template, revision, actor):
+    template = QuestionSetTemplate.objects.select_for_update().get(pk=template.pk)
+    if template.owner_id != actor.pk or revision.template_id != template.pk:
+        raise QuestionSetError('template_access_denied')
+    template.visibility = QuestionSetTemplate.VISIBILITY_COMMUNITY
+    template.community_revision = revision
+    template.community_published_at = timezone.now()
+    template.community_withdrawn_at = None
+    template.save(update_fields=[
+        'visibility', 'community_revision', 'community_published_at',
+        'community_withdrawn_at', 'updated_at',
+    ])
+    return template
+
+
+@transaction.atomic
+def withdraw_template_from_community(*, template, actor):
+    template = QuestionSetTemplate.objects.select_for_update().get(pk=template.pk)
+    if template.owner_id != actor.pk:
+        raise QuestionSetError('template_access_denied')
+    template.visibility = QuestionSetTemplate.VISIBILITY_PRIVATE
+    template.community_revision = None
+    template.community_withdrawn_at = timezone.now()
+    template.save(update_fields=[
+        'visibility', 'community_revision', 'community_withdrawn_at', 'updated_at',
+    ])
+    return template
+
+
+def serialize_template(template, revision=None):
+    if revision is None:
+        revision = template.community_revision or template.revisions.order_by(
+            '-revision_number', '-id',
+        ).first()
+    return {
+        'id': str(template.public_id),
+        'name': template.name,
+        'description': template.description,
+        'audience': template.audience,
+        'collection_style': template.collection_style,
+        'visibility': template.visibility,
+        'revision_id': str(revision.public_id) if revision else None,
+        'revision_number': revision.revision_number if revision else None,
+        'forked_from_revision_id': (
+            str(template.forked_from_revision.public_id)
+            if template.forked_from_revision_id else None
+        ),
+        'origin_revision_id': (
+            str(template.origin_revision.public_id)
+            if template.origin_revision_id else None
+        ),
     }

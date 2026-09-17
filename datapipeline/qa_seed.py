@@ -311,6 +311,9 @@ def _expected_revision_values(question_set_public_id):
         'canonical_body': body,
         'compiler_version': COMPILER_VERSION,
         'engine_version': ENGINE_VERSION,
+        'protocol_schema_version': body.get('schema_version', 'question-set-v1'),
+        'audience': QuestionSet.AUDIENCE_INDIVIDUAL,
+        'collection_style': QuestionSet.COLLECTION_GUIDED,
     }
     content_hash = hashlib.sha256(
         json.dumps(
@@ -506,9 +509,9 @@ def _survey_values(*, revision, primary):
         'name': 'QA Active Course Week 4 Reflection',
         'survey_label': 'QA Active Course Week 4 Reflection',
         'instructions': (
-            'You are LEAI, a conversational reflection facilitator. Follow the '
-            'form-mode directives exactly, ask one question at a time, and keep '
-            'your responses concise and supportive.'
+            'You are LEAI, a conversational feedback facilitator. Follow the '
+            'provided guided questions exactly, ask one question at a time, '
+            'and keep your responses concise and supportive.'
         ),
         'created_by': primary.display_name,
         'course': revision.question_set.course,
