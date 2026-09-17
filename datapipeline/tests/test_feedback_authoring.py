@@ -160,4 +160,3 @@ class FeedbackAuthoringTests(TestCase):
                 idempotency_key='stale-authoring-run',
             )
         self.assertEqual(context.exception.code, 'stale_draft')
-
