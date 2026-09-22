@@ -162,7 +162,7 @@ class MutationReceiptTests(TransactionTestCase):
         object_overhead = len(b'{"value":""}')
         result_value = "x" * (16 * 1024 - object_overhead + 1)
 
-        with self.assertRaises(InvalidMutationResult):
+        try:
             execute_once(
                 principal_scope="service:test",
                 operation="bounded-result",
@@ -183,6 +183,31 @@ class MutationReceiptTests(TransactionTestCase):
                 idempotency_key="request-utf8-limit",
                 request_hash="f" * 64,
                 mutate=lambda: {"value": "é" * 8190},
+            )
+
+    def test_jsonb_numeric_expansion_returns_domain_size_error(self):
+        result = {"values": [1e-6] * 2000}
+
+        with self.assertRaises(InvalidMutationResult):
+            execute_once(
+                principal_scope="service:test",
+                operation="bounded-result",
+                target_key="target:numeric-expansion",
+                idempotency_key="request-numeric-expansion",
+                request_hash="2" * 64,
+                mutate=lambda: result,
+            )
+        except Exception as error:
+            self.assertIsInstance(error, InvalidMutationResult)
+        else:
+            self.fail("PostgreSQL-expanded numeric result was accepted")
+
+        self.assertFalse(MutationReceipt.objects.exists())
+
+    def test_database_enforces_jsonb_numeric_expansion_size(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            MutationReceipt.objects.create(
+                **self._receipt_values(result={"values": [1e-6] * 2000})
             )
 
     def test_database_rejects_malformed_hashes(self):
@@ -218,6 +243,65 @@ class MutationReceiptTests(TransactionTestCase):
             MutationReceipt.objects.create(
                 **self._receipt_values(result=None, completed_at=None)
             )
+
+    def test_completed_receipt_rejects_result_update(self):
+        execute_once(
+            principal_scope="service:test",
+            operation="immutable-result",
+            target_key="target:update",
+            idempotency_key="request-update",
+            request_hash="3" * 64,
+            mutate=lambda: {"value": "original"},
+        )
+        receipt = MutationReceipt.objects.get()
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            MutationReceipt.objects.filter(pk=receipt.pk).update(
+                result={"value": "changed"}
+            )
+
+        receipt.refresh_from_db()
+        self.assertEqual(receipt.result, {"value": "original"})
+
+    def test_completed_receipt_rejects_delete(self):
+        execute_once(
+            principal_scope="service:test",
+            operation="immutable-result",
+            target_key="target:delete",
+            idempotency_key="request-delete",
+            request_hash="4" * 64,
+            mutate=lambda: {"value": "original"},
+        )
+        receipt = MutationReceipt.objects.get()
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            MutationReceipt.objects.filter(pk=receipt.pk).delete()
+
+        self.assertTrue(MutationReceipt.objects.filter(pk=receipt.pk).exists())
+
+    def test_repeatable_read_is_rejected_before_mutation(self):
+        calls = []
+
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+                )
+                cursor.execute("SHOW transaction_isolation")
+                self.assertEqual(cursor.fetchone()[0], "repeatable read")
+
+            with self.assertRaisesRegex(RuntimeError, "READ COMMITTED"):
+                execute_once(
+                    principal_scope="service:test",
+                    operation="isolation-check",
+                    target_key="target:repeatable-read",
+                    idempotency_key="request-repeatable-read",
+                    request_hash="5" * 64,
+                    mutate=lambda: calls.append("called") or {"ok": True},
+                )
+
+            self.assertEqual(calls, [])
+            self.assertFalse(MutationReceipt.objects.exists())
 
     def test_concurrent_identical_requests_use_distinct_connections_and_mutate_once(self):
         outcomes = queue.Queue()

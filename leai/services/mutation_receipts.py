@@ -3,7 +3,7 @@ import json
 import re
 from collections.abc import Callable
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
 
 from leai.models.responses import MutationReceipt
@@ -24,6 +24,10 @@ class IdempotencyConflict(Exception):
 
 class InvalidMutationResult(ValueError):
     """The mutation callback returned an invalid or oversized result."""
+
+
+class UnsupportedTransactionIsolation(RuntimeError):
+    """Receipt replay requires PostgreSQL READ COMMITTED isolation."""
 
 
 def _validate_inputs(
@@ -65,23 +69,35 @@ def _canonicalize_result(result: dict) -> dict:
     if not isinstance(result, dict):
         raise InvalidMutationResult("mutation result must be a JSON object")
     try:
-        canonical_bytes = json.dumps(
+        serialized = json.dumps(
             result,
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("utf-8")
+        )
     except (TypeError, ValueError) as error:
         raise InvalidMutationResult(
             "mutation result must contain only canonical JSON values"
         ) from error
 
-    if len(canonical_bytes) > MutationReceipt.MAX_RESULT_BYTES:
+    # The database check uses this same function after jsonb has normalized
+    # numbers, so Python's exponent formatting cannot undercount the result.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT leai_jsonb_canonical_size(candidate), candidate::text
+            FROM (SELECT %s::jsonb AS candidate) AS normalized
+            """,
+            [serialized],
+        )
+        canonical_size, normalized_json = cursor.fetchone()
+
+    if canonical_size > MutationReceipt.MAX_RESULT_BYTES:
         raise InvalidMutationResult(
             "mutation result exceeds the 16 KiB canonical JSON limit"
         )
-    return json.loads(canonical_bytes)
+    return json.loads(normalized_json)
 
 
 def _replay_or_conflict(
@@ -105,6 +121,12 @@ def execute_once(
     request_hash: str,
     mutate: Callable[[], dict],
 ) -> tuple[dict, bool]:
+    """Commit a mutation and its receipt together under READ COMMITTED.
+
+    The unique-key loser must see the winner's committed row in a fresh
+    statement snapshot. Any caller's outer transaction must also use READ
+    COMMITTED; this service does not retry an outer transaction.
+    """
     _validate_inputs(
         principal_scope=principal_scope,
         operation=operation,
@@ -126,6 +148,14 @@ def execute_once(
     }
 
     with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation_level = cursor.fetchone()[0]
+        if isolation_level != "read committed":
+            raise UnsupportedTransactionIsolation(
+                "execute_once requires PostgreSQL READ COMMITTED isolation"
+            )
+
         receipt = (
             MutationReceipt.objects.select_for_update().filter(**lookup).first()
         )
