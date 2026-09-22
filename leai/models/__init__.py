@@ -32,6 +32,14 @@ from .responses import (
     TeamSnapshot,
     TeamSnapshotItem,
 )
+from .analysis import (
+    AnalysisChatMessage,
+    AnalysisChatSession,
+    AnalysisCitation,
+    AnalysisScopeOccurrence,
+    AnalysisSnapshot,
+)
+from .governance import AuditEvent, ImportRecordMap, ImportRecordOutcome, ImportRun
 
 __all__ = [
     "Course",
@@ -62,4 +70,13 @@ __all__ = [
     "TeamDefinition",
     "TeamSnapshot",
     "TeamSnapshotItem",
+    "AnalysisChatMessage",
+    "AnalysisChatSession",
+    "AnalysisCitation",
+    "AnalysisScopeOccurrence",
+    "AnalysisSnapshot",
+    "AuditEvent",
+    "ImportRecordMap",
+    "ImportRecordOutcome",
+    "ImportRun",
 ]

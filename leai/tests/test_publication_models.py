@@ -162,10 +162,11 @@ class PublicationModelTests(TestCase):
 
     def test_conversation_is_one_per_question_set_and_messages_have_valid_shape(self):
         conversation = self.make_conversation()
-        self.assertNotIn(
+        self.assertIn(
             "source_analysis_snapshot",
             {field.name for field in AuthoringConversation._meta.get_fields()},
         )
+        self.assertIsNone(conversation.source_analysis_snapshot)
         assert_trigger_rejection(
             self,
             lambda: self.make_conversation(question_set=conversation.question_set),

@@ -1,8 +1,12 @@
 import uuid
 
+from django.core.exceptions import ValidationError
 from django.db import models
 
-from .identity import Course, Institution, InstructorAccount
+from .identity import (
+    Course, CourseMembership, Institution,
+    InstitutionMembership, InstructorAccount,
+)
 
 
 class QuestionSet(models.Model):
@@ -188,7 +192,51 @@ class AuthoringConversation(models.Model):
         on_delete=models.PROTECT,
         related_name="created_authoring_conversations",
     )
+    source_analysis_snapshot = models.ForeignKey(
+        "leai.AnalysisSnapshot",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="seeded_authoring_conversations",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        super().clean()
+        if not self.source_analysis_snapshot_id:
+            return
+        course_id = self.question_set.course_id
+        if self.source_analysis_snapshot.course_id != course_id:
+            raise ValidationError({"source_analysis_snapshot": "Source snapshot must belong to the Question Set course."})
+        actor = self.created_by
+        course = self.question_set.course
+        if not actor.is_active or course.lifecycle_state != "active":
+            raise ValidationError({"created_by": "Actor does not have active course access."})
+        if actor.platform_role == "platform_admin":
+            return
+        direct = CourseMembership.objects.filter(
+            course_id=course_id,
+            institution_membership__account_id=actor.pk,
+            institution_membership__institution_id=course.institution_id,
+            institution_membership__is_active=True,
+            role__in=["owner", "instructor", "ta"],
+        ).exists()
+        researcher = InstitutionMembership.objects.filter(
+            account_id=actor.pk,
+            institution_id=course.institution_id,
+            is_active=True,
+            role="researcher",
+        ).exclude(
+            course_access_restrictions__course_id=course_id,
+            course_access_restrictions__denied=True,
+        ).exists()
+        if not direct and not researcher:
+            raise ValidationError({"created_by": "Actor does not have course authoring and analysis access."})
+
+    def save(self, *args, **kwargs):
+        if self.source_analysis_snapshot_id:
+            self.full_clean()
+        return super().save(*args, **kwargs)
 
     class Meta:
         constraints = [
