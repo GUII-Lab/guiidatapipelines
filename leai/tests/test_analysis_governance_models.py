@@ -58,7 +58,7 @@ class AnalysisGovernanceTests(TestCase):
         values = dict(
             actor_account=self.actor, run_kind="dry_run", source_environment="production",
             target_environment="qa", idempotency_key_hash="a" * 64,
-            manifest_digest="b" * 64, status="completed", source_release="v1",
+            manifest_digest="b" * 64, status="running", source_release="v1",
             target_release="v2", migration_set="0001-0007", contract_version="v1",
         )
         values.update(overrides)
@@ -226,6 +226,37 @@ class AnalysisGovernanceTests(TestCase):
         chat = self.make_chat_message().analysis_chat_session
         with self.assertRaises(IntegrityError), transaction.atomic():
             AnalysisChatSession.objects.filter(pk=chat.pk).update(origin_surface="feedback_chat")
+
+    def test_analysis_chat_messages_reject_orm_and_raw_update_delete(self):
+        for action, write in (
+            ("orm_update", lambda message: AnalysisChatMessage.objects.filter(pk=message.pk).update(content="Changed")),
+            ("orm_delete", lambda message: AnalysisChatMessage.objects.filter(pk=message.pk).delete()),
+            ("sql_update", lambda message: self._raw_write(
+                "UPDATE leai_analysischatmessage SET content = %s WHERE id = %s",
+                ["Changed", message.pk],
+            )),
+            ("sql_delete", lambda message: self._raw_write(
+                "DELETE FROM leai_analysischatmessage WHERE id = %s", [message.pk],
+            )),
+        ):
+            message = self.make_chat_message()
+            with self.subTest(action=action), self.assertRaises(IntegrityError), transaction.atomic():
+                write(message)
+
+    def test_first_analysis_message_cannot_be_deleted_to_unfreeze_scope(self):
+        chat = AnalysisChatSession.objects.create(
+            course=self.course, actor_account=self.actor, origin_surface="analyzer"
+        )
+        occurrence = self.make_response_message().response_session.occurrence
+        AnalysisScopeOccurrence.objects.create(
+            analysis_chat_session=chat, survey_occurrence=occurrence
+        )
+        message = AnalysisChatMessage.objects.create(
+            analysis_chat_session=chat, sequence=1, role="user",
+            input_method="typed", content="First message",
+        )
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self._raw_write("DELETE FROM leai_analysischatmessage WHERE id = %s", [message.pk])
 
     def test_analysis_chat_user_input_method_is_required_and_non_user_is_null(self):
         message = self.make_chat_message()
@@ -416,7 +447,7 @@ class AnalysisGovernanceTests(TestCase):
         with self.assertRaises(IntegrityError), transaction.atomic():
             ImportRecordOutcome.objects.create(
                 import_run=run, import_record_map=record_map,
-                source_model="Course", source_key="43", disposition="reused",
+                source_model="Course", source_key="43", disposition="mapped",
                 reason_code="none",
             )
 
@@ -447,12 +478,112 @@ class AnalysisGovernanceTests(TestCase):
                     disposition=disposition, reason_code="none",
                 )
 
+    def test_mapped_requires_first_run_and_reused_requires_later_run(self):
+        first = self.make_import_run(run_kind="execute", status="running")
+        later = self.make_import_run(
+            run_kind="execute", status="running", idempotency_key_hash="c" * 64
+        )
+        record_map = ImportRecordMap.objects.create(
+            first_import_run=first, source_environment="production",
+            target_environment="qa", source_model="Course", source_key="42",
+            source_row_digest="d" * 64, target_model="Course", target_key="7",
+        )
+        with self.subTest(disposition="mapped"), self.assertRaises(IntegrityError), transaction.atomic():
+            ImportRecordOutcome.objects.create(
+                import_run=later, import_record_map=record_map,
+                source_model="Course", source_key="42", disposition="mapped",
+                reason_code="none",
+            )
+        with self.subTest(disposition="reused"):
+            with self.assertRaises(IntegrityError) as rejected, transaction.atomic():
+                self._raw_write(
+                    "INSERT INTO leai_importrecordoutcome "
+                    "(import_run_id, import_record_map_id, source_model, source_key, "
+                    "disposition, reason_code, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, NOW())",
+                    [first.pk, record_map.pk, "Course", "42", "reused", "none"],
+                )
+            self.assertEqual(rejected.exception.__cause__.pgcode, "23514")
+            self.assertEqual(
+                rejected.exception.__cause__.diag.message_primary,
+                "Reused outcome must use a map from an earlier execute run",
+            )
+
+    def test_mapped_first_run_and_reused_later_run_are_allowed(self):
+        first = self.make_import_run(run_kind="execute", status="running")
+        later = self.make_import_run(
+            run_kind="execute", status="running", idempotency_key_hash="c" * 64
+        )
+        record_map = ImportRecordMap.objects.create(
+            first_import_run=first, source_environment="production",
+            target_environment="qa", source_model="Course", source_key="42",
+            source_row_digest="d" * 64, target_model="Course", target_key="7",
+        )
+        for run, disposition in ((first, "mapped"), (later, "reused")):
+            outcome = ImportRecordOutcome.objects.create(
+                import_run=run, import_record_map=record_map,
+                source_model="Course", source_key="42", disposition=disposition,
+                reason_code="none",
+            )
+            self.assertEqual(outcome.import_record_map_id, record_map.pk)
+
+    def test_completed_import_run_rejects_new_outcomes_orm_and_raw_sql(self):
+        run = self.make_import_run(status="running")
+        ImportRecordOutcome.objects.create(
+            import_run=run, source_model="Course", source_key="1",
+            disposition="excluded", reason_code="source_excluded",
+        )
+        ImportRun.objects.filter(pk=run.pk).update(status="completed")
+        with self.subTest(route="orm"), self.assertRaises(IntegrityError), transaction.atomic():
+            ImportRecordOutcome.objects.create(
+                import_run=run, source_model="Course", source_key="2",
+                disposition="excluded", reason_code="source_excluded",
+            )
+        with self.subTest(route="raw_sql"):
+            with self.assertRaises(IntegrityError) as rejected, transaction.atomic():
+                self._raw_write(
+                    "INSERT INTO leai_importrecordoutcome "
+                    "(import_run_id, source_model, source_key, disposition, reason_code, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, NOW())",
+                    [run.pk, "Course", "3", "excluded", "source_excluded"],
+                )
+            self.assertEqual(rejected.exception.__cause__.pgcode, "23514")
+            self.assertEqual(
+                rejected.exception.__cause__.diag.message_primary,
+                "Import Run outcomes are sealed after terminal status",
+            )
+
+    def test_failed_import_run_rejects_new_outcomes(self):
+        run = self.make_import_run(status="failed")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            ImportRecordOutcome.objects.create(
+                import_run=run, source_model="Course", source_key="42",
+                disposition="excluded", reason_code="source_excluded",
+            )
+
+    def test_terminal_import_run_status_cannot_reopen_or_switch(self):
+        for initial, next_status, key in (
+            ("completed", "running", "a" * 64),
+            ("failed", "pending", "c" * 64),
+            ("completed", "failed", "d" * 64),
+            ("failed", "completed", "e" * 64),
+        ):
+            run = self.make_import_run(status=initial, idempotency_key_hash=key)
+            with self.subTest(initial=initial, route="orm"), self.assertRaises(IntegrityError), transaction.atomic():
+                ImportRun.objects.filter(pk=run.pk).update(status=next_status)
+            with self.subTest(initial=initial, route="sql"), self.assertRaises(IntegrityError), transaction.atomic():
+                self._raw_write(
+                    "UPDATE leai_importrun SET status = %s WHERE id = %s",
+                    [next_status, run.pk],
+                )
+
     def test_completed_import_run_outcomes_reject_update_and_delete(self):
         run = self.make_import_run()
         outcome = ImportRecordOutcome.objects.create(
             import_run=run, source_model="LEAIChatSession", source_key="42",
             disposition="quarantined", reason_code="unresolved_owner",
         )
+        ImportRun.objects.filter(pk=run.pk).update(status="completed")
         for write in (
             lambda: ImportRecordOutcome.objects.filter(pk=outcome.pk).update(reason_code="unresolved_scope"),
             lambda: ImportRecordOutcome.objects.filter(pk=outcome.pk).delete(),
@@ -466,7 +597,9 @@ class AnalysisGovernanceTests(TestCase):
             import_run=run, source_model="LEAIChatSession", source_key="42",
             disposition="quarantined", reason_code="unresolved_owner",
         )
-        ImportRun.objects.filter(pk=run.pk).update(status="running")
+        ImportRun.objects.filter(pk=run.pk).update(status="completed")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            ImportRun.objects.filter(pk=run.pk).update(status="running")
         for action, write in (
             ("update", lambda: ImportRecordOutcome.objects.filter(pk=outcome.pk).update(
                 reason_code="unresolved_scope"
@@ -617,3 +750,99 @@ class AnalysisScopeConcurrencyTests(TransactionTestCase):
         self.assertTrue(saw_lock_wait, "scope insert did not wait on the chat parent lock")
         self.assertEqual(scope_result.get("value"), "rejected")
         self.assertFalse(AnalysisScopeOccurrence.objects.filter(analysis_chat_session=chat).exists())
+
+
+class ImportRunConcurrencyTests(TransactionTestCase):
+    def test_outcome_insert_waits_for_uncommitted_completion(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("PostgreSQL row-lock behavior")
+        user = get_user_model().objects.create_user(username="import-race")
+        actor = InstructorAccount.objects.create(
+            user=user, email="import-race@example.edu", display_name="Import Race"
+        )
+        run = ImportRun.objects.create(
+            actor_account=actor, run_kind="dry_run", status="running",
+            source_environment="production", target_environment="qa",
+            idempotency_key_hash="a" * 64, manifest_digest="b" * 64,
+            source_release="v1", target_release="v2", migration_set="0001-0007",
+            contract_version="v1",
+        )
+        completion_written = threading.Event()
+        release_completion = threading.Event()
+        insert_started = threading.Event()
+        insert_done = threading.Event()
+        insert_backend_pid = {}
+        insert_result = {}
+        worker_errors = []
+
+        def complete_run():
+            try:
+                with transaction.atomic():
+                    ImportRun.objects.filter(pk=run.pk).update(status="completed")
+                    completion_written.set()
+                    if not release_completion.wait(10):
+                        raise TimeoutError("completion transaction was not released")
+            except Exception as exc:
+                worker_errors.append(exc)
+            finally:
+                completion_written.set()
+                connections["default"].close()
+
+        def insert_outcome():
+            try:
+                if not completion_written.wait(10):
+                    raise TimeoutError("completion was not written")
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    insert_backend_pid["value"] = cursor.fetchone()[0]
+                insert_started.set()
+                try:
+                    with transaction.atomic():
+                        ImportRecordOutcome.objects.create(
+                            import_run=run, source_model="Course", source_key="42",
+                            disposition="excluded", reason_code="source_excluded",
+                        )
+                except IntegrityError:
+                    insert_result["value"] = "rejected"
+                else:
+                    insert_result["value"] = "inserted"
+            except Exception as exc:
+                worker_errors.append(exc)
+            finally:
+                insert_started.set()
+                insert_done.set()
+                connections["default"].close()
+
+        completion_thread = threading.Thread(target=complete_run)
+        insert_thread = threading.Thread(target=insert_outcome)
+        completion_thread.start()
+        saw_lock_wait = False
+        try:
+            if completion_written.wait(5):
+                insert_thread.start()
+                if insert_started.wait(5) and "value" in insert_backend_pid:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and not insert_done.is_set():
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                                [insert_backend_pid["value"]],
+                            )
+                            row = cursor.fetchone()
+                        if row and row[0] == "Lock":
+                            saw_lock_wait = True
+                            break
+                        time.sleep(0.02)
+        finally:
+            release_completion.set()
+            completion_thread.join(10)
+            if insert_thread.ident is not None:
+                insert_thread.join(10)
+
+        self.assertFalse(completion_thread.is_alive())
+        self.assertFalse(insert_thread.is_alive())
+        self.assertEqual(worker_errors, [])
+        self.assertTrue(saw_lock_wait, "outcome INSERT did not wait on the ImportRun parent")
+        self.assertEqual(insert_result.get("value"), "rejected")
+        self.assertFalse(ImportRecordOutcome.objects.filter(import_run=run).exists())
+        self.assertEqual(ImportRun.objects.get(pk=run.pk).status, "completed")

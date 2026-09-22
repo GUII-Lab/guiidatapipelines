@@ -297,6 +297,9 @@ class Migration(migrations.Migration):
                 CREATE TRIGGER leai_import_record_outcome_append_only
                     BEFORE UPDATE OR DELETE ON leai_importrecordoutcome
                     FOR EACH ROW EXECUTE FUNCTION leai_reject_task6_append_only();
+                CREATE TRIGGER leai_analysis_chat_message_append_only
+                    BEFORE UPDATE OR DELETE ON leai_analysischatmessage
+                    FOR EACH ROW EXECUTE FUNCTION leai_reject_task6_append_only();
                 CREATE TRIGGER leai_response_message_append_only
                     BEFORE UPDATE OR DELETE ON leai_responsemessage
                     FOR EACH ROW EXECUTE FUNCTION leai_reject_task6_append_only();
@@ -491,20 +494,6 @@ class Migration(migrations.Migration):
                     BEFORE UPDATE ON leai_analysischatsession
                     FOR EACH ROW EXECUTE FUNCTION leai_reject_analysis_chat_owner_update();
 
-                CREATE FUNCTION leai_reject_analysis_message_parent_update()
-                RETURNS trigger AS $$
-                BEGIN
-                    IF NEW.analysis_chat_session_id IS DISTINCT FROM OLD.analysis_chat_session_id THEN
-                        RAISE EXCEPTION 'Analysis message parent is immutable'
-                            USING ERRCODE = '23514';
-                    END IF;
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql;
-                CREATE TRIGGER leai_analysis_message_parent_immutable
-                    BEFORE UPDATE OF analysis_chat_session_id ON leai_analysischatmessage
-                    FOR EACH ROW EXECUTE FUNCTION leai_reject_analysis_message_parent_update();
-
                 CREATE FUNCTION leai_guard_sourced_question_set_course()
                 RETURNS trigger AS $$
                 BEGIN
@@ -526,8 +515,9 @@ class Migration(migrations.Migration):
 
                 CREATE FUNCTION leai_check_import_record_provenance()
                 RETURNS trigger AS $$
-                DECLARE run_source text; run_target text; run_type text; map_source text;
-                        map_target text; map_model text; map_key text;
+                DECLARE run_source text; run_target text; run_type text; run_status text;
+                        map_source text; map_target text; map_model text; map_key text;
+                        map_first_run_id bigint;
                 BEGIN
                     IF TG_TABLE_NAME = 'leai_importrecordmap' THEN
                         SELECT source_environment, target_environment, import_run.run_kind
@@ -542,10 +532,15 @@ class Migration(migrations.Migration):
                                 USING ERRCODE = '23514';
                         END IF;
                     ELSE
-                        SELECT source_environment, target_environment, import_run.run_kind
-                            INTO run_source, run_target, run_type
+                        SELECT source_environment, target_environment,
+                               import_run.run_kind, import_run.status
+                            INTO run_source, run_target, run_type, run_status
                             FROM leai_importrun AS import_run
-                            WHERE import_run.id = NEW.import_run_id;
+                            WHERE import_run.id = NEW.import_run_id FOR UPDATE;
+                        IF run_status IN ('completed', 'failed') THEN
+                            RAISE EXCEPTION 'Import Run outcomes are sealed after terminal status'
+                                USING ERRCODE = '23514';
+                        END IF;
                         IF run_source IS NULL OR
                            (run_type = 'execute' AND NEW.disposition IN ('mapped', 'reused')
                             AND NEW.import_record_map_id IS NULL) THEN
@@ -554,14 +549,25 @@ class Migration(migrations.Migration):
                         END IF;
                         IF NEW.import_record_map_id IS NOT NULL THEN
                             SELECT source_environment, target_environment,
-                                   source_model, source_key
-                                INTO map_source, map_target, map_model, map_key
+                                   source_model, source_key, first_import_run_id
+                                INTO map_source, map_target, map_model, map_key,
+                                     map_first_run_id
                                 FROM leai_importrecordmap
                                 WHERE id = NEW.import_record_map_id;
                             IF map_source IS NULL
                                OR map_source <> run_source OR map_target <> run_target
                                OR map_model <> NEW.source_model OR map_key <> NEW.source_key THEN
                                 RAISE EXCEPTION 'Import outcome must reference its exact source map'
+                                    USING ERRCODE = '23514';
+                            END IF;
+                            IF NEW.disposition = 'mapped'
+                               AND NEW.import_run_id <> map_first_run_id THEN
+                                RAISE EXCEPTION 'Mapped outcome must belong to map first execute run'
+                                    USING ERRCODE = '23514';
+                            END IF;
+                            IF NEW.disposition = 'reused'
+                               AND NEW.import_run_id = map_first_run_id THEN
+                                RAISE EXCEPTION 'Reused outcome must use a map from an earlier execute run'
                                     USING ERRCODE = '23514';
                             END IF;
                         END IF;
@@ -579,6 +585,11 @@ class Migration(migrations.Migration):
                 CREATE FUNCTION leai_reject_import_run_identity_update()
                 RETURNS trigger AS $$
                 BEGIN
+                    IF OLD.status IN ('completed', 'failed')
+                       AND NEW.status IS DISTINCT FROM OLD.status THEN
+                        RAISE EXCEPTION 'Import Run terminal status is immutable'
+                            USING ERRCODE = '23514';
+                    END IF;
                     IF (NEW.actor_account_id, NEW.run_kind, NEW.source_environment,
                         NEW.target_environment, NEW.idempotency_key_hash,
                         NEW.manifest_digest, NEW.source_release, NEW.target_release,
@@ -607,8 +618,7 @@ class Migration(migrations.Migration):
                 DROP TRIGGER IF EXISTS leai_sourced_question_set_course_immutable ON leai_questionset;
                 DROP FUNCTION IF EXISTS leai_guard_sourced_question_set_course();
                 DROP TRIGGER IF EXISTS leai_response_message_append_only ON leai_responsemessage;
-                DROP TRIGGER IF EXISTS leai_analysis_message_parent_immutable ON leai_analysischatmessage;
-                DROP FUNCTION IF EXISTS leai_reject_analysis_message_parent_update();
+                DROP TRIGGER IF EXISTS leai_analysis_chat_message_append_only ON leai_analysischatmessage;
                 DROP TRIGGER IF EXISTS leai_analysis_chat_owner_immutable ON leai_analysischatsession;
                 DROP FUNCTION IF EXISTS leai_reject_analysis_chat_owner_update();
                 DROP TRIGGER IF EXISTS leai_authoring_conversation_identity_immutable ON leai_authoringconversation;
