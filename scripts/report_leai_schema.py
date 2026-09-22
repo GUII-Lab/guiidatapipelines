@@ -6,6 +6,24 @@ import sys
 from pathlib import Path
 
 
+EXPECTED_CANONICAL_MIGRATIONS = (
+    "0001_identity_course",
+    "0002_identity_integrity_guards",
+    "0003_lock_child_institution_parents",
+    "0004_authoring_core",
+    "0005_authoring_publication",
+    "0006_responses",
+    "0007_mutation_receipt",
+    "0008_analysis_governance",
+    "0009_product_usage_event",
+)
+
+
+def validate_canonical_migrations(applied):
+    if tuple(applied) != EXPECTED_CANONICAL_MIGRATIONS:
+        raise ValueError("Applied canonical migrations do not match the reviewed foundation")
+
+
 def list_canonical_migrations(connection):
     with connection.cursor() as cursor:
         cursor.execute(
@@ -79,7 +97,7 @@ def schema_counts(connection):
     return tables, constraints, indexes, uuid_columns
 
 
-def render_schema_report(connection, verification_results=()):
+def render_schema_report(connection):
     tables, constraints, indexes, uuid_columns = schema_counts(connection)
     migrations = list_canonical_migrations(connection)
     forbidden = count_forbidden_legacy_foreign_keys(connection)
@@ -96,24 +114,13 @@ def render_schema_report(connection, verification_results=()):
         f"- Indexes: {indexes}",
         f"- Public UUID columns: {', '.join(f'{table}.{column}' for table, column in uuid_columns)}",
         f"- Forbidden legacy foreign keys: {forbidden}",
-        "",
-        "## Verification commands and results",
-        "",
     ]
-    lines.extend(f"- `{command}` — {result}" for command, result in verification_results)
     return "\n".join(lines) + "\n"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expect-database", required=True)
-    parser.add_argument(
-        "--verification",
-        nargs=2,
-        action="append",
-        metavar=("COMMAND", "RESULT"),
-        default=[],
-    )
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "guiidatapipelines.settings")
@@ -124,11 +131,13 @@ def main():
     actual_database = connection.settings_dict["NAME"]
     if actual_database != args.expect_database:
         parser.error("Database does not match --expect-database")
-    if len(list_canonical_migrations(connection)) != 9:
-        parser.error("Expected exactly nine applied canonical migrations")
+    try:
+        validate_canonical_migrations(list_canonical_migrations(connection))
+    except ValueError as error:
+        parser.error(str(error))
     if count_forbidden_legacy_foreign_keys(connection):
         parser.error("Canonical schema has forbidden legacy foreign keys")
-    print(render_schema_report(connection, args.verification), end="")
+    print(render_schema_report(connection), end="")
 
 
 if __name__ == "__main__":
