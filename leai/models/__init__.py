@@ -8,10 +8,19 @@ from .identity import (
     InstructorSession,
 )
 from .authoring import (
+    AuthoringConversation,
+    AuthoringMessage,
+    AuthoringRun,
+    PreviewDecision,
+    PreviewMessage,
+    PreviewSession,
     QuestionSet,
     QuestionSetDraft,
     QuestionSetDraftVersion,
     QuestionSetRevision,
+    QuestionSetTemplate,
+    QuestionSetTemplateRevision,
+    SurveyOccurrence,
 )
 
 __all__ = [
@@ -22,8 +31,17 @@ __all__ = [
     "InstitutionMembership",
     "InstructorAccount",
     "InstructorSession",
+    "AuthoringConversation",
+    "AuthoringMessage",
+    "AuthoringRun",
+    "PreviewDecision",
+    "PreviewMessage",
+    "PreviewSession",
     "QuestionSet",
     "QuestionSetDraft",
     "QuestionSetDraftVersion",
     "QuestionSetRevision",
+    "QuestionSetTemplate",
+    "QuestionSetTemplateRevision",
+    "SurveyOccurrence",
 ]
