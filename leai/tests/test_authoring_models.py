@@ -23,6 +23,15 @@ from leai.models import (
 )
 
 
+def assert_trigger_rejection(test_case, write, message):
+    with test_case.assertRaises(IntegrityError) as raised, transaction.atomic():
+        write()
+
+    cause = raised.exception.__cause__
+    test_case.assertEqual(cause.pgcode, "23514")
+    test_case.assertEqual(cause.diag.message_primary, message)
+
+
 class AuthoringModelTests(TestCase):
     def setUp(self):
         self.institution = Institution.objects.create(
@@ -133,8 +142,9 @@ class AuthoringModelTests(TestCase):
             question_set=self.make_question_set(title="Question set B"),
         )
 
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            QuestionSetRevision.objects.create(
+        assert_trigger_rejection(
+            self,
+            lambda: QuestionSetRevision.objects.create(
                 question_set=question_set_a,
                 revision_number=1,
                 source_draft_version=source_version_b,
@@ -143,7 +153,9 @@ class AuthoringModelTests(TestCase):
                 compiler_version="1.0.0",
                 engine_version="1.0.0",
                 created_by=self.account,
-            )
+            ),
+            "Question Set Revision source draft version must belong to its Question Set",
+        )
 
     def test_revision_numbers_are_unique_within_question_set(self):
         question_set = self.make_question_set()
@@ -198,18 +210,26 @@ class AuthoringModelTests(TestCase):
         )
         source_revision = self.make_revision()
 
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            self.make_question_set(
+        assert_trigger_rejection(
+            self,
+            lambda: self.make_question_set(
                 course=other_course,
                 source_question_set_revision=source_revision,
-            )
+            ),
+            "Question Set source revision must belong to the same Course",
+        )
 
     def test_draft_base_revision_must_belong_to_its_question_set(self):
         draft_a = self.make_draft()
         revision_b = self.make_revision(question_set=self.make_question_set())
 
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            QuestionSetDraft.objects.filter(pk=draft_a.pk).update(base_revision=revision_b)
+        assert_trigger_rejection(
+            self,
+            lambda: QuestionSetDraft.objects.filter(pk=draft_a.pk).update(
+                base_revision=revision_b,
+            ),
+            "Question Set Draft base revision must belong to its Question Set",
+        )
 
     def test_public_ids_receive_postgresql_defaults_for_direct_sql_inserts(self):
         with connection.cursor() as cursor:
@@ -265,8 +285,11 @@ class AuthoringModelTests(TestCase):
             name="Immutable Other Course",
         )
         question_set.course = other_course
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            question_set.save()
+        assert_trigger_rejection(
+            self,
+            question_set.save,
+            "Question Set course, owner, and source revision are immutable",
+        )
 
         with self.assertRaises(IntegrityError), transaction.atomic():
             QuestionSet.objects.filter(pk=question_set.pk).update(owner=self.make_account("other"))
@@ -370,20 +393,33 @@ class AuthoringConcurrencyTests(TransactionTestCase):
             created_by=self.account,
         )
 
-    def assert_parent_identity_reassignment_cannot_race_lineage_write(
+    @staticmethod
+    def _error_details(error):
+        cause = error.__cause__
+        return cause.pgcode, cause.diag.message_primary
+
+    def _blocking_pids(self, database_pid):
+        connection.ensure_connection()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_blocking_pids(%s)", [database_pid])
+            return cursor.fetchone()[0], connection.connection.get_backend_pid()
+
+    def assert_valid_child_blocks_on_referenced_parent(
         self,
         *,
         parent_model,
         parent_pk,
-        parent_reassign,
         child_write,
     ):
-        parent_locked = threading.Event()
-        child_attempted = threading.Event()
-        release_parent = threading.Event()
+        locker_ready = threading.Event()
+        child_started = threading.Event()
+        child_finished = threading.Event()
+        release_locker = threading.Event()
+        locker_pid_queue = queue.Queue()
+        child_pid_queue = queue.Queue()
         outcomes = queue.Queue()
 
-        def parent_write():
+        def locker():
             database_pid = None
             try:
                 close_old_connections()
@@ -392,48 +428,69 @@ class AuthoringConcurrencyTests(TransactionTestCase):
                 database_pid = database.connection.get_backend_pid()
                 with transaction.atomic():
                     parent_model.objects.select_for_update().get(pk=parent_pk)
-                    parent_locked.set()
-                    if not release_parent.wait(self.thread_timeout_seconds):
-                        raise RuntimeError("test did not release the parent transaction")
-                    parent_reassign()
-                outcomes.put(("parent", "committed", database_pid))
-            except DatabaseError:
-                outcomes.put(("parent", "rejected", database_pid))
+                    locker_pid_queue.put(database_pid)
+                    locker_ready.set()
+                    if not release_locker.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("test did not release the locker transaction")
+                outcomes.put(("locker", "committed", database_pid))
             except Exception as error:
-                outcomes.put(("parent", "error", database_pid, repr(error)))
+                outcomes.put(("locker", "error", database_pid, repr(error)))
             finally:
                 close_old_connections()
 
-        def child_write_in_transaction():
+        def child():
             database_pid = None
             try:
                 close_old_connections()
                 database = connections["default"]
                 database.ensure_connection()
                 database_pid = database.connection.get_backend_pid()
+                child_pid_queue.put(database_pid)
                 with transaction.atomic():
-                    if not parent_locked.wait(self.thread_timeout_seconds):
-                        raise RuntimeError("parent did not lock its identity row")
-                    child_attempted.set()
+                    if not locker_ready.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("locker did not acquire the referenced parent row")
+                    child_started.set()
                     child_write()
                 outcomes.put(("child", "committed", database_pid))
-            except DatabaseError:
-                outcomes.put(("child", "rejected", database_pid))
+            except IntegrityError as error:
+                outcomes.put(("child", "integrity", database_pid, *self._error_details(error)))
+            except DatabaseError as error:
+                outcomes.put(("child", "database_error", database_pid, *self._error_details(error)))
             except Exception as error:
                 outcomes.put(("child", "error", database_pid, repr(error)))
             finally:
+                child_finished.set()
                 close_old_connections()
 
-        parent_thread = threading.Thread(target=parent_write)
-        child_thread = threading.Thread(target=child_write_in_transaction)
-        parent_thread.start()
+        locker_thread = threading.Thread(target=locker)
+        child_thread = threading.Thread(target=child)
+        locker_thread.start()
+        self.assertTrue(locker_ready.wait(self.thread_timeout_seconds))
+        locker_pid = locker_pid_queue.get(timeout=self.thread_timeout_seconds)
         child_thread.start()
-        self.assertTrue(child_attempted.wait(self.thread_timeout_seconds))
-        release_parent.set()
-        parent_thread.join(self.thread_timeout_seconds)
-        child_thread.join(self.thread_timeout_seconds)
+        child_pid = child_pid_queue.get(timeout=self.thread_timeout_seconds)
+        self.assertTrue(child_started.wait(self.thread_timeout_seconds))
 
-        self.assertFalse(parent_thread.is_alive(), "parent thread did not finish")
+        try:
+            for _ in range(100):
+                blocking_pids, observer_pid = self._blocking_pids(child_pid)
+                if locker_pid in blocking_pids:
+                    break
+                self.assertFalse(child_finished.is_set(), "child completed without blocking")
+            else:
+                self.fail("child did not block on the referenced parent row")
+
+            self.assertFalse(child_finished.is_set(), "child produced an outcome before release")
+            self.assertTrue(outcomes.empty(), "child produced an outcome before release")
+            self.assertNotEqual(locker_pid, child_pid)
+            self.assertNotEqual(locker_pid, observer_pid)
+            self.assertNotEqual(child_pid, observer_pid)
+        finally:
+            release_locker.set()
+            locker_thread.join(self.thread_timeout_seconds)
+            child_thread.join(self.thread_timeout_seconds)
+
+        self.assertFalse(locker_thread.is_alive(), "locker thread did not finish")
         self.assertFalse(child_thread.is_alive(), "child thread did not finish")
         results = {
             outcome[0]: outcome[1:]
@@ -442,20 +499,67 @@ class AuthoringConcurrencyTests(TransactionTestCase):
                 outcomes.get(timeout=self.thread_timeout_seconds),
             ]
         }
-        self.assertEqual(results["parent"][0], "rejected", results)
+        self.assertEqual(results["locker"][0], "committed", results)
         self.assertEqual(results["child"][0], "committed", results)
-        self.assertNotEqual(results["parent"][1], results["child"][1])
 
-    def test_source_revision_lineage_survives_a_racing_question_set_reassignment(self):
+    def assert_opposite_order_invalid_writes_reject_without_deadlock(
+        self,
+        *,
+        first_write,
+        second_write,
+        message,
+    ):
+        start_writes = threading.Barrier(2)
+        outcomes = queue.Queue()
+
+        def write_in_transaction(name, write):
+            database_pid = None
+            try:
+                close_old_connections()
+                database = connections["default"]
+                database.ensure_connection()
+                database_pid = database.connection.get_backend_pid()
+                with transaction.atomic():
+                    start_writes.wait(self.thread_timeout_seconds)
+                    write()
+                outcomes.put((name, "committed", database_pid))
+            except IntegrityError as error:
+                outcomes.put((name, "integrity", database_pid, *self._error_details(error)))
+            except DatabaseError as error:
+                outcomes.put((name, "database_error", database_pid, *self._error_details(error)))
+            except Exception as error:
+                outcomes.put((name, "error", database_pid, repr(error)))
+            finally:
+                close_old_connections()
+
+        first_thread = threading.Thread(target=write_in_transaction, args=("first", first_write))
+        second_thread = threading.Thread(target=write_in_transaction, args=("second", second_write))
+        first_thread.start()
+        second_thread.start()
+        first_thread.join(self.thread_timeout_seconds)
+        second_thread.join(self.thread_timeout_seconds)
+
+        self.assertFalse(first_thread.is_alive(), "first stress thread did not finish")
+        self.assertFalse(second_thread.is_alive(), "second stress thread did not finish")
+        results = {
+            outcome[0]: outcome[1:]
+            for outcome in [
+                outcomes.get(timeout=self.thread_timeout_seconds),
+                outcomes.get(timeout=self.thread_timeout_seconds),
+            ]
+        }
+        for result in results.values():
+            self.assertEqual(result[0], "integrity", results)
+            self.assertEqual(result[2], "23514", results)
+            self.assertEqual(result[3], message, results)
+
+    def test_source_revision_write_blocks_on_its_referenced_revision(self):
         source_question_set = self.make_question_set("Source")
         source_revision = self.make_revision(source_question_set)
 
-        self.assert_parent_identity_reassignment_cannot_race_lineage_write(
-            parent_model=QuestionSet,
-            parent_pk=source_question_set.pk,
-            parent_reassign=lambda: QuestionSet.objects.filter(
-                pk=source_question_set.pk,
-            ).update(course=self.other_course),
+        self.assert_valid_child_blocks_on_referenced_parent(
+            parent_model=QuestionSetRevision,
+            parent_pk=source_revision.pk,
             child_write=lambda: QuestionSet.objects.create(
                 course=self.course,
                 owner=self.account,
@@ -473,7 +577,7 @@ class AuthoringConcurrencyTests(TransactionTestCase):
             ).exists(),
         )
 
-    def test_base_revision_lineage_survives_a_racing_question_set_reassignment(self):
+    def test_base_revision_write_blocks_on_its_referenced_revision(self):
         question_set = self.make_question_set("Draft owner")
         draft = QuestionSetDraft.objects.create(
             question_set=question_set,
@@ -483,12 +587,9 @@ class AuthoringConcurrencyTests(TransactionTestCase):
         )
         base_revision = self.make_revision(question_set)
 
-        self.assert_parent_identity_reassignment_cannot_race_lineage_write(
-            parent_model=QuestionSet,
-            parent_pk=question_set.pk,
-            parent_reassign=lambda: QuestionSet.objects.filter(pk=question_set.pk).update(
-                course=self.other_course,
-            ),
+        self.assert_valid_child_blocks_on_referenced_parent(
+            parent_model=QuestionSetRevision,
+            parent_pk=base_revision.pk,
             child_write=lambda: QuestionSetDraft.objects.filter(pk=draft.pk).update(
                 base_revision=base_revision,
             ),
@@ -497,7 +598,7 @@ class AuthoringConcurrencyTests(TransactionTestCase):
         draft.refresh_from_db()
         self.assertEqual(draft.base_revision, base_revision)
 
-    def test_revision_source_lineage_survives_a_racing_draft_reassignment(self):
+    def test_revision_source_write_blocks_on_its_referenced_draft_version(self):
         question_set = self.make_question_set("Revision owner")
         draft = QuestionSetDraft.objects.create(
             question_set=question_set,
@@ -512,14 +613,10 @@ class AuthoringConcurrencyTests(TransactionTestCase):
             canonical_body={},
             created_by=self.account,
         )
-        other_question_set = self.make_question_set("Other draft owner")
 
-        self.assert_parent_identity_reassignment_cannot_race_lineage_write(
-            parent_model=QuestionSetDraft,
-            parent_pk=draft.pk,
-            parent_reassign=lambda: QuestionSetDraft.objects.filter(pk=draft.pk).update(
-                question_set=other_question_set,
-            ),
+        self.assert_valid_child_blocks_on_referenced_parent(
+            parent_model=QuestionSetDraftVersion,
+            parent_pk=source_draft_version.pk,
             child_write=lambda: QuestionSetRevision.objects.create(
                 question_set=question_set,
                 revision_number=1,
@@ -538,3 +635,75 @@ class AuthoringConcurrencyTests(TransactionTestCase):
                 source_draft_version=source_draft_version,
             ).exists(),
         )
+
+    def test_opposite_order_base_revision_writes_reject_without_deadlock(self):
+        question_set_a = self.make_question_set("Base A")
+        question_set_b = self.make_question_set("Base B")
+        revision_a = self.make_revision(question_set_a)
+        revision_b = self.make_revision(question_set_b)
+
+        for _ in range(8):
+            self.assert_opposite_order_invalid_writes_reject_without_deadlock(
+                first_write=lambda: QuestionSetDraft.objects.filter(
+                    pk=question_set_a.draft.pk,
+                ).update(base_revision=revision_b),
+                second_write=lambda: QuestionSetDraft.objects.filter(
+                    pk=question_set_b.draft.pk,
+                ).update(base_revision=revision_a),
+                message="Question Set Draft base revision must belong to its Question Set",
+            )
+
+    def test_opposite_order_revision_source_writes_reject_without_deadlock(self):
+        question_set_a = self.make_question_set("Revision A")
+        question_set_b = self.make_question_set("Revision B")
+        draft_a = QuestionSetDraft.objects.create(
+            question_set=question_set_a,
+            current_version=1,
+            canonical_body={},
+            updated_by=self.account,
+        )
+        draft_b = QuestionSetDraft.objects.create(
+            question_set=question_set_b,
+            current_version=1,
+            canonical_body={},
+            updated_by=self.account,
+        )
+        draft_version_a = QuestionSetDraftVersion.objects.create(
+            draft=draft_a,
+            version_number=1,
+            content_hash="a" * 64,
+            canonical_body={},
+            created_by=self.account,
+        )
+        draft_version_b = QuestionSetDraftVersion.objects.create(
+            draft=draft_b,
+            version_number=1,
+            content_hash="a" * 64,
+            canonical_body={},
+            created_by=self.account,
+        )
+
+        for _ in range(8):
+            self.assert_opposite_order_invalid_writes_reject_without_deadlock(
+                first_write=lambda: QuestionSetRevision.objects.create(
+                    question_set=question_set_a,
+                    revision_number=1,
+                    source_draft_version=draft_version_b,
+                    content_hash="a" * 64,
+                    compiled_protocol={},
+                    compiler_version="1.0.0",
+                    engine_version="1.0.0",
+                    created_by=self.account,
+                ),
+                second_write=lambda: QuestionSetRevision.objects.create(
+                    question_set=question_set_b,
+                    revision_number=1,
+                    source_draft_version=draft_version_a,
+                    content_hash="a" * 64,
+                    compiled_protocol={},
+                    compiler_version="1.0.0",
+                    engine_version="1.0.0",
+                    created_by=self.account,
+                ),
+                message="Question Set Revision source draft version must belong to its Question Set",
+            )
