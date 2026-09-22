@@ -1,9 +1,13 @@
 import uuid
 
 from django.db import models
+from django.db.models.lookups import Exact, LessThanOrEqual
 
 from .authoring import SurveyOccurrence
 from .identity import Course, InstructorAccount
+
+
+MAX_MUTATION_RESULT_BYTES = 16 * 1024
 
 
 class TeamConfiguration(models.Model):
@@ -390,5 +394,87 @@ class PdfImportJob(models.Model):
             models.CheckConstraint(
                 check=models.Q(status__in=["pending", "running", "completed", "failed"]),
                 name="leai_pdf_import_job_status_valid",
+            ),
+        ]
+
+
+class MutationReceipt(models.Model):
+    MAX_RESULT_BYTES = MAX_MUTATION_RESULT_BYTES
+
+    id = models.BigAutoField(primary_key=True)
+    principal_scope = models.CharField(max_length=255)
+    operation = models.CharField(max_length=128)
+    target_key = models.CharField(max_length=255)
+    idempotency_key_hash = models.CharField(max_length=64)
+    request_hash = models.CharField(max_length=64)
+    result = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=(
+                    "principal_scope",
+                    "operation",
+                    "target_key",
+                    "idempotency_key_hash",
+                ),
+                name="leai_mutation_receipt_scope_idempotency_uniq",
+            ),
+            models.CheckConstraint(
+                check=~models.Q(principal_scope=""),
+                name="leai_mutation_receipt_principal_nonempty",
+            ),
+            models.CheckConstraint(
+                check=~models.Q(operation=""),
+                name="leai_mutation_receipt_operation_nonempty",
+            ),
+            models.CheckConstraint(
+                check=~models.Q(target_key=""),
+                name="leai_mutation_receipt_target_nonempty",
+            ),
+            models.CheckConstraint(
+                check=models.Q(idempotency_key_hash__regex=r"^[0-9a-f]{64}$"),
+                name="leai_mutation_receipt_idempotency_hash_valid",
+            ),
+            models.CheckConstraint(
+                check=models.Q(request_hash__regex=r"^[0-9a-f]{64}$"),
+                name="leai_mutation_receipt_request_hash_valid",
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(result__isnull=True, completed_at__isnull=True)
+                    | models.Q(result__isnull=False, completed_at__isnull=False)
+                ),
+                name="leai_mutation_receipt_completion_shape_valid",
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(result__isnull=True)
+                    | Exact(
+                        models.Func(
+                            models.F("result"),
+                            function="jsonb_typeof",
+                            output_field=models.CharField(),
+                        ),
+                        models.Value("object"),
+                    )
+                ),
+                name="leai_mutation_receipt_result_object",
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(result__isnull=True)
+                    | LessThanOrEqual(
+                        models.Func(
+                            models.F("result"),
+                            function="leai_jsonb_canonical_size",
+                            output_field=models.BigIntegerField(),
+                        ),
+                        models.Value(MAX_MUTATION_RESULT_BYTES),
+                    )
+                ),
+                name="leai_mutation_receipt_result_bounded",
             ),
         ]
