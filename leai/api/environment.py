@@ -4,6 +4,7 @@ from django.conf import settings
 from django.db import DatabaseError, connection
 from django.http import HttpResponseNotAllowed, JsonResponse
 from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
 
 
 CONTRACT_VERSION = "2026-09-21"
@@ -28,6 +29,7 @@ def no_store_json(payload, status=200):
     return response
 
 
+@csrf_exempt
 def environment_view(request):
     if request.method != "GET":
         response = HttpResponseNotAllowed(["GET"])

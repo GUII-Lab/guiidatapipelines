@@ -1,6 +1,6 @@
 from django.core import checks
 from django.db import connection
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, override_settings
 
 
 class EnvironmentApiTests(TestCase):
@@ -55,6 +55,6 @@ class EnvironmentApiTests(TestCase):
 
     @override_settings(LEAI_ENVIRONMENT="local", LEAI_BUILD_ID="local-backend")
     def test_unsupported_method_is_not_cached(self):
-        response = self.client.post(self.endpoint)
+        response = Client(enforce_csrf_checks=True).post(self.endpoint)
         self.assertEqual(response.status_code, 405)
         self.assertEqual(response["Cache-Control"], "no-store")
