@@ -162,7 +162,7 @@ class MutationReceiptTests(TransactionTestCase):
         object_overhead = len(b'{"value":""}')
         result_value = "x" * (16 * 1024 - object_overhead + 1)
 
-        try:
+        with self.assertRaises(InvalidMutationResult):
             execute_once(
                 principal_scope="service:test",
                 operation="bounded-result",
@@ -197,11 +197,6 @@ class MutationReceiptTests(TransactionTestCase):
                 request_hash="2" * 64,
                 mutate=lambda: result,
             )
-        except Exception as error:
-            self.assertIsInstance(error, InvalidMutationResult)
-        else:
-            self.fail("PostgreSQL-expanded numeric result was accepted")
-
         self.assertFalse(MutationReceipt.objects.exists())
 
     def test_database_enforces_jsonb_numeric_expansion_size(self):
