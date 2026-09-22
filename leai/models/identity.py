@@ -28,6 +28,14 @@ class InstructorAccount(models.Model):
     is_active = models.BooleanField(default=True)
     must_change_password = models.BooleanField(default=True)
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(platform_role__in=["member", "platform_admin"]),
+                name="leai_instructor_account_platform_role_valid",
+            ),
+        ]
+
 
 class Course(models.Model):
     class Lifecycle(models.TextChoices):
@@ -83,6 +91,10 @@ class Course(models.Model):
 
     class Meta:
         constraints = [
+            models.CheckConstraint(
+                check=models.Q(lifecycle_state__in=["active", "completed", "archived"]),
+                name="leai_course_lifecycle_state_valid",
+            ),
             models.UniqueConstraint(
                 fields=("institution", "course_code"),
                 name="leai_course_code_per_institution_uniq",
@@ -134,6 +146,10 @@ class InstitutionMembership(models.Model):
 
     class Meta:
         constraints = [
+            models.CheckConstraint(
+                check=models.Q(role__in=["instructor", "researcher"]),
+                name="leai_institution_membership_role_valid",
+            ),
             models.UniqueConstraint(
                 fields=("account", "institution"),
                 name="leai_institution_membership_account_institution_uniq",
@@ -172,6 +188,10 @@ class CourseMembership(models.Model):
 
     class Meta:
         constraints = [
+            models.CheckConstraint(
+                check=models.Q(role__in=["owner", "instructor", "ta"]),
+                name="leai_course_membership_role_valid",
+            ),
             models.UniqueConstraint(
                 fields=("course", "institution_membership"),
                 name="leai_course_membership_course_institution_membership_uniq",

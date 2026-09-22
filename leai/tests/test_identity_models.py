@@ -138,6 +138,127 @@ class IdentityModelTests(TestCase):
                 institution_membership=self.membership_b,
             )
 
+    def test_course_institution_rejects_bulk_update_that_breaks_membership(self):
+        CourseMembership.objects.create(
+            course=self.course_a,
+            institution_membership=self.membership_a,
+            role="owner",
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Course.objects.filter(pk=self.course_a.pk).update(
+                institution=self.institution_b,
+            )
+
+    def test_course_institution_rejects_bulk_update_that_breaks_restriction(self):
+        CourseAccessRestriction.objects.create(
+            course=self.course_a,
+            institution_membership=self.membership_a,
+            denied=True,
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Course.objects.filter(pk=self.course_a.pk).update(
+                institution=self.institution_b,
+            )
+
+    def test_membership_institution_rejects_bulk_update_that_breaks_membership(self):
+        CourseMembership.objects.create(
+            course=self.course_a,
+            institution_membership=self.membership_a,
+            role="owner",
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            InstitutionMembership.objects.filter(pk=self.membership_a.pk).update(
+                institution=self.institution_b,
+            )
+
+    def test_membership_institution_rejects_bulk_update_that_breaks_restriction(self):
+        CourseAccessRestriction.objects.create(
+            course=self.course_a,
+            institution_membership=self.membership_a,
+            denied=True,
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            InstitutionMembership.objects.filter(pk=self.membership_a.pk).update(
+                institution=self.institution_b,
+            )
+
+    def test_course_institution_allows_bulk_update_without_dependents(self):
+        course = Course.objects.create(
+            institution=self.institution_a,
+            course_code="movable-course",
+            name="Movable Course",
+        )
+
+        updated = Course.objects.filter(pk=course.pk).update(
+            institution=self.institution_b,
+        )
+
+        course.refresh_from_db()
+        self.assertEqual(updated, 1)
+        self.assertEqual(course.institution, self.institution_b)
+
+    def test_membership_institution_allows_bulk_update_without_dependents(self):
+        institution_c = Institution.objects.create(
+            slug="ucla",
+            name="UC Los Angeles",
+        )
+        membership = InstitutionMembership.objects.create(
+            account=self.account_a,
+            institution=institution_c,
+            role="instructor",
+        )
+
+        updated = InstitutionMembership.objects.filter(pk=membership.pk).update(
+            institution=self.institution_b,
+        )
+
+        membership.refresh_from_db()
+        self.assertEqual(updated, 1)
+        self.assertEqual(membership.institution, self.institution_b)
+
+    def test_platform_role_rejects_direct_invalid_value(self):
+        user = get_user_model().objects.create_user(
+            username="invalid-platform-role",
+            email="invalid-platform-role@ucsc.edu",
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            InstructorAccount.objects.create(
+                user=user,
+                email="invalid-platform-role@ucsc.edu",
+                display_name="Invalid Platform Role",
+                platform_role="invalid",
+            )
+
+    def test_institution_membership_role_rejects_direct_invalid_value(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            InstitutionMembership.objects.create(
+                account=self.account_a,
+                institution=self.institution_b,
+                role="invalid",
+            )
+
+    def test_course_lifecycle_rejects_direct_invalid_value(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Course.objects.create(
+                institution=self.institution_b,
+                course_code="invalid-lifecycle",
+                name="Invalid Lifecycle",
+                lifecycle_state="invalid",
+            )
+
+    def test_course_membership_role_rejects_direct_invalid_value(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            CourseMembership.objects.create(
+                course=self.course_a,
+                institution_membership=self.membership_a,
+                role="invalid",
+            )
+
     def test_postgresql_defaults_generate_public_ids_for_sql_inserts(self):
         user = get_user_model().objects.create_user(
             username="jiahong",
