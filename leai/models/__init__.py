@@ -7,6 +7,12 @@ from .identity import (
     InstructorAccount,
     InstructorSession,
 )
+from .authoring import (
+    QuestionSet,
+    QuestionSetDraft,
+    QuestionSetDraftVersion,
+    QuestionSetRevision,
+)
 
 __all__ = [
     "Course",
@@ -16,4 +22,8 @@ __all__ = [
     "InstitutionMembership",
     "InstructorAccount",
     "InstructorSession",
+    "QuestionSet",
+    "QuestionSetDraft",
+    "QuestionSetDraftVersion",
+    "QuestionSetRevision",
 ]
