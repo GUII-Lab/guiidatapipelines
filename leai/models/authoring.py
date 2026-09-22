@@ -251,6 +251,13 @@ class AuthoringConversation(models.Model):
                 ),
                 name="leai_authoring_conversation_origin_valid",
             ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(origin_surface="instructor_insights", source_analysis_snapshot__isnull=False)
+                    | (~models.Q(origin_surface="instructor_insights") & models.Q(source_analysis_snapshot__isnull=True))
+                ),
+                name="leai_authoring_conversation_source_shape_valid",
+            ),
         ]
 
 

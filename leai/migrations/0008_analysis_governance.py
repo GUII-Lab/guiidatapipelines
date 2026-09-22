@@ -112,7 +112,6 @@ class Migration(migrations.Migration):
                 ('model_policy_version', models.CharField(max_length=64)),
                 ('prompt_policy_version', models.CharField(max_length=64)),
                 ('source_count', models.PositiveIntegerField()),
-                ('status', models.CharField(choices=[('completed', 'Completed'), ('failed', 'Failed')], max_length=16)),
                 ('result', models.JSONField(default=dict)),
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('course', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='analysis_snapshots', to='leai.course')),
@@ -218,10 +217,6 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='analysissnapshot',
-            constraint=models.CheckConstraint(check=models.Q(('status__in', ['completed', 'failed'])), name='leai_analysis_snapshot_status_valid'),
-        ),
-        migrations.AddConstraint(
-            model_name='analysissnapshot',
             constraint=models.CheckConstraint(check=models.Q(('scope_key', ''), _negated=True), name='leai_analysis_snapshot_scope_nonempty'),
         ),
         migrations.AddConstraint(
@@ -260,6 +255,16 @@ class Migration(migrations.Migration):
             model_name='analysischatmessage',
             constraint=models.CheckConstraint(check=models.Q(models.Q(('input_method__in', ['typed', 'voice']), ('input_method__isnull', False), ('role', 'user')), models.Q(('input_method__isnull', True), ('role__in', ['assistant', 'system'])), _connector='OR'), name='leai_analysis_chat_message_input_shape_valid'),
         ),
+        migrations.AddConstraint(
+            model_name='authoringconversation',
+            constraint=models.CheckConstraint(
+                check=(
+                    models.Q(origin_surface='instructor_insights', source_analysis_snapshot__isnull=False)
+                    | (~models.Q(origin_surface='instructor_insights') & models.Q(source_analysis_snapshot__isnull=True))
+                ),
+                name='leai_authoring_conversation_source_shape_valid',
+            ),
+        ),
         migrations.RunSQL(
             sql="""
                 ALTER TABLE leai_auditevent ALTER COLUMN event_id SET DEFAULT gen_random_uuid();
@@ -288,6 +293,12 @@ class Migration(migrations.Migration):
                     FOR EACH ROW EXECUTE FUNCTION leai_reject_task6_append_only();
                 CREATE TRIGGER leai_import_record_map_append_only
                     BEFORE UPDATE OR DELETE ON leai_importrecordmap
+                    FOR EACH ROW EXECUTE FUNCTION leai_reject_task6_append_only();
+                CREATE TRIGGER leai_import_record_outcome_append_only
+                    BEFORE UPDATE OR DELETE ON leai_importrecordoutcome
+                    FOR EACH ROW EXECUTE FUNCTION leai_reject_task6_append_only();
+                CREATE TRIGGER leai_response_message_append_only
+                    BEFORE UPDATE OR DELETE ON leai_responsemessage
                     FOR EACH ROW EXECUTE FUNCTION leai_reject_task6_append_only();
 
                 CREATE FUNCTION leai_reject_task6_public_uuid_update()
@@ -331,6 +342,53 @@ class Migration(migrations.Migration):
                 CREATE TRIGGER leai_analysis_scope_same_course
                     BEFORE INSERT OR UPDATE ON leai_analysisscopeoccurrence
                     FOR EACH ROW EXECUTE FUNCTION leai_check_analysis_scope_course();
+
+                CREATE FUNCTION leai_reject_analysis_scope_after_message()
+                RETURNS trigger AS $$
+                DECLARE scope_chat_id bigint; moved_chat_id bigint;
+                BEGIN
+                    IF TG_OP = 'INSERT' THEN
+                        scope_chat_id := NEW.analysis_chat_session_id;
+                    ELSIF TG_OP = 'DELETE' THEN
+                        scope_chat_id := OLD.analysis_chat_session_id;
+                    ELSE
+                        scope_chat_id := OLD.analysis_chat_session_id;
+                        moved_chat_id := NEW.analysis_chat_session_id;
+                    END IF;
+                    PERFORM id FROM leai_analysischatsession
+                        WHERE id IN (scope_chat_id, moved_chat_id)
+                        ORDER BY id FOR UPDATE;
+                    IF EXISTS (
+                        SELECT 1 FROM leai_analysischatmessage
+                        WHERE analysis_chat_session_id = scope_chat_id
+                    ) OR (moved_chat_id IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM leai_analysischatmessage
+                        WHERE analysis_chat_session_id = moved_chat_id
+                    )) THEN
+                        RAISE EXCEPTION 'Analysis scope is frozen after first message'
+                            USING ERRCODE = '23514';
+                    END IF;
+                    IF TG_OP = 'DELETE' THEN
+                        RETURN OLD;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER leai_analysis_scope_frozen_after_message
+                    BEFORE INSERT OR UPDATE OR DELETE ON leai_analysisscopeoccurrence
+                    FOR EACH ROW EXECUTE FUNCTION leai_reject_analysis_scope_after_message();
+
+                CREATE FUNCTION leai_lock_analysis_chat_for_message_insert()
+                RETURNS trigger AS $$
+                BEGIN
+                    PERFORM 1 FROM leai_analysischatsession
+                        WHERE id = NEW.analysis_chat_session_id FOR UPDATE;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER leai_analysis_message_lock_parent
+                    BEFORE INSERT ON leai_analysischatmessage
+                    FOR EACH ROW EXECUTE FUNCTION leai_lock_analysis_chat_for_message_insert();
 
                 CREATE FUNCTION leai_check_analysis_citation_course()
                 RETURNS trigger AS $$
@@ -397,6 +455,26 @@ class Migration(migrations.Migration):
                     ON leai_authoringconversation
                     FOR EACH ROW EXECUTE FUNCTION leai_check_authoring_snapshot_course();
 
+                CREATE FUNCTION leai_reject_authoring_conversation_identity_update()
+                RETURNS trigger AS $$
+                BEGIN
+                    IF (NEW.created_by_id, NEW.question_set_id,
+                        NEW.source_analysis_snapshot_id, NEW.origin_surface)
+                       IS DISTINCT FROM
+                       (OLD.created_by_id, OLD.question_set_id,
+                        OLD.source_analysis_snapshot_id, OLD.origin_surface) THEN
+                        RAISE EXCEPTION 'Authoring Conversation creation provenance is immutable'
+                            USING ERRCODE = '23514';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER leai_authoring_conversation_identity_immutable
+                    BEFORE UPDATE OF created_by_id, question_set_id,
+                        source_analysis_snapshot_id, origin_surface
+                    ON leai_authoringconversation
+                    FOR EACH ROW EXECUTE FUNCTION leai_reject_authoring_conversation_identity_update();
+
                 CREATE FUNCTION leai_reject_analysis_chat_owner_update()
                 RETURNS trigger AS $$
                 BEGIN
@@ -427,24 +505,6 @@ class Migration(migrations.Migration):
                     BEFORE UPDATE OF analysis_chat_session_id ON leai_analysischatmessage
                     FOR EACH ROW EXECUTE FUNCTION leai_reject_analysis_message_parent_update();
 
-                CREATE FUNCTION leai_guard_cited_response_parent()
-                RETURNS trigger AS $$
-                BEGIN
-                    IF NEW.response_session_id IS DISTINCT FROM OLD.response_session_id
-                       AND EXISTS (
-                           SELECT 1 FROM leai_analysiscitation
-                           WHERE response_message_id = OLD.id
-                       ) THEN
-                        RAISE EXCEPTION 'Cited response message parent is immutable'
-                            USING ERRCODE = '23514';
-                    END IF;
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql;
-                CREATE TRIGGER leai_cited_response_parent_immutable
-                    BEFORE UPDATE OF response_session_id ON leai_responsemessage
-                    FOR EACH ROW EXECUTE FUNCTION leai_guard_cited_response_parent();
-
                 CREATE FUNCTION leai_guard_sourced_question_set_course()
                 RETURNS trigger AS $$
                 BEGIN
@@ -466,33 +526,44 @@ class Migration(migrations.Migration):
 
                 CREATE FUNCTION leai_check_import_record_provenance()
                 RETURNS trigger AS $$
-                DECLARE run_source text; run_target text; map_source text;
+                DECLARE run_source text; run_target text; run_type text; map_source text;
                         map_target text; map_model text; map_key text;
                 BEGIN
                     IF TG_TABLE_NAME = 'leai_importrecordmap' THEN
-                        SELECT source_environment, target_environment
-                            INTO run_source, run_target FROM leai_importrun
-                            WHERE id = NEW.first_import_run_id;
+                        SELECT source_environment, target_environment, import_run.run_kind
+                            INTO run_source, run_target, run_type
+                            FROM leai_importrun AS import_run
+                            WHERE import_run.id = NEW.first_import_run_id;
                         IF run_source IS NULL OR run_target IS NULL
+                           OR run_type <> 'execute'
                            OR NEW.source_environment <> run_source
                            OR NEW.target_environment <> run_target THEN
-                            RAISE EXCEPTION 'Import map environments must match first run'
+                            RAISE EXCEPTION 'Import map requires a matching execute run'
                                 USING ERRCODE = '23514';
                         END IF;
-                    ELSIF NEW.import_record_map_id IS NOT NULL THEN
-                        SELECT source_environment, target_environment,
-                               source_model, source_key
-                            INTO map_source, map_target, map_model, map_key
-                            FROM leai_importrecordmap
-                            WHERE id = NEW.import_record_map_id;
-                        SELECT source_environment, target_environment
-                            INTO run_source, run_target FROM leai_importrun
-                            WHERE id = NEW.import_run_id;
-                        IF map_source IS NULL OR run_source IS NULL
-                           OR map_source <> run_source OR map_target <> run_target
-                           OR map_model <> NEW.source_model OR map_key <> NEW.source_key THEN
-                            RAISE EXCEPTION 'Import outcome must reference its exact source map'
+                    ELSE
+                        SELECT source_environment, target_environment, import_run.run_kind
+                            INTO run_source, run_target, run_type
+                            FROM leai_importrun AS import_run
+                            WHERE import_run.id = NEW.import_run_id;
+                        IF run_source IS NULL OR
+                           (run_type = 'execute' AND NEW.disposition IN ('mapped', 'reused')
+                            AND NEW.import_record_map_id IS NULL) THEN
+                            RAISE EXCEPTION 'Execute mapping outcome requires a durable map'
                                 USING ERRCODE = '23514';
+                        END IF;
+                        IF NEW.import_record_map_id IS NOT NULL THEN
+                            SELECT source_environment, target_environment,
+                                   source_model, source_key
+                                INTO map_source, map_target, map_model, map_key
+                                FROM leai_importrecordmap
+                                WHERE id = NEW.import_record_map_id;
+                            IF map_source IS NULL
+                               OR map_source <> run_source OR map_target <> run_target
+                               OR map_model <> NEW.source_model OR map_key <> NEW.source_key THEN
+                                RAISE EXCEPTION 'Import outcome must reference its exact source map'
+                                    USING ERRCODE = '23514';
+                            END IF;
                         END IF;
                     END IF;
                     RETURN NEW;
@@ -502,7 +573,7 @@ class Migration(migrations.Migration):
                     BEFORE INSERT ON leai_importrecordmap
                     FOR EACH ROW EXECUTE FUNCTION leai_check_import_record_provenance();
                 CREATE TRIGGER leai_import_outcome_map_scope
-                    BEFORE INSERT OR UPDATE ON leai_importrecordoutcome
+                    BEFORE INSERT ON leai_importrecordoutcome
                     FOR EACH ROW EXECUTE FUNCTION leai_check_import_record_provenance();
 
                 CREATE FUNCTION leai_reject_import_run_identity_update()
@@ -535,22 +606,28 @@ class Migration(migrations.Migration):
                 DROP FUNCTION IF EXISTS leai_check_import_record_provenance();
                 DROP TRIGGER IF EXISTS leai_sourced_question_set_course_immutable ON leai_questionset;
                 DROP FUNCTION IF EXISTS leai_guard_sourced_question_set_course();
-                DROP TRIGGER IF EXISTS leai_cited_response_parent_immutable ON leai_responsemessage;
-                DROP FUNCTION IF EXISTS leai_guard_cited_response_parent();
+                DROP TRIGGER IF EXISTS leai_response_message_append_only ON leai_responsemessage;
                 DROP TRIGGER IF EXISTS leai_analysis_message_parent_immutable ON leai_analysischatmessage;
                 DROP FUNCTION IF EXISTS leai_reject_analysis_message_parent_update();
                 DROP TRIGGER IF EXISTS leai_analysis_chat_owner_immutable ON leai_analysischatsession;
                 DROP FUNCTION IF EXISTS leai_reject_analysis_chat_owner_update();
+                DROP TRIGGER IF EXISTS leai_authoring_conversation_identity_immutable ON leai_authoringconversation;
+                DROP FUNCTION IF EXISTS leai_reject_authoring_conversation_identity_update();
                 DROP TRIGGER IF EXISTS leai_authoring_source_snapshot_same_course ON leai_authoringconversation;
                 DROP FUNCTION IF EXISTS leai_check_authoring_snapshot_course();
                 DROP TRIGGER IF EXISTS leai_analysis_citation_same_course ON leai_analysiscitation;
                 DROP FUNCTION IF EXISTS leai_check_analysis_citation_course();
                 DROP TRIGGER IF EXISTS leai_analysis_scope_same_course ON leai_analysisscopeoccurrence;
                 DROP FUNCTION IF EXISTS leai_check_analysis_scope_course();
+                DROP TRIGGER IF EXISTS leai_analysis_scope_frozen_after_message ON leai_analysisscopeoccurrence;
+                DROP FUNCTION IF EXISTS leai_reject_analysis_scope_after_message();
+                DROP TRIGGER IF EXISTS leai_analysis_message_lock_parent ON leai_analysischatmessage;
+                DROP FUNCTION IF EXISTS leai_lock_analysis_chat_for_message_insert();
                 DROP TRIGGER IF EXISTS leai_importrun_uuid_immutable ON leai_importrun;
                 DROP TRIGGER IF EXISTS leai_auditevent_uuid_immutable ON leai_auditevent;
                 DROP FUNCTION IF EXISTS leai_reject_task6_public_uuid_update();
                 DROP TRIGGER IF EXISTS leai_import_record_map_append_only ON leai_importrecordmap;
+                DROP TRIGGER IF EXISTS leai_import_record_outcome_append_only ON leai_importrecordoutcome;
                 DROP TRIGGER IF EXISTS leai_audit_event_append_only ON leai_auditevent;
                 DROP TRIGGER IF EXISTS leai_analysis_citation_append_only ON leai_analysiscitation;
                 DROP TRIGGER IF EXISTS leai_analysis_snapshot_append_only ON leai_analysissnapshot;

@@ -13,8 +13,6 @@ ANALYSIS_ORIGIN = (
 
 
 class AnalysisSnapshot(models.Model):
-    STATUSES = (("completed", "Completed"), ("failed", "Failed"))
-
     id = models.BigAutoField(primary_key=True)
     course = models.ForeignKey(Course, on_delete=models.PROTECT, related_name="analysis_snapshots")
     scope_key = models.CharField(max_length=255)
@@ -23,7 +21,6 @@ class AnalysisSnapshot(models.Model):
     model_policy_version = models.CharField(max_length=64)
     prompt_policy_version = models.CharField(max_length=64)
     source_count = models.PositiveIntegerField()
-    status = models.CharField(max_length=16, choices=STATUSES)
     result = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -33,7 +30,6 @@ class AnalysisSnapshot(models.Model):
                 fields=("course", "scope_key", "algorithm_version", "response_cutoff_version", "model_policy_version", "prompt_policy_version"),
                 name="leai_analysis_snapshot_generation_uniq",
             ),
-            models.CheckConstraint(check=models.Q(status__in=["completed", "failed"]), name="leai_analysis_snapshot_status_valid"),
             models.CheckConstraint(check=~models.Q(scope_key=""), name="leai_analysis_snapshot_scope_nonempty"),
         ]
 
