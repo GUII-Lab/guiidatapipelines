@@ -28,12 +28,13 @@ from leai.models import (
 )
 
 
-def assert_trigger_rejection(test_case, write, message=None):
+def assert_trigger_rejection(test_case, write, message=None, sqlstate=None):
     with test_case.assertRaises(IntegrityError) as raised, transaction.atomic():
         write()
-    if message:
+    if message or sqlstate:
         cause = raised.exception.__cause__
-        test_case.assertEqual(cause.pgcode, "23514")
+        test_case.assertEqual(cause.pgcode, sqlstate or "23514")
+    if message:
         test_case.assertEqual(cause.diag.message_primary, message)
 
 
@@ -219,6 +220,13 @@ class PublicationModelTests(TestCase):
             ),
             "Authoring Run base draft version must belong to its Conversation Question Set",
         )
+        assert_trigger_rejection(
+            self,
+            lambda: AuthoringConversation.objects.filter(pk=conversation.pk).update(
+                question_set=self.make_question_set(),
+            ),
+            "Authoring Conversation question_set must match dependent Run base draft versions",
+        )
         for values in (
             {"status": "invalid", "source_provenance_snapshot": {"source": "builder"}},
             {"status": "pending", "source_provenance_snapshot": []},
@@ -254,9 +262,10 @@ class PublicationModelTests(TestCase):
             template=private_template,
             source_question_set_revision=self.make_revision(),
         )
+        institution_source_revision = self.make_revision()
         self.make_template_revision(
             template=institution_template,
-            source_question_set_revision=self.make_revision(),
+            source_question_set_revision=institution_source_revision,
         )
 
         assert_trigger_rejection(
@@ -301,6 +310,13 @@ class PublicationModelTests(TestCase):
                 owner_account=self.make_account("replacement-owner"),
             ),
             "Template source revision must match its owner scope",
+        )
+        assert_trigger_rejection(
+            self,
+            lambda: Course.objects.filter(
+                pk=institution_source_revision.question_set.course_id,
+            ).update(institution=other_institution),
+            "Course institution must match dependent institution template revisions",
         )
         assert_trigger_rejection(
             self,
@@ -436,11 +452,19 @@ class PublicationModelTests(TestCase):
             label="Week 1 revised",
             settings_version=2,
             completion_certificate_enabled=True,
+            completed_response_download_enabled=True,
+            opens_at=timezone.now(),
+            closes_at=timezone.now() + timedelta(days=7),
+            manually_closed_at=timezone.now() + timedelta(days=1),
         )
         occurrence.refresh_from_db()
         self.assertEqual(occurrence.label, "Week 1 revised")
         self.assertEqual(occurrence.settings_version, 2)
         self.assertTrue(occurrence.completion_certificate_enabled)
+        self.assertTrue(occurrence.completed_response_download_enabled)
+        self.assertIsNotNone(occurrence.opens_at)
+        self.assertIsNotNone(occurrence.closes_at)
+        self.assertIsNotNone(occurrence.manually_closed_at)
 
     def test_externally_addressed_rows_get_database_uuid_defaults_on_direct_write(self):
         revision = self.make_revision()
@@ -501,6 +525,20 @@ class PublicationModelTests(TestCase):
         self.assertIsNotNone(template_revision_public_id)
         self.assertIsNotNone(preview_public_id)
         self.assertIsNotNone(occurrence_public_id)
+        for model, public_id in (
+            (QuestionSetTemplate, template_public_id),
+            (QuestionSetTemplateRevision, template_revision_public_id),
+            (PreviewSession, preview_public_id),
+            (SurveyOccurrence, occurrence_public_id),
+        ):
+            with self.subTest(model=model.__name__):
+                assert_trigger_rejection(
+                    self,
+                    lambda model=model, public_id=public_id: model.objects.filter(
+                        public_id=public_id,
+                    ).update(public_id="33333333-3333-4333-8333-333333333333"),
+                    sqlstate="23514",
+                )
 
 
 class PublicationConcurrencyTests(TransactionTestCase):
@@ -555,6 +593,233 @@ class PublicationConcurrencyTests(TransactionTestCase):
             compiler_version="1.0.0",
             engine_version="1.0.0",
             created_by=self.account,
+        )
+
+    def make_question_set(self, title):
+        return QuestionSet.objects.create(
+            course=self.course,
+            owner=self.account,
+            title=title,
+            audience="individual",
+            collection_style="guided",
+        )
+
+    def assert_parent_first_child_write_stays_consistent(
+        self,
+        *,
+        parent_write,
+        child_write,
+        child_message,
+    ):
+        parent_ready = threading.Event()
+        release_parent = threading.Event()
+        child_started = threading.Event()
+        child_finished = threading.Event()
+        outcomes = queue.Queue()
+
+        def parent():
+            try:
+                close_old_connections()
+                with transaction.atomic():
+                    parent_write()
+                    parent_ready.set()
+                    if not release_parent.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("parent was not released")
+                outcomes.put(("parent", "committed"))
+            except Exception as error:
+                outcomes.put(("parent", "error", repr(error)))
+            finally:
+                close_old_connections()
+
+        def child():
+            try:
+                close_old_connections()
+                if not parent_ready.wait(self.thread_timeout_seconds):
+                    raise RuntimeError("parent mutation did not begin")
+                with transaction.atomic():
+                    child_started.set()
+                    child_write()
+                outcomes.put(("child", "committed"))
+            except IntegrityError as error:
+                cause = error.__cause__
+                outcomes.put(("child", "integrity", cause.pgcode, cause.diag.message_primary))
+            except Exception as error:
+                outcomes.put(("child", "error", repr(error)))
+            finally:
+                child_finished.set()
+                close_old_connections()
+
+        parent_thread = threading.Thread(target=parent)
+        child_thread = threading.Thread(target=child)
+        parent_thread.start()
+        self.assertTrue(parent_ready.wait(self.thread_timeout_seconds))
+        child_thread.start()
+        self.assertTrue(child_started.wait(self.thread_timeout_seconds))
+        self.assertFalse(child_finished.wait(0.1), "child did not block on the mutated parent")
+        release_parent.set()
+        parent_thread.join(self.thread_timeout_seconds)
+        child_thread.join(self.thread_timeout_seconds)
+
+        self.assertFalse(parent_thread.is_alive())
+        self.assertFalse(child_thread.is_alive())
+        results = {result[0]: result[1:] for result in (outcomes.get(), outcomes.get())}
+        self.assertEqual(results["parent"], ("committed",), results)
+        self.assertEqual(results["child"], ("integrity", "23514", child_message), results)
+
+    def assert_child_first_parent_mutation_rejects(
+        self,
+        *,
+        child_write,
+        parent_write,
+        parent_message,
+    ):
+        child_written = threading.Event()
+        release_child = threading.Event()
+        parent_started = threading.Event()
+        parent_finished = threading.Event()
+        outcomes = queue.Queue()
+
+        def child():
+            try:
+                close_old_connections()
+                with transaction.atomic():
+                    child_write()
+                    child_written.set()
+                    if not release_child.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("child was not released")
+                outcomes.put(("child", "committed"))
+            except Exception as error:
+                outcomes.put(("child", "error", repr(error)))
+            finally:
+                close_old_connections()
+
+        def parent():
+            try:
+                close_old_connections()
+                if not child_written.wait(self.thread_timeout_seconds):
+                    raise RuntimeError("child did not write")
+                with transaction.atomic():
+                    parent_started.set()
+                    parent_write()
+                outcomes.put(("parent", "committed"))
+            except IntegrityError as error:
+                cause = error.__cause__
+                outcomes.put(("parent", "integrity", cause.pgcode, cause.diag.message_primary))
+            except Exception as error:
+                outcomes.put(("parent", "error", repr(error)))
+            finally:
+                parent_finished.set()
+                close_old_connections()
+
+        child_thread = threading.Thread(target=child)
+        parent_thread = threading.Thread(target=parent)
+        child_thread.start()
+        self.assertTrue(child_written.wait(self.thread_timeout_seconds))
+        parent_thread.start()
+        self.assertTrue(parent_started.wait(self.thread_timeout_seconds))
+        self.assertFalse(parent_finished.wait(0.1), "parent did not block on child lineage")
+        release_child.set()
+        child_thread.join(self.thread_timeout_seconds)
+        parent_thread.join(self.thread_timeout_seconds)
+
+        self.assertFalse(child_thread.is_alive())
+        self.assertFalse(parent_thread.is_alive())
+        results = {result[0]: result[1:] for result in (outcomes.get(), outcomes.get())}
+        self.assertEqual(results["child"], ("committed",), results)
+        self.assertEqual(results["parent"], ("integrity", "23514", parent_message), results)
+
+    def test_parent_first_conversation_move_rejects_later_run_with_old_question_set(self):
+        revision = self.make_revision()
+        conversation = AuthoringConversation.objects.create(
+            question_set=revision.question_set,
+            origin_surface="builder",
+            created_by=self.account,
+        )
+        other_question_set = self.make_question_set("Moved conversation questions")
+        self.assert_parent_first_child_write_stays_consistent(
+            parent_write=lambda: AuthoringConversation.objects.filter(pk=conversation.pk).update(
+                question_set=other_question_set,
+            ),
+            child_write=lambda: AuthoringRun.objects.create(
+                conversation=conversation,
+                base_draft_version=revision.source_draft_version,
+                requested_by=self.account,
+                status="pending",
+                source_provenance_snapshot={"source": "builder"},
+            ),
+            child_message="Authoring Run base draft version must belong to its Conversation Question Set",
+        )
+
+    def test_child_first_run_rejects_later_conversation_move(self):
+        revision = self.make_revision()
+        conversation = AuthoringConversation.objects.create(
+            question_set=revision.question_set,
+            origin_surface="builder",
+            created_by=self.account,
+        )
+        other_question_set = self.make_question_set("Moved conversation questions")
+        self.assert_child_first_parent_mutation_rejects(
+            child_write=lambda: AuthoringRun.objects.create(
+                conversation=conversation,
+                base_draft_version=revision.source_draft_version,
+                requested_by=self.account,
+                status="pending",
+                source_provenance_snapshot={"source": "builder"},
+            ),
+            parent_write=lambda: AuthoringConversation.objects.filter(pk=conversation.pk).update(
+                question_set=other_question_set,
+            ),
+            parent_message="Authoring Conversation question_set must match dependent Run base draft versions",
+        )
+
+    def test_parent_first_course_move_rejects_later_institution_template_source(self):
+        revision = self.make_revision()
+        template = QuestionSetTemplate.objects.create(
+            title="Institution template",
+            owner_institution=self.institution,
+        )
+        other_institution = Institution.objects.create(
+            slug="publication-concurrency-other-institution-parent-first",
+            name="Publication Concurrency Other Institution Parent First",
+        )
+        self.assert_parent_first_child_write_stays_consistent(
+            parent_write=lambda: Course.objects.filter(pk=self.course.pk).update(
+                institution=other_institution,
+            ),
+            child_write=lambda: QuestionSetTemplateRevision.objects.create(
+                template=template,
+                revision_number=1,
+                source_question_set_revision=revision,
+                content_hash="b" * 64,
+                canonical_body={},
+                created_by=self.account,
+            ),
+            child_message="Template source revision must match its owner scope",
+        )
+
+    def test_child_first_institution_template_source_rejects_later_course_move(self):
+        revision = self.make_revision()
+        template = QuestionSetTemplate.objects.create(
+            title="Institution template",
+            owner_institution=self.institution,
+        )
+        other_institution = Institution.objects.create(
+            slug="publication-concurrency-other-institution-child-first",
+            name="Publication Concurrency Other Institution Child First",
+        )
+        self.assert_child_first_parent_mutation_rejects(
+            child_write=lambda: QuestionSetTemplateRevision.objects.create(
+                template=template,
+                revision_number=1,
+                source_question_set_revision=revision,
+                content_hash="b" * 64,
+                canonical_body={},
+                created_by=self.account,
+            ),
+            parent_write=lambda: Course.objects.filter(pk=self.course.pk).update(
+                institution=other_institution,
+            ),
+            parent_message="Course institution must match dependent institution template revisions",
         )
 
     def test_occurrence_write_blocks_on_referenced_revision(self):

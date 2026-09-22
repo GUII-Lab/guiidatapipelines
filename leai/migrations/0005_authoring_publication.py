@@ -338,6 +338,33 @@ class Migration(migrations.Migration):
                 ON leai_authoringrun
                 FOR EACH ROW EXECUTE FUNCTION leai_enforce_authoring_run_base_draft_version();
 
+                CREATE FUNCTION leai_enforce_conversation_question_set_update()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    run_question_set_id bigint;
+                BEGIN
+                    FOR run_question_set_id IN
+                        SELECT draft.question_set_id
+                        FROM leai_authoringrun AS authoring_run
+                        JOIN leai_questionsetdraftversion AS source_version
+                          ON source_version.id = authoring_run.base_draft_version_id
+                        JOIN leai_questionsetdraft AS draft ON draft.id = source_version.draft_id
+                        WHERE authoring_run.conversation_id = NEW.id
+                    LOOP
+                        IF NEW.question_set_id <> run_question_set_id THEN
+                            RAISE EXCEPTION USING
+                                ERRCODE = '23514',
+                                MESSAGE = 'Authoring Conversation question_set must match dependent Run base draft versions';
+                        END IF;
+                    END LOOP;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                CREATE TRIGGER leai_authoringconversation_question_set_lineage_valid
+                BEFORE UPDATE OF question_set_id ON leai_authoringconversation
+                FOR EACH ROW EXECUTE FUNCTION leai_enforce_conversation_question_set_update();
+
                 CREATE FUNCTION leai_enforce_template_source_revision()
                 RETURNS TRIGGER AS $$
                 DECLARE
@@ -424,6 +451,37 @@ class Migration(migrations.Migration):
                 ON leai_questionsettemplate
                 FOR EACH ROW EXECUTE FUNCTION leai_enforce_template_owner_scope_update();
 
+                CREATE FUNCTION leai_enforce_course_institution_template_lineage()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    template_institution_id bigint;
+                BEGIN
+                    FOR template_institution_id IN
+                        SELECT template.owner_institution_id
+                        FROM leai_questionsettemplaterevision AS template_revision
+                        JOIN leai_questionsettemplate AS template
+                          ON template.id = template_revision.template_id
+                        JOIN leai_questionsetrevision AS source_revision
+                          ON source_revision.id = template_revision.source_question_set_revision_id
+                        JOIN leai_questionset AS question_set
+                          ON question_set.id = source_revision.question_set_id
+                        WHERE question_set.course_id = NEW.id
+                          AND template.owner_institution_id IS NOT NULL
+                    LOOP
+                        IF NEW.institution_id <> template_institution_id THEN
+                            RAISE EXCEPTION USING
+                                ERRCODE = '23514',
+                                MESSAGE = 'Course institution must match dependent institution template revisions';
+                        END IF;
+                    END LOOP;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                CREATE TRIGGER leai_course_institution_template_lineage_valid
+                BEFORE UPDATE OF institution_id ON leai_course
+                FOR EACH ROW EXECUTE FUNCTION leai_enforce_course_institution_template_lineage();
+
                 CREATE FUNCTION leai_enforce_survey_occurrence_course()
                 RETURNS TRIGGER AS $$
                 DECLARE
@@ -466,6 +524,10 @@ class Migration(migrations.Migration):
                     ON leai_questionsettemplaterevision;
                 DROP FUNCTION IF EXISTS leai_enforce_template_source_revision();
 
+                DROP TRIGGER IF EXISTS leai_course_institution_template_lineage_valid
+                    ON leai_course;
+                DROP FUNCTION IF EXISTS leai_enforce_course_institution_template_lineage();
+
                 DROP TRIGGER IF EXISTS leai_questionsettemplate_owner_scope_lineage_valid
                     ON leai_questionsettemplate;
                 DROP FUNCTION IF EXISTS leai_enforce_template_owner_scope_update();
@@ -473,6 +535,10 @@ class Migration(migrations.Migration):
                 DROP TRIGGER IF EXISTS leai_authoringrun_base_draft_version_same_question_set
                     ON leai_authoringrun;
                 DROP FUNCTION IF EXISTS leai_enforce_authoring_run_base_draft_version();
+
+                DROP TRIGGER IF EXISTS leai_authoringconversation_question_set_lineage_valid
+                    ON leai_authoringconversation;
+                DROP FUNCTION IF EXISTS leai_enforce_conversation_question_set_update();
 
                 DROP TRIGGER IF EXISTS leai_a_surveyoccurrence_identity_immutable
                     ON leai_surveyoccurrence;
