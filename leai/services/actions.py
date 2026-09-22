@@ -2,6 +2,8 @@
 
 from collections import defaultdict
 
+from django.db.models import Q
+
 from leai.models import Course, CourseAccessRestriction, CourseMembership, InstitutionMembership
 
 
@@ -78,7 +80,25 @@ def accessible_course_rows(account, *, course_id=None):
     if course_id is not None:
         courses = courses.filter(public_id=course_id)
     if account.platform_role == "platform_admin":
-        return [(course, ACTIONS, "platform_admin") for course in courses.order_by("name", "id")]
+        courses = list(courses.order_by("name", "id"))
+        explicit = defaultdict(set)
+        for course_pk, role in CourseMembership.objects.filter(
+            course_id__in=[course.pk for course in courses],
+            institution_membership__account=account,
+            institution_membership__is_active=True,
+        ).values_list("course_id", "role"):
+            explicit[course_pk].add(role)
+        return [
+            (
+                course,
+                ACTIONS,
+                next(
+                    (role for role in ("owner", "instructor", "ta") if role in explicit[course.pk]),
+                    "platform_admin",
+                ),
+            )
+            for course in courses
+        ]
 
     memberships = list(
         InstitutionMembership.objects.filter(account=account, is_active=True).values(
@@ -87,15 +107,34 @@ def accessible_course_rows(account, *, course_id=None):
     )
     if not memberships:
         return []
-    courses = list(
-        courses.filter(institution_id__in={row["institution_id"] for row in memberships})
-        .order_by("name", "id")
-    )
+    membership_ids = [row["id"] for row in memberships]
+    explicit_course_ids = CourseMembership.objects.filter(
+        institution_membership_id__in=membership_ids,
+    ).values("course_id")
+    researchers = {
+        row["institution_id"]: row["id"]
+        for row in memberships
+        if row["role"] == "researcher"
+    }
+    if researchers:
+        restricted_course_ids = CourseAccessRestriction.objects.filter(
+            institution_membership_id__in=researchers.values(),
+            denied=True,
+        ).values("course_id")
+        courses = courses.filter(
+            Q(pk__in=explicit_course_ids)
+            | (
+                Q(institution_id__in=researchers)
+                & ~Q(pk__in=restricted_course_ids)
+            )
+        )
+    else:
+        courses = courses.filter(pk__in=explicit_course_ids)
+    courses = list(courses.order_by("name", "id"))
     if not courses:
         return []
 
     course_ids = [course.pk for course in courses]
-    membership_ids = [row["id"] for row in memberships]
     roles_by_course = defaultdict(set)
     for course_pk, role in CourseMembership.objects.filter(
         course_id__in=course_ids,
@@ -103,11 +142,6 @@ def accessible_course_rows(account, *, course_id=None):
     ).values_list("course_id", "role"):
         roles_by_course[course_pk].add(role)
 
-    researchers = {
-        row["institution_id"]: row["id"]
-        for row in memberships
-        if row["role"] == "researcher"
-    }
     restrictions = set(
         CourseAccessRestriction.objects.filter(
             course_id__in=course_ids,

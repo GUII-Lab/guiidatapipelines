@@ -77,13 +77,28 @@ class InstructorCourseApiTests(TestCase):
         self.assertEqual(course["role"], "owner")
 
     def test_inaccessible_course_detail_is_nondisclosing_not_found(self):
+        unassigned_same_institution = Course.objects.create(
+            institution=self.ucsc, course_code="unassigned", name="Unassigned"
+        )
         allowed = self.get(f"instructor_courses/{self.own_course.public_id}/")
         denied = self.get(f"instructor_courses/{self.other_course.public_id}/")
+        same_institution_denied = self.get(
+            f"instructor_courses/{unassigned_same_institution.public_id}/"
+        )
         unknown = self.get("instructor_courses/11111111-1111-4111-8111-111111111111/")
         self.assertEqual(allowed.status_code, 200)
         self.assertEqual(denied.status_code, 404)
+        self.assertEqual(same_institution_denied.status_code, 404)
         self.assertEqual(unknown.status_code, 404)
         self.assertEqual(denied.json(), unknown.json())
+
+    def test_platform_admin_keeps_explicit_course_attribution(self):
+        self.account.platform_role = "platform_admin"
+        self.account.save(update_fields=["platform_role"])
+        response = self.get("instructor_courses/")
+        rows = {row["course_name"]: row for row in response.json()["courses"]}
+        self.assertEqual(rows["Winter"]["role"], "owner")
+        self.assertEqual(rows["Spring"]["role"], "platform_admin")
 
     def test_forced_password_change_blocks_course_list_but_not_me(self):
         self.account.must_change_password = True
