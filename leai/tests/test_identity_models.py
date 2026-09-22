@@ -1,6 +1,16 @@
+import queue
+import threading
+
 from django.contrib.auth import get_user_model
-from django.db import IntegrityError, connection, transaction
-from django.test import TestCase
+from django.db import (
+    DatabaseError,
+    IntegrityError,
+    close_old_connections,
+    connection,
+    connections,
+    transaction,
+)
+from django.test import TestCase, TransactionTestCase
 
 from leai.models import (
     Course,
@@ -364,3 +374,231 @@ class IdentityModelTests(TestCase):
                 banner_split_mode="count",
                 banner_split_value=0,
             )
+
+
+class IdentityConcurrencyTests(TransactionTestCase):
+    thread_timeout_seconds = 5
+
+    def setUp(self):
+        self.institution_a = Institution.objects.create(
+            slug="ucsc-concurrency",
+            name="UC Santa Cruz Concurrency",
+        )
+        self.institution_b = Institution.objects.create(
+            slug="ucd-concurrency",
+            name="UC Davis Concurrency",
+        )
+        self.account_a = InstructorAccount.objects.create(
+            user=get_user_model().objects.create_user(
+                username="mimi-concurrency",
+                email="mimi-concurrency@ucsc.edu",
+            ),
+            email="mimi-concurrency@ucsc.edu",
+            display_name="Mimi Concurrency",
+        )
+        self.account_b = InstructorAccount.objects.create(
+            user=get_user_model().objects.create_user(
+                username="ulia-concurrency",
+                email="ulia-concurrency@ucd.edu",
+            ),
+            email="ulia-concurrency@ucd.edu",
+            display_name="Ulia Concurrency",
+        )
+        self.membership_a = InstitutionMembership.objects.create(
+            account=self.account_a,
+            institution=self.institution_a,
+            role="instructor",
+        )
+        self.membership_b = InstitutionMembership.objects.create(
+            account=self.account_b,
+            institution=self.institution_b,
+            role="researcher",
+        )
+
+    def _assert_parent_update_rejects_racing_child_create(self, child_kind):
+        course = Course.objects.create(
+            institution=self.institution_a,
+            course_code=f"race-{child_kind}",
+            name=f"Race {child_kind}",
+        )
+        parent_updated = threading.Event()
+        child_attempted = threading.Event()
+        child_write_completed = threading.Event()
+        allow_parent_commit = threading.Event()
+        allow_child_commit = threading.Event()
+        outcomes = queue.Queue()
+
+        def parent_update():
+            database_pid = None
+            try:
+                close_old_connections()
+                database = connections["default"]
+                database.ensure_connection()
+                database_pid = database.connection.get_backend_pid()
+                with transaction.atomic():
+                    Course.objects.filter(pk=course.pk).update(
+                        institution=self.institution_b,
+                    )
+                    parent_updated.set()
+                    if not allow_parent_commit.wait(self.thread_timeout_seconds * 2):
+                        raise RuntimeError("test did not release the parent transaction")
+                outcomes.put(("parent", "committed", database_pid))
+            except Exception as error:
+                outcomes.put(("parent", "error", database_pid, repr(error)))
+            finally:
+                close_old_connections()
+
+        def child_create():
+            database_pid = None
+            try:
+                close_old_connections()
+                database = connections["default"]
+                database.ensure_connection()
+                database_pid = database.connection.get_backend_pid()
+                with transaction.atomic():
+                    if not parent_updated.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("parent did not update its institution")
+                    child_attempted.set()
+                    if child_kind == "membership":
+                        CourseMembership.objects.create(
+                            course=course,
+                            institution_membership=self.membership_a,
+                            role="owner",
+                        )
+                    else:
+                        CourseAccessRestriction.objects.create(
+                            course=course,
+                            institution_membership=self.membership_a,
+                            denied=True,
+                        )
+                    child_write_completed.set()
+                    if not allow_child_commit.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("test did not release the child transaction")
+                outcomes.put(("child", "committed", database_pid))
+            except DatabaseError:
+                outcomes.put(("child", "rejected", database_pid))
+            except Exception as error:
+                outcomes.put(("child", "error", database_pid, repr(error)))
+            finally:
+                close_old_connections()
+
+        parent_thread = threading.Thread(target=parent_update)
+        child_thread = threading.Thread(target=child_create)
+        parent_thread.start()
+        child_thread.start()
+        self.assertTrue(
+            child_attempted.wait(self.thread_timeout_seconds),
+            "child did not attempt its write",
+        )
+        if child_write_completed.wait(self.thread_timeout_seconds):
+            allow_child_commit.set()
+        allow_parent_commit.set()
+        allow_child_commit.set()
+        parent_thread.join(self.thread_timeout_seconds)
+        child_thread.join(self.thread_timeout_seconds)
+
+        self.assertFalse(parent_thread.is_alive(), "parent thread did not finish")
+        self.assertFalse(child_thread.is_alive(), "child thread did not finish")
+        results = {
+            outcome[0]: outcome[1:]
+            for outcome in [
+                outcomes.get(timeout=self.thread_timeout_seconds),
+                outcomes.get(timeout=self.thread_timeout_seconds),
+            ]
+        }
+        self.assertEqual(results["parent"][0], "committed", results)
+        self.assertEqual(results["child"][0], "rejected", results)
+        self.assertNotEqual(results["parent"][1], results["child"][1])
+        self.assertFalse(
+            (
+                CourseMembership.objects.filter(
+                    course=course,
+                    institution_membership=self.membership_a,
+                ).exists()
+                if child_kind == "membership"
+                else CourseAccessRestriction.objects.filter(
+                    course=course,
+                    institution_membership=self.membership_a,
+                ).exists()
+            )
+        )
+
+    def test_parent_update_racing_course_membership_create_cannot_commit_mismatch(self):
+        self._assert_parent_update_rejects_racing_child_create("membership")
+
+    def test_parent_update_racing_restriction_create_cannot_commit_mismatch(self):
+        self._assert_parent_update_rejects_racing_child_create("restriction")
+
+    def test_nonconflicting_child_create_commits_while_parent_update_is_open(self):
+        course_to_update = Course.objects.create(
+            institution=self.institution_a,
+            course_code="race-parent",
+            name="Race Parent",
+        )
+        independent_course = Course.objects.create(
+            institution=self.institution_b,
+            course_code="race-independent",
+            name="Race Independent",
+        )
+        parent_updated = threading.Event()
+        child_committed = threading.Event()
+        outcomes = queue.Queue()
+
+        def parent_update():
+            try:
+                close_old_connections()
+                with transaction.atomic():
+                    Course.objects.filter(pk=course_to_update.pk).update(
+                        institution=self.institution_b,
+                    )
+                    parent_updated.set()
+                    if not child_committed.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("nonconflicting child did not commit")
+                outcomes.put(("parent", "committed"))
+            except Exception as error:
+                outcomes.put(("parent", "error", repr(error)))
+            finally:
+                close_old_connections()
+
+        def child_create():
+            try:
+                close_old_connections()
+                if not parent_updated.wait(self.thread_timeout_seconds):
+                    raise RuntimeError("parent did not update its institution")
+                with transaction.atomic():
+                    CourseMembership.objects.create(
+                        course=independent_course,
+                        institution_membership=self.membership_b,
+                        role="instructor",
+                    )
+                child_committed.set()
+                outcomes.put(("child", "committed"))
+            except Exception as error:
+                outcomes.put(("child", "error", repr(error)))
+            finally:
+                close_old_connections()
+
+        parent_thread = threading.Thread(target=parent_update)
+        child_thread = threading.Thread(target=child_create)
+        parent_thread.start()
+        child_thread.start()
+        parent_thread.join(self.thread_timeout_seconds)
+        child_thread.join(self.thread_timeout_seconds)
+
+        self.assertFalse(parent_thread.is_alive(), "parent thread did not finish")
+        self.assertFalse(child_thread.is_alive(), "child thread did not finish")
+        results = {
+            outcome[0]: outcome[1:]
+            for outcome in [
+                outcomes.get(timeout=self.thread_timeout_seconds),
+                outcomes.get(timeout=self.thread_timeout_seconds),
+            ]
+        }
+        self.assertEqual(results["parent"][0], "committed")
+        self.assertEqual(results["child"][0], "committed")
+        self.assertTrue(
+            CourseMembership.objects.filter(
+                course=independent_course,
+                institution_membership=self.membership_b,
+            ).exists()
+        )
