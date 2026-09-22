@@ -1,4 +1,5 @@
 import re
+from functools import wraps
 
 from django.conf import settings
 from django.db import DatabaseError, connection
@@ -29,32 +30,49 @@ def no_store_json(payload, status=200):
     return response
 
 
-@csrf_exempt
-def environment_view(request):
-    if request.method != "GET":
-        response = HttpResponseNotAllowed(["GET"])
-        response["Cache-Control"] = "no-store"
-        return response
+def verified_environment_identity():
     environment = settings.LEAI_ENVIRONMENT
     build_id = settings.LEAI_BUILD_ID
     if environment not in ENVIRONMENT_SCHEMA or not valid_build_identity(environment, build_id):
-        return no_store_json({"error": "environment_unavailable"}, status=503)
+        return None
 
     try:
         with connection.cursor() as cursor:
             cursor.execute("SELECT current_schema()")
             schema_identity = cursor.fetchone()[0]
     except DatabaseError:
-        return no_store_json({"error": "environment_unavailable"}, status=503)
+        return None
 
     if schema_identity != ENVIRONMENT_SCHEMA[environment]:
-        return no_store_json({"error": "environment_unavailable"}, status=503)
+        return None
 
-    return no_store_json({
+    return {
         "environment": environment,
         "backend_build_sha": build_id,
         "schema_identity": schema_identity,
         "contract_version": CONTRACT_VERSION,
         "allowed_app_bases": ENVIRONMENT_APP_BASES[environment],
         "server_time": timezone.now().isoformat(),
-    })
+    }
+
+
+def environment_required(view):
+    @wraps(view)
+    def wrapped(request, *args, **kwargs):
+        if verified_environment_identity() is None:
+            return no_store_json({"error": "environment_unavailable"}, status=503)
+        return view(request, *args, **kwargs)
+
+    return wrapped
+
+
+@csrf_exempt
+def environment_view(request):
+    if request.method != "GET":
+        response = HttpResponseNotAllowed(["GET"])
+        response["Cache-Control"] = "no-store"
+        return response
+    identity = verified_environment_identity()
+    if identity is None:
+        return no_store_json({"error": "environment_unavailable"}, status=503)
+    return no_store_json(identity)

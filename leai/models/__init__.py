@@ -5,6 +5,7 @@ from .identity import (
     Institution,
     InstitutionMembership,
     InstructorAccount,
+    InstructorLoginThrottle,
     InstructorSession,
 )
 from .authoring import (
@@ -49,6 +50,7 @@ __all__ = [
     "Institution",
     "InstitutionMembership",
     "InstructorAccount",
+    "InstructorLoginThrottle",
     "InstructorSession",
     "AuthoringConversation",
     "AuthoringMessage",

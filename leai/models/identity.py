@@ -168,6 +168,23 @@ class InstructorSession(models.Model):
     revoked_at = models.DateTimeField(null=True, blank=True)
 
 
+class InstructorLoginThrottle(models.Model):
+    """Shared short-window counters keyed by HMAC, never raw email or IP."""
+
+    id = models.BigAutoField(primary_key=True)
+    key_digest = models.CharField(max_length=64, unique=True)
+    window_start = models.DateTimeField(db_index=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(attempts__lte=120),
+                name="leai_login_throttle_attempts_bounded",
+            ),
+        ]
+
+
 class CourseMembership(models.Model):
     class Role(models.TextChoices):
         OWNER = "owner"

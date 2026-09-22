@@ -1,6 +1,7 @@
 """Strict JSON and bearer-only instructor authentication endpoints."""
 
 import json
+import uuid
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.exceptions import ValidationError
@@ -15,6 +16,7 @@ from leai.services.instructor_sessions import (
     create_instructor_session,
     resolve_instructor_session,
 )
+from leai.services.login_throttle import LoginRateLimited, consume_login_attempt
 
 from .environment import no_store_json
 
@@ -66,6 +68,12 @@ def instructor_sessions_view(request):
             return no_store_json({"error": "invalid_request"}, status=400)
         email, password = credentials
         try:
+            consume_login_attempt(email, request.META.get("REMOTE_ADDR", "unknown"))
+        except LoginRateLimited as error:
+            response = no_store_json({"error": "rate_limited"}, status=429)
+            response["Retry-After"] = str(error.retry_after)
+            return response
+        try:
             account = InstructorAccount.objects.select_related("user").get(email__iexact=email)
         except (InstructorAccount.DoesNotExist, InstructorAccount.MultipleObjectsReturned):
             check_password(password, _UNKNOWN_ACCOUNT_HASH)
@@ -76,7 +84,22 @@ def instructor_sessions_view(request):
             or not account.user.is_active
         ):
             return _invalid_credentials()
-        token, expires_at = create_instructor_session(account)
+        with transaction.atomic():
+            token, expires_at, session = create_instructor_session(account)
+            AuditEvent.objects.create(
+                actor_account=account,
+                actor_kind=(
+                    "platform_admin"
+                    if account.platform_role == "platform_admin"
+                    else "instructor"
+                ),
+                action="auth.login",
+                outcome="allowed",
+                target_type="instructor_session",
+                target_id=str(session.pk),
+                request_id=uuid.uuid4().hex,
+                bounded_metadata={},
+            )
         return no_store_json(
             {
                 "token": token,
@@ -105,6 +128,7 @@ def instructor_sessions_view(request):
                     outcome="allowed",
                     target_type="instructor_session",
                     target_id=str(locked.pk),
+                    request_id=uuid.uuid4().hex,
                     bounded_metadata={},
                 )
         response = HttpResponse(status=204)

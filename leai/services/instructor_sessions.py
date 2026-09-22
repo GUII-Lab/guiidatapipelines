@@ -21,12 +21,12 @@ def token_digest(token):
 def create_instructor_session(account):
     token = secrets.token_urlsafe(32)
     expires_at = timezone.now() + SESSION_LIFETIME
-    InstructorSession.objects.create(
+    session = InstructorSession.objects.create(
         account=account,
         capability_digest=token_digest(token),
         expires_at=expires_at,
     )
-    return token, expires_at
+    return token, expires_at, session
 
 
 def bearer_token(request):
@@ -51,6 +51,8 @@ def resolve_instructor_session(request, *, allow_revoked=False):
         return None
     if not allow_revoked and session.revoked_at is not None:
         return None
-    if not session.account.is_active or not session.account.user.is_active:
+    if not allow_revoked and (
+        not session.account.is_active or not session.account.user.is_active
+    ):
         return None
     return session

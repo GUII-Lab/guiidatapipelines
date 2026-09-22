@@ -63,9 +63,9 @@ class SchemaMigrationTests(TransactionTestCase):
     def test_canonical_schema_has_no_legacy_foreign_keys(self):
         self.assertEqual(count_forbidden_legacy_foreign_keys(connection), 0)
 
-    def test_fresh_database_applies_the_nine_foundation_migrations(self):
+    def test_fresh_database_keeps_the_nine_foundation_migrations_as_prefix(self):
         self.assertEqual(
-            list_canonical_migrations(connection),
+            list_canonical_migrations(connection)[:9],
             [
                 "0001_identity_course",
                 "0002_identity_integrity_guards",
@@ -80,13 +80,14 @@ class SchemaMigrationTests(TransactionTestCase):
         )
 
     def test_latest_expand_only_migration_reverses_in_disposable_database(self):
+        current_leaf = MigrationExecutor(connection).loader.graph.leaf_nodes("leai")
         try:
             MigrationExecutor(connection).migrate([("leai", "0008_analysis_governance")])
             with connection.cursor() as cursor:
                 cursor.execute("SELECT to_regclass('leai_productusageevent')")
                 self.assertIsNone(cursor.fetchone()[0])
         finally:
-            MigrationExecutor(connection).migrate([("leai", "0009_product_usage_event")])
+            MigrationExecutor(connection).migrate(current_leaf)
         with connection.cursor() as cursor:
             cursor.execute("SELECT to_regclass('leai_productusageevent')")
             self.assertIsNotNone(cursor.fetchone()[0])

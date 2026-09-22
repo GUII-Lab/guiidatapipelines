@@ -143,10 +143,21 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 # https://docs.djangoproject.com/en/3.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-CORS_ALLOW_ALL_ORIGINS = True  # For development only, specify domains in production
 django_heroku.settings(locals())
 
 # The canonical LEAI API is opt-in per deployment. The legacy Django runtime
 # stays local until QA and Production provide separately reviewed identities.
 LEAI_ENVIRONMENT = os.environ.get("LEAI_ENVIRONMENT", "local")
 LEAI_BUILD_ID = os.environ.get("LEAI_BUILD_ID", "local-backend")
+
+# CORS is an origin boundary, not a URL-path boundary. Both Pages deployments
+# share the same approved origin; local Vite is allowed only in local mode.
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGINS = ["https://guii-lab.github.io"]
+if LEAI_ENVIRONMENT == "local":
+    CORS_ALLOWED_ORIGINS += [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+    ]
