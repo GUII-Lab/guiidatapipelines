@@ -1,6 +1,7 @@
 import queue
 import threading
 import time
+import uuid
 
 from django.contrib.auth import get_user_model
 from django.db import (
@@ -189,6 +190,12 @@ class ResponseFixturesMixin:
     def force_constraints(*constraint_names):
         with connection.cursor() as cursor:
             cursor.execute(f"SET CONSTRAINTS {', '.join(constraint_names)} IMMEDIATE")
+
+    def assert_integrity_code(self, operation, expected_code="23514"):
+        with self.assertRaises(IntegrityError) as caught:
+            with transaction.atomic():
+                operation()
+        self.assertEqual(caught.exception.__cause__.pgcode, expected_code)
 
 
 class ResponseModelTests(ResponseFixturesMixin, TestCase):
@@ -434,40 +441,213 @@ class ResponseModelTests(ResponseFixturesMixin, TestCase):
             )
             self.force_constraints(PDF_OCCURRENCE_FK)
 
-    def test_bulk_updates_cannot_break_existing_occurrence_relations(self):
+    def test_occurrence_ownership_and_team_snapshots_are_immutable_via_model_save(self):
+        first_occurrence = self.make_occurrence(audience="team")
+        second_occurrence = self.make_occurrence(audience="team")
+        configuration = self.make_team_configuration(course=first_occurrence.course)
+        snapshot = TeamSnapshot.objects.create(
+            occurrence=first_occurrence,
+            source_configuration=configuration,
+            frozen_at=timezone.now(),
+        )
+        item = TeamSnapshotItem.objects.create(
+            snapshot=snapshot,
+            occurrence=first_occurrence,
+            item_number=1,
+            stable_key="immutable-team",
+            label="Immutable Team",
+        )
+        session = self.make_student_session(occurrence=first_occurrence)
+        batch = self.make_pdf_batch(occurrence=first_occurrence)
+
+        def save_to_other_occurrence(instance):
+            instance.occurrence = second_occurrence
+            instance.save(update_fields=["occurrence"])
+
+        for instance in (session, batch, snapshot, item):
+            with self.subTest(model=type(instance).__name__):
+                self.assert_integrity_code(
+                    lambda instance=instance: save_to_other_occurrence(instance),
+                )
+
+        snapshot.refresh_from_db()
+        snapshot.frozen_at = snapshot.frozen_at + timezone.timedelta(seconds=1)
+        self.assert_integrity_code(
+            lambda: snapshot.save(update_fields=["frozen_at"]),
+        )
+
+        item.refresh_from_db()
+        item.label = "Mutated Team"
+        self.assert_integrity_code(lambda: item.save(update_fields=["label"]))
+
+    def test_bulk_updates_and_deletes_cannot_migrate_frozen_occurrence_graphs(self):
         first_occurrence = self.make_occurrence(audience="team")
         second_occurrence = self.make_occurrence(audience="team")
         team_item = self.make_team_item(occurrence=first_occurrence)
-        team_session = self.make_student_session(
-            occurrence=first_occurrence,
-            team_snapshot_item=team_item,
-        )
+        team_session = self.make_student_session(occurrence=first_occurrence)
         batch = self.make_pdf_batch(occurrence=first_occurrence)
-        pdf_session = self.make_pdf_session(
-            occurrence=first_occurrence,
-            batch=batch,
+        empty_snapshot = TeamSnapshot.objects.create(
+            occurrence=self.make_occurrence(audience="team"),
+            source_configuration=self.make_team_configuration(course=self.course),
+            frozen_at=timezone.now(),
         )
 
         invalid_updates = [
             lambda: ResponseSession.objects.filter(pk=team_session.pk).update(
                 occurrence=second_occurrence,
             ),
-            lambda: TeamSnapshotItem.objects.filter(pk=team_item.pk).update(
-                occurrence=second_occurrence,
-            ),
-            lambda: ResponseSession.objects.filter(pk=pdf_session.pk).update(
-                occurrence=second_occurrence,
-            ),
             lambda: PdfImportBatch.objects.filter(pk=batch.pk).update(
                 occurrence=second_occurrence,
             ),
+            lambda: TeamSnapshot.objects.filter(pk=team_item.snapshot_id).update(
+                occurrence=second_occurrence,
+            ),
+            lambda: TeamSnapshotItem.objects.filter(pk=team_item.pk).update(
+                occurrence=second_occurrence,
+            ),
+            lambda: TeamSnapshot.objects.filter(pk=team_item.snapshot_id).update(
+                frozen_at=timezone.now(),
+            ),
+            lambda: TeamSnapshotItem.objects.filter(pk=team_item.pk).update(
+                label="Mutated Team",
+            ),
         ]
         for update in invalid_updates:
-            with self.subTest(update=update), self.assertRaises(
-                IntegrityError,
-            ), transaction.atomic():
-                update()
-                self.force_constraints(TEAM_OCCURRENCE_FK, PDF_OCCURRENCE_FK)
+            with self.subTest(update=update):
+                self.assert_integrity_code(update)
+
+        for delete in (
+            lambda: TeamSnapshotItem.objects.filter(pk=team_item.pk).delete(),
+            lambda: TeamSnapshot.objects.filter(pk=empty_snapshot.pk).delete(),
+        ):
+            with self.subTest(delete=delete):
+                self.assert_integrity_code(delete)
+
+    def test_response_public_ids_are_immutable_with_check_violation_sqlstate(self):
+        session = self.make_student_session()
+        batch = self.make_pdf_batch(occurrence=session.occurrence)
+
+        for model, pk in (
+            (ResponseSession, session.pk),
+            (PdfImportBatch, batch.pk),
+        ):
+            with self.subTest(model=model.__name__):
+                self.assert_integrity_code(
+                    lambda model=model, pk=pk: model.objects.filter(pk=pk).update(
+                        public_id=uuid.uuid4(),
+                    ),
+                )
+
+    def test_pdf_idempotency_key_is_unique_per_occurrence(self):
+        first_occurrence = self.make_occurrence()
+        second_occurrence = self.make_occurrence()
+        shared_key = "d" * 64
+        self.make_pdf_batch(
+            occurrence=first_occurrence,
+            idempotency_key_hash=shared_key,
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.make_pdf_batch(
+                occurrence=first_occurrence,
+                idempotency_key_hash=shared_key,
+            )
+
+        allowed = self.make_pdf_batch(
+            occurrence=second_occurrence,
+            idempotency_key_hash=shared_key,
+        )
+        self.assertEqual(allowed.occurrence, second_occurrence)
+
+    def test_raw_sql_cannot_mutate_occurrence_ownership_or_frozen_team_rows(self):
+        first_occurrence = self.make_occurrence(audience="team")
+        second_occurrence = self.make_occurrence(audience="team")
+        session = self.make_student_session(occurrence=first_occurrence)
+        batch = self.make_pdf_batch(occurrence=first_occurrence)
+        item = self.make_team_item(occurrence=first_occurrence)
+
+        writes = [
+            (
+                "UPDATE leai_responsesession SET occurrence_id = %s WHERE id = %s",
+                [second_occurrence.pk, session.pk],
+            ),
+            (
+                "UPDATE leai_pdfimportbatch SET occurrence_id = %s WHERE id = %s",
+                [second_occurrence.pk, batch.pk],
+            ),
+            (
+                "UPDATE leai_teamsnapshot SET occurrence_id = %s WHERE id = %s",
+                [second_occurrence.pk, item.snapshot_id],
+            ),
+            (
+                "UPDATE leai_teamsnapshotitem SET label = %s WHERE id = %s",
+                ["Mutated Team", item.pk],
+            ),
+            (
+                "DELETE FROM leai_teamsnapshotitem WHERE id = %s",
+                [item.pk],
+            ),
+        ]
+        for sql, params in writes:
+            with self.subTest(sql=sql):
+                self.assert_integrity_code(
+                    lambda sql=sql, params=params: connection.cursor().execute(
+                        sql,
+                        params,
+                    ),
+                )
+
+    def test_raw_sql_composite_foreign_keys_reject_cross_occurrence_rows(self):
+        first_occurrence = self.make_occurrence(audience="team")
+        second_occurrence = self.make_occurrence(audience="team")
+        team_item = self.make_team_item(occurrence=first_occurrence)
+        batch = self.make_pdf_batch(occurrence=first_occurrence)
+
+        invalid_inserts = [
+            (
+                """
+                INSERT INTO leai_teamsnapshotitem
+                    (snapshot_id, occurrence_id, item_number, stable_key, label)
+                VALUES (%s, %s, 2, 'raw-cross-occurrence', 'Raw Cross Occurrence')
+                """,
+                [team_item.snapshot_id, second_occurrence.pk],
+                SNAPSHOT_ITEM_OCCURRENCE_FK,
+            ),
+            (
+                """
+                INSERT INTO leai_responsesession
+                    (occurrence_id, team_snapshot_item_id, capability_nonce,
+                     capability_digest, capability_key_version, source, status,
+                     research_consent, next_message_sequence, turn_version,
+                     created_at, updated_at)
+                VALUES (%s, %s, 'raw-team-nonce', %s, 1, 'student', 'active',
+                        FALSE, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                [second_occurrence.pk, team_item.pk, "8" * 64],
+                TEAM_OCCURRENCE_FK,
+            ),
+            (
+                """
+                INSERT INTO leai_responsesession
+                    (occurrence_id, pdf_import_batch_id, source, status,
+                     research_consent, next_message_sequence, turn_version,
+                     created_at, updated_at)
+                VALUES (%s, %s, 'pdf', 'active', FALSE, 1, 1,
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                [second_occurrence.pk, batch.pk],
+                PDF_OCCURRENCE_FK,
+            ),
+        ]
+
+        for sql, params, constraint_name in invalid_inserts:
+            with self.subTest(constraint=constraint_name):
+                def insert_and_check():
+                    with connection.cursor() as cursor:
+                        cursor.execute(sql, params)
+                    self.force_constraints(constraint_name)
+
+                self.assert_integrity_code(insert_and_check, expected_code="23503")
 
     def test_pdf_batch_job_and_team_definition_constraints_are_database_enforced(self):
         batch = self.make_pdf_batch()
@@ -585,74 +765,70 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
             cursor.execute("SELECT pg_blocking_pids(%s)", [database_pid])
             return cursor.fetchone()[0]
 
-    def wait_for_blocker(self, blocked_pid, blocker_pid, finished, label):
-        for _ in range(100):
-            if blocker_pid in self.blocking_pids(blocked_pid):
-                return True
-            if finished.is_set():
-                return False
-            time.sleep(0.01)
-        self.fail(f"{label} did not block on the conflicting occurrence write")
-
-    def run_parent_first_race(
+    def run_immutable_parent_child_race(
         self,
         *,
         parent_write,
         child_write,
-        constraint_name,
+        parent_first,
     ):
-        parent_ready = threading.Event()
-        child_started = threading.Event()
+        parent_attempted = threading.Event()
+        child_inserted = threading.Event()
+        parent_finished = threading.Event()
         child_finished = threading.Event()
         release_parent = threading.Event()
-        pids = queue.Queue()
+        release_child = threading.Event()
         outcomes = queue.Queue()
 
         def parent():
-            database_pid = None
             try:
                 close_old_connections()
-                database = connections["default"]
-                database.ensure_connection()
-                database_pid = database.connection.get_backend_pid()
+                if not parent_first and not child_inserted.wait(
+                    self.thread_timeout_seconds,
+                ):
+                    raise RuntimeError("child insert did not begin")
                 with transaction.atomic():
-                    parent_write()
-                    pids.put(("parent", database_pid))
-                    parent_ready.set()
-                    if not release_parent.wait(self.thread_timeout_seconds):
+                    try:
+                        with transaction.atomic():
+                            parent_write()
+                    except IntegrityError as error:
+                        outcomes.put(("parent", "integrity", *self.error_details(error)))
+                    else:
+                        outcomes.put(("parent", "changed"))
+                    parent_attempted.set()
+                    if parent_first and not release_parent.wait(
+                        self.thread_timeout_seconds,
+                    ):
                         raise RuntimeError("parent transaction was not released")
-                outcomes.put(("parent", "committed", database_pid))
+            except DatabaseError as error:
+                outcomes.put(("parent", "database_error", *self.error_details(error)))
             except Exception as error:
-                outcomes.put(("parent", "error", database_pid, repr(error)))
+                outcomes.put(("parent", "error", repr(error)))
             finally:
+                parent_finished.set()
                 close_old_connections()
 
         def child():
-            database_pid = None
             try:
                 close_old_connections()
-                database = connections["default"]
-                database.ensure_connection()
-                database_pid = database.connection.get_backend_pid()
-                pids.put(("child", database_pid))
-                if not parent_ready.wait(self.thread_timeout_seconds):
+                if parent_first and not parent_attempted.wait(
+                    self.thread_timeout_seconds,
+                ):
                     raise RuntimeError("parent mutation did not begin")
                 with transaction.atomic():
-                    child_started.set()
                     child_write()
-                    with database.cursor() as cursor:
-                        cursor.execute(f"SET CONSTRAINTS {constraint_name} IMMEDIATE")
-                outcomes.put(("child", "committed", database_pid))
+                    child_inserted.set()
+                    if not parent_first and not release_child.wait(
+                        self.thread_timeout_seconds,
+                    ):
+                        raise RuntimeError("child transaction was not released")
+                outcomes.put(("child", "committed"))
             except IntegrityError as error:
-                outcomes.put(
-                    ("child", "integrity", database_pid, *self.error_details(error)),
-                )
+                outcomes.put(("child", "integrity", *self.error_details(error)))
             except DatabaseError as error:
-                outcomes.put(
-                    ("child", "database_error", database_pid, *self.error_details(error)),
-                )
+                outcomes.put(("child", "database_error", *self.error_details(error)))
             except Exception as error:
-                outcomes.put(("child", "error", database_pid, repr(error)))
+                outcomes.put(("child", "error", repr(error)))
             finally:
                 child_finished.set()
                 close_old_connections()
@@ -660,249 +836,208 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
         parent_thread = threading.Thread(target=parent)
         child_thread = threading.Thread(target=child)
         parent_thread.start()
-        self.assertTrue(parent_ready.wait(self.thread_timeout_seconds))
         child_thread.start()
-        self.assertTrue(child_started.wait(self.thread_timeout_seconds))
 
-        pid_values = dict(pids.get(timeout=5) for _ in range(2))
-        try:
-            self.wait_for_blocker(
-                pid_values["child"],
-                pid_values["parent"],
-                child_finished,
-                "child",
+        if parent_first:
+            completed_without_blocking = child_finished.wait(
+                self.thread_timeout_seconds,
             )
-        finally:
             release_parent.set()
-            parent_thread.join(self.thread_timeout_seconds)
-            child_thread.join(self.thread_timeout_seconds)
-
-        self.assertFalse(parent_thread.is_alive(), "parent race thread did not finish")
-        self.assertFalse(child_thread.is_alive(), "child race thread did not finish")
-        results = {
-            result[0]: result[1:]
-            for result in (
-                outcomes.get(timeout=self.thread_timeout_seconds),
-                outcomes.get(timeout=self.thread_timeout_seconds),
+        else:
+            completed_without_blocking = parent_finished.wait(
+                self.thread_timeout_seconds,
             )
-        }
-        self.assertEqual(results["parent"][0], "committed", results)
-        self.assertEqual(results["child"][0], "integrity", results)
-        self.assertEqual(results["child"][2], "23503", results)
-
-    def run_child_first_race(
-        self,
-        *,
-        parent_write,
-        child_write,
-        constraint_name,
-    ):
-        child_ready = threading.Event()
-        parent_started = threading.Event()
-        parent_finished = threading.Event()
-        release_child = threading.Event()
-        pids = queue.Queue()
-        outcomes = queue.Queue()
-
-        def child():
-            database_pid = None
-            try:
-                close_old_connections()
-                database = connections["default"]
-                database.ensure_connection()
-                database_pid = database.connection.get_backend_pid()
-                with transaction.atomic():
-                    child_write()
-                    with database.cursor() as cursor:
-                        cursor.execute(f"SET CONSTRAINTS {constraint_name} IMMEDIATE")
-                    pids.put(("child", database_pid))
-                    child_ready.set()
-                    if not release_child.wait(self.thread_timeout_seconds):
-                        raise RuntimeError("child transaction was not released")
-                outcomes.put(("child", "committed", database_pid))
-            except Exception as error:
-                outcomes.put(("child", "error", database_pid, repr(error)))
-            finally:
-                close_old_connections()
-
-        def parent():
-            database_pid = None
-            try:
-                close_old_connections()
-                database = connections["default"]
-                database.ensure_connection()
-                database_pid = database.connection.get_backend_pid()
-                pids.put(("parent", database_pid))
-                if not child_ready.wait(self.thread_timeout_seconds):
-                    raise RuntimeError("child relation did not become valid")
-                with transaction.atomic():
-                    parent_started.set()
-                    parent_write()
-                outcomes.put(("parent", "committed", database_pid))
-            except IntegrityError as error:
-                outcomes.put(
-                    ("parent", "integrity", database_pid, *self.error_details(error)),
-                )
-            except DatabaseError as error:
-                outcomes.put(
-                    ("parent", "database_error", database_pid, *self.error_details(error)),
-                )
-            except Exception as error:
-                outcomes.put(("parent", "error", database_pid, repr(error)))
-            finally:
-                parent_finished.set()
-                close_old_connections()
-
-        child_thread = threading.Thread(target=child)
-        parent_thread = threading.Thread(target=parent)
-        child_thread.start()
-        self.assertTrue(child_ready.wait(self.thread_timeout_seconds))
-        parent_thread.start()
-        self.assertTrue(parent_started.wait(self.thread_timeout_seconds))
-
-        pid_values = dict(pids.get(timeout=5) for _ in range(2))
-        try:
-            self.wait_for_blocker(
-                pid_values["parent"],
-                pid_values["child"],
-                parent_finished,
-                "parent",
-            )
-        finally:
             release_child.set()
-            child_thread.join(self.thread_timeout_seconds)
-            parent_thread.join(self.thread_timeout_seconds)
 
-        self.assertFalse(child_thread.is_alive(), "child race thread did not finish")
+        parent_thread.join(self.thread_timeout_seconds)
+        child_thread.join(self.thread_timeout_seconds)
+        self.assertTrue(completed_without_blocking, "race operation blocked")
         self.assertFalse(parent_thread.is_alive(), "parent race thread did not finish")
-        results = {
-            result[0]: result[1:]
-            for result in (
-                outcomes.get(timeout=self.thread_timeout_seconds),
-                outcomes.get(timeout=self.thread_timeout_seconds),
-            )
-        }
-        self.assertEqual(results["child"][0], "committed", results)
-        self.assertEqual(results["parent"][0], "integrity", results)
-        self.assertEqual(results["parent"][2], "23503", results)
+        self.assertFalse(child_thread.is_alive(), "child race thread did not finish")
 
-    def assert_parent_child_orders_are_safe(
-        self,
-        *,
-        make_parent,
-        parent_write,
-        child_write,
-        constraint_name,
-    ):
-        parent = make_parent()
-        self.run_parent_first_race(
-            parent_write=lambda: parent_write(parent),
-            child_write=lambda: child_write(parent),
-            constraint_name=constraint_name,
+        results = {}
+        while not outcomes.empty():
+            result = outcomes.get_nowait()
+            results[result[0]] = result[1:]
+        self.assertEqual(results.get("parent", ())[:2], ("integrity", "23514"), results)
+        self.assertEqual(results.get("child"), ("committed",), results)
+
+    def make_snapshot_item_race(self):
+        original_occurrence = self.make_occurrence(audience="team")
+        other_occurrence = self.make_occurrence(audience="team")
+        configuration = self.make_team_configuration(course=self.course)
+        snapshot = TeamSnapshot.objects.create(
+            occurrence=original_occurrence,
+            source_configuration=configuration,
+            frozen_at=timezone.now(),
         )
-
-        parent = make_parent()
-        self.run_child_first_race(
-            parent_write=lambda: parent_write(parent),
-            child_write=lambda: child_write(parent),
-            constraint_name=constraint_name,
-        )
-
-    def test_team_item_occurrence_parent_child_orders_are_safe(self):
-        def make_case():
-            original_occurrence = self.make_occurrence(audience="team")
-            other_occurrence = self.make_occurrence(audience="team")
-            item = self.make_team_item(occurrence=original_occurrence)
-
-            def move_snapshot_and_item():
-                TeamSnapshot.objects.filter(pk=item.snapshot_id).update(
-                    occurrence=other_occurrence,
-                )
-                TeamSnapshotItem.objects.filter(pk=item.pk).update(
-                    occurrence=other_occurrence,
-                )
-
-            def create_response():
-                self.make_student_session(
-                    occurrence=original_occurrence,
-                    team_snapshot_item=item,
-                )
-
-            return move_snapshot_and_item, create_response
-
-        parent_write, child_write = make_case()
-        self.run_parent_first_race(
-            parent_write=parent_write,
-            child_write=child_write,
-            constraint_name=TEAM_OCCURRENCE_FK,
-        )
-
-        parent_write, child_write = make_case()
-        self.run_child_first_race(
-            parent_write=parent_write,
-            child_write=child_write,
-            constraint_name=TEAM_OCCURRENCE_FK,
-        )
-
-    def test_team_snapshot_occurrence_parent_child_orders_are_safe(self):
-        def make_case():
-            original_occurrence = self.make_occurrence(audience="team")
-            other_occurrence = self.make_occurrence(audience="team")
-            configuration = self.make_team_configuration(
-                course=original_occurrence.course,
-            )
-            snapshot = TeamSnapshot.objects.create(
-                occurrence=original_occurrence,
-                source_configuration=configuration,
-                frozen_at=timezone.now(),
-            )
-            suffix = self.next_suffix()
-
-            def move_snapshot():
-                TeamSnapshot.objects.filter(pk=snapshot.pk).update(
-                    occurrence=other_occurrence,
-                )
-
-            def create_item():
-                TeamSnapshotItem.objects.create(
-                    snapshot=snapshot,
-                    occurrence=original_occurrence,
-                    item_number=1,
-                    stable_key=f"race-team-{suffix}",
-                    label=f"Race Team {suffix}",
-                )
-
-            return move_snapshot, create_item
-
-        parent_write, child_write = make_case()
-        self.run_parent_first_race(
-            parent_write=parent_write,
-            child_write=child_write,
-            constraint_name=SNAPSHOT_ITEM_OCCURRENCE_FK,
-        )
-
-        parent_write, child_write = make_case()
-        self.run_child_first_race(
-            parent_write=parent_write,
-            child_write=child_write,
-            constraint_name=SNAPSHOT_ITEM_OCCURRENCE_FK,
-        )
-
-    def test_pdf_batch_occurrence_parent_child_orders_are_safe(self):
-        original_occurrence = self.make_occurrence()
-        other_occurrence = self.make_occurrence()
-
-        self.assert_parent_child_orders_are_safe(
-            make_parent=lambda: self.make_pdf_batch(occurrence=original_occurrence),
-            parent_write=lambda batch: PdfImportBatch.objects.filter(pk=batch.pk).update(
+        suffix = self.next_suffix()
+        return (
+            lambda: TeamSnapshot.objects.filter(pk=snapshot.pk).update(
                 occurrence=other_occurrence,
             ),
-            child_write=lambda batch: self.make_pdf_session(
+            lambda: TeamSnapshotItem.objects.create(
+                snapshot=snapshot,
+                occurrence=original_occurrence,
+                item_number=1,
+                stable_key=f"race-team-{suffix}",
+                label=f"Race Team {suffix}",
+            ),
+        )
+
+    def make_item_session_race(self):
+        original_occurrence = self.make_occurrence(audience="team")
+        other_occurrence = self.make_occurrence(audience="team")
+        item = self.make_team_item(occurrence=original_occurrence)
+        return (
+            lambda: TeamSnapshotItem.objects.filter(pk=item.pk).update(
+                occurrence=other_occurrence,
+            ),
+            lambda: self.make_student_session(
+                occurrence=original_occurrence,
+                team_snapshot_item=item,
+            ),
+        )
+
+    def make_batch_session_race(self):
+        original_occurrence = self.make_occurrence()
+        other_occurrence = self.make_occurrence()
+        batch = self.make_pdf_batch(occurrence=original_occurrence)
+        return (
+            lambda: PdfImportBatch.objects.filter(pk=batch.pk).update(
+                occurrence=other_occurrence,
+            ),
+            lambda: self.make_pdf_session(
                 occurrence=original_occurrence,
                 batch=batch,
             ),
-            constraint_name=PDF_OCCURRENCE_FK,
         )
+
+    def make_session_message_race(self):
+        original_occurrence = self.make_occurrence()
+        other_occurrence = self.make_occurrence()
+        session = self.make_student_session(occurrence=original_occurrence)
+        return (
+            lambda: ResponseSession.objects.filter(pk=session.pk).update(
+                occurrence=other_occurrence,
+            ),
+            lambda: ResponseMessage.objects.create(
+                response_session=session,
+                sequence=1,
+                role="student",
+                input_method="typed",
+                content="Concurrent message",
+            ),
+        )
+
+    def test_occurrence_parent_child_races_reject_parent_first_and_child_first_moves(self):
+        case_factories = (
+            self.make_snapshot_item_race,
+            self.make_item_session_race,
+            self.make_batch_session_race,
+            self.make_session_message_race,
+        )
+        for case_factory in case_factories:
+            for parent_first in (True, False):
+                with self.subTest(
+                    relation=case_factory.__name__,
+                    order="parent-first" if parent_first else "child-first",
+                ):
+                    parent_write, child_write = case_factory()
+                    self.run_immutable_parent_child_race(
+                        parent_write=parent_write,
+                        child_write=child_write,
+                        parent_first=parent_first,
+                    )
+
+    def test_team_snapshot_insert_does_not_block_on_inverse_parent_lock_order(self):
+        occurrence = self.make_occurrence(audience="team")
+        configuration = self.make_team_configuration(course=occurrence.course)
+        locks_held = threading.Event()
+        insert_started = threading.Event()
+        insert_completed = threading.Event()
+        release_locks = threading.Event()
+        release_insert = threading.Event()
+        pids = queue.Queue()
+        outcomes = queue.Queue()
+
+        def lock_parents():
+            try:
+                close_old_connections()
+                database = connections["default"]
+                database.ensure_connection()
+                pids.put(("locker", database.connection.get_backend_pid()))
+                with transaction.atomic():
+                    SurveyOccurrence.objects.select_for_update().get(pk=occurrence.pk)
+                    TeamConfiguration.objects.select_for_update().get(
+                        pk=configuration.pk,
+                    )
+                    locks_held.set()
+                    if not release_locks.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("parent locks were not released")
+                outcomes.put(("locker", "committed"))
+            except Exception as error:
+                outcomes.put(("locker", "error", repr(error)))
+            finally:
+                close_old_connections()
+
+        def insert_snapshot():
+            try:
+                close_old_connections()
+                database = connections["default"]
+                database.ensure_connection()
+                pids.put(("inserter", database.connection.get_backend_pid()))
+                if not locks_held.wait(self.thread_timeout_seconds):
+                    raise RuntimeError("parent locks were not acquired")
+                with transaction.atomic():
+                    insert_started.set()
+                    TeamSnapshot.objects.create(
+                        occurrence=occurrence,
+                        source_configuration=configuration,
+                        frozen_at=timezone.now(),
+                    )
+                    insert_completed.set()
+                    if not release_insert.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("snapshot insert was not released")
+                outcomes.put(("inserter", "committed"))
+            except Exception as error:
+                outcomes.put(("inserter", "error", repr(error)))
+            finally:
+                close_old_connections()
+
+        locker_thread = threading.Thread(target=lock_parents)
+        inserter_thread = threading.Thread(target=insert_snapshot)
+        locker_thread.start()
+        inserter_thread.start()
+        self.assertTrue(insert_started.wait(self.thread_timeout_seconds))
+        pid_values = dict(pids.get(timeout=5) for _ in range(2))
+
+        blockers = []
+        for _ in range(100):
+            if insert_completed.is_set():
+                break
+            blockers = self.blocking_pids(pid_values["inserter"])
+            if blockers:
+                break
+            time.sleep(0.01)
+        completed_while_locked = insert_completed.is_set()
+
+        release_locks.set()
+        locker_thread.join(self.thread_timeout_seconds)
+        insert_completed.wait(self.thread_timeout_seconds)
+        release_insert.set()
+        inserter_thread.join(self.thread_timeout_seconds)
+
+        self.assertTrue(completed_while_locked, {"blocking_pids": blockers})
+        self.assertNotIn(pid_values["locker"], blockers)
+        self.assertFalse(locker_thread.is_alive(), "locker thread did not finish")
+        self.assertFalse(inserter_thread.is_alive(), "inserter thread did not finish")
+        results = {}
+        while not outcomes.empty():
+            result = outcomes.get_nowait()
+            results[result[0]] = result[1:]
+        self.assertEqual(results.get("locker"), ("committed",), results)
+        self.assertEqual(results.get("inserter"), ("committed",), results)
 
     def test_occurrence_foreign_keys_are_explicitly_deferred(self):
         with connection.cursor() as cursor:
@@ -912,7 +1047,11 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
                 FROM pg_constraint
                 WHERE conname = ANY(%s)
                 """,
-                [[TEAM_OCCURRENCE_FK, PDF_OCCURRENCE_FK]],
+                [[
+                    TEAM_OCCURRENCE_FK,
+                    PDF_OCCURRENCE_FK,
+                    SNAPSHOT_ITEM_OCCURRENCE_FK,
+                ]],
             )
             constraints = {name: (deferrable, deferred) for name, deferrable, deferred in cursor}
 
@@ -921,5 +1060,6 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
             {
                 TEAM_OCCURRENCE_FK: (True, True),
                 PDF_OCCURRENCE_FK: (True, True),
+                SNAPSHOT_ITEM_OCCURRENCE_FK: (True, True),
             },
         )

@@ -137,7 +137,7 @@ class PdfImportBatch(models.Model):
         on_delete=models.PROTECT,
         related_name="committed_pdf_import_batches",
     )
-    idempotency_key_hash = models.CharField(max_length=64, unique=True)
+    idempotency_key_hash = models.CharField(max_length=64)
     manifest_digest = models.CharField(max_length=64)
     status = models.CharField(max_length=16, choices=STATUSES, default="prepared")
     manifest = models.JSONField(default=dict)
@@ -149,6 +149,10 @@ class PdfImportBatch(models.Model):
             models.UniqueConstraint(
                 fields=("id", "occurrence"),
                 name="leai_pdf_import_batch_id_occurrence_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=("occurrence", "idempotency_key_hash"),
+                name="leai_pdf_import_batch_occurrence_idempotency_uniq",
             ),
             models.CheckConstraint(
                 check=models.Q(

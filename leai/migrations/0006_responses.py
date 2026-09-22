@@ -17,7 +17,7 @@ class Migration(migrations.Migration):
             fields=[
                 ('id', models.BigAutoField(primary_key=True, serialize=False)),
                 ('public_id', models.UUIDField(default=uuid.uuid4, editable=False, unique=True)),
-                ('idempotency_key_hash', models.CharField(max_length=64, unique=True)),
+                ('idempotency_key_hash', models.CharField(max_length=64)),
                 ('manifest_digest', models.CharField(max_length=64)),
                 ('status', models.CharField(choices=[('prepared', 'Prepared'), ('committed', 'Committed'), ('processing', 'Processing'), ('completed', 'Completed'), ('failed', 'Failed')], default='prepared', max_length=16)),
                 ('manifest', models.JSONField(default=dict)),
@@ -221,6 +221,10 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='pdfimportbatch',
+            constraint=models.UniqueConstraint(fields=('occurrence', 'idempotency_key_hash'), name='leai_pdf_import_batch_occurrence_idempotency_uniq'),
+        ),
+        migrations.AddConstraint(
+            model_name='pdfimportbatch',
             constraint=models.CheckConstraint(check=models.Q(('status__in', ['prepared', 'committed', 'processing', 'completed', 'failed'])), name='leai_pdf_import_batch_status_valid'),
         ),
         migrations.AddConstraint(
@@ -255,25 +259,26 @@ class Migration(migrations.Migration):
                 ALTER TABLE leai_responsesession
                     ALTER COLUMN public_id SET DEFAULT gen_random_uuid();
 
-                CREATE FUNCTION leai_reject_response_public_id_update()
+                CREATE FUNCTION leai_reject_response_identity_update()
                 RETURNS TRIGGER AS $$
                 BEGIN
-                    IF NEW.public_id IS DISTINCT FROM OLD.public_id THEN
+                    IF NEW.public_id IS DISTINCT FROM OLD.public_id
+                       OR NEW.occurrence_id IS DISTINCT FROM OLD.occurrence_id THEN
                         RAISE EXCEPTION USING
                             ERRCODE = '23514',
-                            MESSAGE = 'LEAI response public_id values are immutable';
+                            MESSAGE = 'LEAI response public_id and occurrence values are immutable';
                     END IF;
                     RETURN NEW;
                 END;
                 $$ LANGUAGE plpgsql;
 
-                CREATE TRIGGER leai_pdfimportbatch_public_id_immutable
-                BEFORE UPDATE OF public_id ON leai_pdfimportbatch
-                FOR EACH ROW EXECUTE FUNCTION leai_reject_response_public_id_update();
+                CREATE TRIGGER leai_pdfimportbatch_identity_immutable
+                BEFORE UPDATE OF public_id, occurrence_id ON leai_pdfimportbatch
+                FOR EACH ROW EXECUTE FUNCTION leai_reject_response_identity_update();
 
-                CREATE TRIGGER leai_responsesession_public_id_immutable
-                BEFORE UPDATE OF public_id ON leai_responsesession
-                FOR EACH ROW EXECUTE FUNCTION leai_reject_response_public_id_update();
+                CREATE TRIGGER leai_responsesession_identity_immutable
+                BEFORE UPDATE OF public_id, occurrence_id ON leai_responsesession
+                FOR EACH ROW EXECUTE FUNCTION leai_reject_response_identity_update();
 
                 CREATE FUNCTION leai_reject_team_configuration_course_update()
                 RETURNS TRIGGER AS $$
@@ -300,14 +305,12 @@ class Migration(migrations.Migration):
                     SELECT course_id
                     INTO configuration_course_id
                     FROM leai_teamconfiguration
-                    WHERE id = NEW.source_configuration_id
-                    FOR UPDATE;
+                    WHERE id = NEW.source_configuration_id;
 
                     SELECT course_id
                     INTO occurrence_course_id
                     FROM leai_surveyoccurrence
-                    WHERE id = NEW.occurrence_id
-                    FOR UPDATE;
+                    WHERE id = NEW.occurrence_id;
 
                     IF configuration_course_id IS NULL
                        OR occurrence_course_id IS NULL
@@ -321,9 +324,25 @@ class Migration(migrations.Migration):
                 $$ LANGUAGE plpgsql;
 
                 CREATE TRIGGER leai_team_snapshot_course_matches_configuration
-                BEFORE INSERT OR UPDATE OF occurrence_id, source_configuration_id
-                ON leai_teamsnapshot
+                BEFORE INSERT ON leai_teamsnapshot
                 FOR EACH ROW EXECUTE FUNCTION leai_enforce_team_snapshot_course();
+
+                CREATE FUNCTION leai_reject_frozen_team_row_mutation()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '23514',
+                        MESSAGE = 'LEAI Team Snapshot rows are immutable and append-only';
+                END;
+                $$ LANGUAGE plpgsql;
+
+                CREATE TRIGGER leai_team_snapshot_immutable
+                BEFORE UPDATE OR DELETE ON leai_teamsnapshot
+                FOR EACH ROW EXECUTE FUNCTION leai_reject_frozen_team_row_mutation();
+
+                CREATE TRIGGER leai_team_snapshot_item_immutable
+                BEFORE UPDATE OR DELETE ON leai_teamsnapshotitem
+                FOR EACH ROW EXECUTE FUNCTION leai_reject_frozen_team_row_mutation();
 
                 ALTER TABLE leai_teamsnapshotitem
                     ADD CONSTRAINT leai_team_snapshot_item_occurrence_fk
@@ -351,6 +370,12 @@ class Migration(migrations.Migration):
                 ALTER TABLE leai_teamsnapshotitem
                     DROP CONSTRAINT IF EXISTS leai_team_snapshot_item_occurrence_fk;
 
+                DROP TRIGGER IF EXISTS leai_team_snapshot_item_immutable
+                    ON leai_teamsnapshotitem;
+                DROP TRIGGER IF EXISTS leai_team_snapshot_immutable
+                    ON leai_teamsnapshot;
+                DROP FUNCTION IF EXISTS leai_reject_frozen_team_row_mutation();
+
                 DROP TRIGGER IF EXISTS leai_team_snapshot_course_matches_configuration
                     ON leai_teamsnapshot;
                 DROP FUNCTION IF EXISTS leai_enforce_team_snapshot_course();
@@ -359,11 +384,11 @@ class Migration(migrations.Migration):
                     ON leai_teamconfiguration;
                 DROP FUNCTION IF EXISTS leai_reject_team_configuration_course_update();
 
-                DROP TRIGGER IF EXISTS leai_responsesession_public_id_immutable
+                DROP TRIGGER IF EXISTS leai_responsesession_identity_immutable
                     ON leai_responsesession;
-                DROP TRIGGER IF EXISTS leai_pdfimportbatch_public_id_immutable
+                DROP TRIGGER IF EXISTS leai_pdfimportbatch_identity_immutable
                     ON leai_pdfimportbatch;
-                DROP FUNCTION IF EXISTS leai_reject_response_public_id_update();
+                DROP FUNCTION IF EXISTS leai_reject_response_identity_update();
 
                 ALTER TABLE leai_responsesession ALTER COLUMN public_id DROP DEFAULT;
                 ALTER TABLE leai_pdfimportbatch ALTER COLUMN public_id DROP DEFAULT;
