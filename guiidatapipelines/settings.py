@@ -40,6 +40,7 @@ ALLOWED_HOSTS = ['*']
 # Application definition
 
 INSTALLED_APPS = [
+    "leai.apps.LeaiConfig",
     "datapipeline.apps.DatapipelineConfig",
     'django.contrib.admin',
     'django.contrib.auth',

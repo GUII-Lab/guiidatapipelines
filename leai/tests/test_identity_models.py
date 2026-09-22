@@ -1,0 +1,245 @@
+from django.contrib.auth import get_user_model
+from django.db import IntegrityError, connection, transaction
+from django.test import TestCase
+
+from leai.models import (
+    Course,
+    CourseAccessRestriction,
+    CourseMembership,
+    Institution,
+    InstitutionMembership,
+    InstructorAccount,
+)
+
+
+class IdentityModelTests(TestCase):
+    def setUp(self):
+        self.institution_a = Institution.objects.create(
+            slug="ucsc",
+            name="UC Santa Cruz",
+        )
+        self.institution_b = Institution.objects.create(
+            slug="ucd",
+            name="UC Davis",
+        )
+        self.user_a = get_user_model().objects.create_user(
+            username="mimi",
+            email="mirapopo@ucsc.edu",
+        )
+        self.user_b = get_user_model().objects.create_user(
+            username="ulia",
+            email="uzaman@ucd.edu",
+        )
+        self.account_a = InstructorAccount.objects.create(
+            user=self.user_a,
+            email="mirapopo@ucsc.edu",
+            display_name="Mimi Rapoport",
+        )
+        self.account_b = InstructorAccount.objects.create(
+            user=self.user_b,
+            email="uzaman@ucd.edu",
+            display_name="Ulia Zaman",
+        )
+        self.membership_a = InstitutionMembership.objects.create(
+            account=self.account_a,
+            institution=self.institution_a,
+            role="instructor",
+        )
+        self.membership_b = InstitutionMembership.objects.create(
+            account=self.account_b,
+            institution=self.institution_b,
+            role="researcher",
+        )
+        self.course_a = Course.objects.create(
+            institution=self.institution_a,
+            course_code="winter-game-design",
+            name="Winter Game Design",
+        )
+
+    def test_course_belongs_to_exactly_one_institution(self):
+        institution = Institution.objects.create(
+            slug="ucsc-course",
+            name="UC Santa Cruz Course",
+        )
+        course = Course.objects.create(
+            institution=institution,
+            public_id="11111111-1111-4111-8111-111111111111",
+            course_code="winter-game-design",
+            name="Winter Game Design",
+            lifecycle_state=Course.Lifecycle.ACTIVE,
+        )
+
+        self.assertEqual(course.institution, institution)
+
+    def test_one_account_has_one_membership_per_institution(self):
+        user = get_user_model().objects.create_user(
+            username="mimi-membership",
+            email="mirapopo-membership@ucsc.edu",
+        )
+        account = InstructorAccount.objects.create(
+            user=user,
+            email="mirapopo-membership@ucsc.edu",
+            display_name="Mimi Rapoport",
+        )
+        institution = Institution.objects.create(
+            slug="ucsc-membership",
+            name="UC Santa Cruz Membership",
+        )
+        InstitutionMembership.objects.create(
+            account=account,
+            institution=institution,
+            role="instructor",
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            InstitutionMembership.objects.create(
+                account=account,
+                institution=institution,
+                role="researcher",
+            )
+
+    def test_course_membership_rejects_different_institution_on_create(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            CourseMembership.objects.create(
+                course=self.course_a,
+                institution_membership=self.membership_b,
+                role="instructor",
+            )
+
+    def test_course_membership_rejects_different_institution_on_update(self):
+        membership = CourseMembership.objects.create(
+            course=self.course_a,
+            institution_membership=self.membership_a,
+            role="owner",
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            CourseMembership.objects.filter(pk=membership.pk).update(
+                institution_membership=self.membership_b,
+            )
+
+    def test_course_access_restriction_rejects_different_institution_on_create(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            CourseAccessRestriction.objects.create(
+                course=self.course_a,
+                institution_membership=self.membership_b,
+                denied=True,
+            )
+
+    def test_course_access_restriction_rejects_different_institution_on_update(self):
+        restriction = CourseAccessRestriction.objects.create(
+            course=self.course_a,
+            institution_membership=self.membership_a,
+            denied=True,
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            CourseAccessRestriction.objects.filter(pk=restriction.pk).update(
+                institution_membership=self.membership_b,
+            )
+
+    def test_postgresql_defaults_generate_public_ids_for_sql_inserts(self):
+        user = get_user_model().objects.create_user(
+            username="jiahong",
+            email="jli906@ucsc.edu",
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO leai_instructoraccount
+                    (user_id, email, display_name, platform_role, is_active, must_change_password)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING public_id
+                """,
+                [
+                    user.pk,
+                    "jli906@ucsc.edu",
+                    "Jiahong Li",
+                    "platform_admin",
+                    True,
+                    False,
+                ],
+            )
+            account_public_id = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                INSERT INTO leai_course
+                    (institution_id, course_code, name, lifecycle_state,
+                     settings_version, analysis_data_version, banner_enabled,
+                     banner_text, banner_dismissible, banner_display_mode,
+                     banner_duration_seconds, banner_split_enabled,
+                     banner_split_mode, banner_split_value,
+                     assistant_display_name, referral_enabled, referral_text,
+                     completion_certificate_enabled_by_default,
+                     completed_response_download_enabled_by_default)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s)
+                RETURNING public_id
+                """,
+                [
+                    self.institution_b.pk,
+                    "spring-hci",
+                    "Spring HCI",
+                    "active",
+                    1,
+                    0,
+                    False,
+                    "",
+                    False,
+                    "persistent",
+                    10,
+                    False,
+                    "percentage",
+                    50,
+                    "",
+                    False,
+                    "",
+                    False,
+                    False,
+                ],
+            )
+            course_public_id = cursor.fetchone()[0]
+
+        self.assertIsNotNone(account_public_id)
+        self.assertIsNotNone(course_public_id)
+
+    def test_public_ids_reject_bulk_updates(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            InstructorAccount.objects.filter(pk=self.account_a.pk).update(
+                public_id="22222222-2222-4222-8222-222222222222",
+            )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Course.objects.filter(pk=self.course_a.pk).update(
+                public_id="33333333-3333-4333-8333-333333333333",
+            )
+
+    def test_timed_banner_rejects_nonpositive_duration(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Course.objects.create(
+                institution=self.institution_b,
+                course_code="timed-banner",
+                name="Timed Banner",
+                banner_display_mode="timed",
+                banner_duration_seconds=0,
+            )
+
+    def test_percentage_banner_split_rejects_value_over_100(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Course.objects.create(
+                institution=self.institution_b,
+                course_code="percentage-split",
+                name="Percentage Split",
+                banner_split_mode="percentage",
+                banner_split_value=101,
+            )
+
+    def test_count_banner_split_rejects_nonpositive_value(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Course.objects.create(
+                institution=self.institution_b,
+                course_code="count-split",
+                name="Count Split",
+                banner_split_mode="count",
+                banner_split_value=0,
+            )
