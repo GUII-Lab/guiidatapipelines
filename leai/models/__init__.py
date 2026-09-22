@@ -40,6 +40,7 @@ from .analysis import (
     AnalysisSnapshot,
 )
 from .governance import AuditEvent, ImportRecordMap, ImportRecordOutcome, ImportRun
+from .usage import ProductUsageEvent
 
 __all__ = [
     "Course",
@@ -79,4 +80,5 @@ __all__ = [
     "ImportRecordMap",
     "ImportRecordOutcome",
     "ImportRun",
+    "ProductUsageEvent",
 ]
