@@ -25,6 +25,10 @@ class TeamConfiguration(models.Model):
 
     class Meta:
         constraints = [
+            models.UniqueConstraint(
+                fields=("id", "course"),
+                name="leai_team_configuration_id_course_uniq",
+            ),
             models.CheckConstraint(
                 check=models.Q(settings_version__gte=1),
                 name="leai_team_configuration_settings_version_positive",
@@ -68,7 +72,12 @@ class TeamSnapshot(models.Model):
         on_delete=models.PROTECT,
         related_name="snapshots",
     )
-    frozen_at = models.DateTimeField()
+    course = models.ForeignKey(
+        Course,
+        on_delete=models.PROTECT,
+        related_name="team_snapshots",
+    )
+    frozen_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [

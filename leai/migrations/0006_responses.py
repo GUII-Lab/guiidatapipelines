@@ -43,7 +43,8 @@ class Migration(migrations.Migration):
             name='TeamSnapshot',
             fields=[
                 ('id', models.BigAutoField(primary_key=True, serialize=False)),
-                ('frozen_at', models.DateTimeField()),
+                ('frozen_at', models.DateTimeField(blank=True, null=True)),
+                ('course', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='team_snapshots', to='leai.course')),
                 ('occurrence', models.OneToOneField(on_delete=django.db.models.deletion.PROTECT, related_name='team_snapshot', to='leai.surveyoccurrence')),
                 ('source_configuration', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='snapshots', to='leai.teamconfiguration')),
             ],
@@ -146,6 +147,10 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name='teamdefinition',
             constraint=models.UniqueConstraint(fields=('configuration', 'sort_order'), name='leai_team_definition_sort_order_uniq'),
+        ),
+        migrations.AddConstraint(
+            model_name='teamconfiguration',
+            constraint=models.UniqueConstraint(fields=('id', 'course'), name='leai_team_configuration_id_course_uniq'),
         ),
         migrations.AddConstraint(
             model_name='teamconfiguration',
@@ -259,6 +264,10 @@ class Migration(migrations.Migration):
                 ALTER TABLE leai_responsesession
                     ALTER COLUMN public_id SET DEFAULT gen_random_uuid();
 
+                ALTER TABLE leai_surveyoccurrence
+                    ADD CONSTRAINT leai_survey_occurrence_id_course_uniq
+                    UNIQUE (id, course_id);
+
                 CREATE FUNCTION leai_reject_response_identity_update()
                 RETURNS TRIGGER AS $$
                 BEGIN
@@ -296,36 +305,70 @@ class Migration(migrations.Migration):
                 BEFORE UPDATE OF course_id ON leai_teamconfiguration
                 FOR EACH ROW EXECUTE FUNCTION leai_reject_team_configuration_course_update();
 
-                CREATE FUNCTION leai_enforce_team_snapshot_course()
+                CREATE FUNCTION leai_guard_team_snapshot_mutation()
                 RETURNS TRIGGER AS $$
-                DECLARE
-                    configuration_course_id bigint;
-                    occurrence_course_id bigint;
                 BEGIN
-                    SELECT course_id
-                    INTO configuration_course_id
-                    FROM leai_teamconfiguration
-                    WHERE id = NEW.source_configuration_id;
+                    IF TG_OP = 'UPDATE'
+                       AND OLD.frozen_at IS NULL
+                       AND NEW.frozen_at IS NOT NULL
+                       AND NEW.id IS NOT DISTINCT FROM OLD.id
+                       AND NEW.occurrence_id IS NOT DISTINCT FROM OLD.occurrence_id
+                       AND NEW.source_configuration_id IS NOT DISTINCT FROM OLD.source_configuration_id
+                       AND NEW.course_id IS NOT DISTINCT FROM OLD.course_id THEN
+                        RETURN NEW;
+                    END IF;
+                    RAISE EXCEPTION USING
+                        ERRCODE = '23514',
+                        MESSAGE = 'LEAI Team Snapshot rows are immutable after freezing';
+                END;
+                $$ LANGUAGE plpgsql;
 
-                    SELECT course_id
-                    INTO occurrence_course_id
-                    FROM leai_surveyoccurrence
-                    WHERE id = NEW.occurrence_id;
+                CREATE TRIGGER leai_team_snapshot_immutable
+                BEFORE UPDATE OR DELETE ON leai_teamsnapshot
+                FOR EACH ROW EXECUTE FUNCTION leai_guard_team_snapshot_mutation();
 
-                    IF configuration_course_id IS NULL
-                       OR occurrence_course_id IS NULL
-                       OR configuration_course_id <> occurrence_course_id THEN
+                CREATE FUNCTION leai_require_team_snapshot_frozen()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    PERFORM 1
+                    FROM leai_teamsnapshot
+                    WHERE id = NEW.id AND frozen_at IS NOT NULL;
+                    IF NOT FOUND THEN
                         RAISE EXCEPTION USING
                             ERRCODE = '23514',
-                            MESSAGE = 'Team Snapshot source configuration must belong to its Occurrence course';
+                            MESSAGE = 'LEAI Team Snapshot construction must freeze before commit';
+                    END IF;
+                    RETURN NULL;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                CREATE CONSTRAINT TRIGGER leai_team_snapshot_frozen_at_commit
+                AFTER INSERT OR UPDATE ON leai_teamsnapshot
+                DEFERRABLE INITIALLY DEFERRED
+                FOR EACH ROW EXECUTE FUNCTION leai_require_team_snapshot_frozen();
+
+                CREATE FUNCTION leai_reject_late_team_snapshot_item()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    snapshot_frozen_at timestamp with time zone;
+                BEGIN
+                    SELECT frozen_at
+                    INTO snapshot_frozen_at
+                    FROM leai_teamsnapshot
+                    WHERE id = NEW.snapshot_id;
+
+                    IF NOT FOUND OR snapshot_frozen_at IS NOT NULL THEN
+                        RAISE EXCEPTION USING
+                            ERRCODE = '23514',
+                            MESSAGE = 'LEAI Team Snapshot items may only be inserted during construction';
                     END IF;
                     RETURN NEW;
                 END;
                 $$ LANGUAGE plpgsql;
 
-                CREATE TRIGGER leai_team_snapshot_course_matches_configuration
-                BEFORE INSERT ON leai_teamsnapshot
-                FOR EACH ROW EXECUTE FUNCTION leai_enforce_team_snapshot_course();
+                CREATE TRIGGER leai_team_snapshot_item_construction_only
+                BEFORE INSERT ON leai_teamsnapshotitem
+                FOR EACH ROW EXECUTE FUNCTION leai_reject_late_team_snapshot_item();
 
                 CREATE FUNCTION leai_reject_frozen_team_row_mutation()
                 RETURNS TRIGGER AS $$
@@ -336,13 +379,21 @@ class Migration(migrations.Migration):
                 END;
                 $$ LANGUAGE plpgsql;
 
-                CREATE TRIGGER leai_team_snapshot_immutable
-                BEFORE UPDATE OR DELETE ON leai_teamsnapshot
-                FOR EACH ROW EXECUTE FUNCTION leai_reject_frozen_team_row_mutation();
-
                 CREATE TRIGGER leai_team_snapshot_item_immutable
                 BEFORE UPDATE OR DELETE ON leai_teamsnapshotitem
                 FOR EACH ROW EXECUTE FUNCTION leai_reject_frozen_team_row_mutation();
+
+                ALTER TABLE leai_teamsnapshot
+                    ADD CONSTRAINT leai_team_snapshot_occurrence_course_fk
+                    FOREIGN KEY (occurrence_id, course_id)
+                    REFERENCES leai_surveyoccurrence (id, course_id)
+                    DEFERRABLE INITIALLY DEFERRED;
+
+                ALTER TABLE leai_teamsnapshot
+                    ADD CONSTRAINT leai_team_snapshot_configuration_course_fk
+                    FOREIGN KEY (source_configuration_id, course_id)
+                    REFERENCES leai_teamconfiguration (id, course_id)
+                    DEFERRABLE INITIALLY DEFERRED;
 
                 ALTER TABLE leai_teamsnapshotitem
                     ADD CONSTRAINT leai_team_snapshot_item_occurrence_fk
@@ -369,16 +420,28 @@ class Migration(migrations.Migration):
                     DROP CONSTRAINT IF EXISTS leai_response_session_team_occurrence_fk;
                 ALTER TABLE leai_teamsnapshotitem
                     DROP CONSTRAINT IF EXISTS leai_team_snapshot_item_occurrence_fk;
+                ALTER TABLE leai_teamsnapshot
+                    DROP CONSTRAINT IF EXISTS leai_team_snapshot_configuration_course_fk;
+                ALTER TABLE leai_teamsnapshot
+                    DROP CONSTRAINT IF EXISTS leai_team_snapshot_occurrence_course_fk;
+
+                DROP TRIGGER IF EXISTS leai_team_snapshot_item_construction_only
+                    ON leai_teamsnapshotitem;
+                DROP FUNCTION IF EXISTS leai_reject_late_team_snapshot_item();
+
+                DROP TRIGGER IF EXISTS leai_team_snapshot_frozen_at_commit
+                    ON leai_teamsnapshot;
+                DROP FUNCTION IF EXISTS leai_require_team_snapshot_frozen();
 
                 DROP TRIGGER IF EXISTS leai_team_snapshot_item_immutable
                     ON leai_teamsnapshotitem;
                 DROP TRIGGER IF EXISTS leai_team_snapshot_immutable
                     ON leai_teamsnapshot;
+                DROP FUNCTION IF EXISTS leai_guard_team_snapshot_mutation();
                 DROP FUNCTION IF EXISTS leai_reject_frozen_team_row_mutation();
 
-                DROP TRIGGER IF EXISTS leai_team_snapshot_course_matches_configuration
-                    ON leai_teamsnapshot;
-                DROP FUNCTION IF EXISTS leai_enforce_team_snapshot_course();
+                ALTER TABLE leai_surveyoccurrence
+                    DROP CONSTRAINT IF EXISTS leai_survey_occurrence_id_course_uniq;
 
                 DROP TRIGGER IF EXISTS leai_team_configuration_course_immutable
                     ON leai_teamconfiguration;

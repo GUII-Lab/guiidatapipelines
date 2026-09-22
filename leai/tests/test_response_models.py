@@ -38,6 +38,8 @@ from leai.models import (
 TEAM_OCCURRENCE_FK = "leai_response_session_team_occurrence_fk"
 PDF_OCCURRENCE_FK = "leai_response_session_pdf_occurrence_fk"
 SNAPSHOT_ITEM_OCCURRENCE_FK = "leai_team_snapshot_item_occurrence_fk"
+SNAPSHOT_OCCURRENCE_COURSE_FK = "leai_team_snapshot_occurrence_course_fk"
+SNAPSHOT_CONFIGURATION_COURSE_FK = "leai_team_snapshot_configuration_course_fk"
 
 
 class ResponseFixturesMixin:
@@ -130,19 +132,24 @@ class ResponseFixturesMixin:
         configuration = configuration or self.make_team_configuration(
             course=occurrence.course,
         )
-        snapshot = TeamSnapshot.objects.create(
-            occurrence=occurrence,
-            source_configuration=configuration,
-            frozen_at=timezone.now(),
-        )
         suffix = self.next_suffix()
-        return TeamSnapshotItem.objects.create(
-            snapshot=snapshot,
-            occurrence=occurrence,
-            item_number=1,
-            stable_key=f"team-{suffix}",
-            label=f"Team {suffix}",
-        )
+        with transaction.atomic():
+            snapshot = TeamSnapshot.objects.create(
+                occurrence=occurrence,
+                source_configuration=configuration,
+                course=occurrence.course,
+                frozen_at=None,
+            )
+            item = TeamSnapshotItem.objects.create(
+                snapshot=snapshot,
+                occurrence=occurrence,
+                item_number=1,
+                stable_key=f"team-{suffix}",
+                label=f"Team {suffix}",
+            )
+            snapshot.frozen_at = timezone.now()
+            snapshot.save(update_fields=["frozen_at"])
+        return item
 
     def make_pdf_batch(self, *, occurrence=None, **overrides):
         occurrence = occurrence or self.make_occurrence()
@@ -367,37 +374,42 @@ class ResponseModelTests(ResponseFixturesMixin, TestCase):
                 sort_order=2,
             )
 
-        snapshot = TeamSnapshot.objects.create(
-            occurrence=team_occurrence,
-            source_configuration=configuration,
-            frozen_at=timezone.now(),
-        )
-        TeamSnapshotItem.objects.create(
-            snapshot=snapshot,
-            occurrence=team_occurrence,
-            item_number=1,
-            stable_key="team-a",
-            label="Team A",
-        )
-
-        with self.assertRaises(IntegrityError), transaction.atomic():
+        with transaction.atomic():
+            snapshot = TeamSnapshot.objects.create(
+                occurrence=team_occurrence,
+                source_configuration=configuration,
+                course=team_occurrence.course,
+                frozen_at=None,
+            )
             TeamSnapshotItem.objects.create(
                 snapshot=snapshot,
                 occurrence=team_occurrence,
                 item_number=1,
-                stable_key="team-b",
-                label="Team B",
+                stable_key="team-a",
+                label="Team A",
             )
 
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            TeamSnapshotItem.objects.create(
-                snapshot=snapshot,
-                occurrence=other_occurrence,
-                item_number=2,
-                stable_key="team-b",
-                label="Team B",
-            )
-            self.force_constraints(SNAPSHOT_ITEM_OCCURRENCE_FK)
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                TeamSnapshotItem.objects.create(
+                    snapshot=snapshot,
+                    occurrence=team_occurrence,
+                    item_number=1,
+                    stable_key="team-b",
+                    label="Team B",
+                )
+
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                TeamSnapshotItem.objects.create(
+                    snapshot=snapshot,
+                    occurrence=other_occurrence,
+                    item_number=2,
+                    stable_key="team-b",
+                    label="Team B",
+                )
+                self.force_constraints(SNAPSHOT_ITEM_OCCURRENCE_FK)
+
+            snapshot.frozen_at = timezone.now()
+            snapshot.save(update_fields=["frozen_at"])
 
         wrong_course_configuration = self.make_team_configuration(
             course=self.other_course,
@@ -406,8 +418,10 @@ class ResponseModelTests(ResponseFixturesMixin, TestCase):
             TeamSnapshot.objects.create(
                 occurrence=team_occurrence,
                 source_configuration=wrong_course_configuration,
+                course=team_occurrence.course,
                 frozen_at=timezone.now(),
             )
+            self.force_constraints(SNAPSHOT_CONFIGURATION_COURSE_FK)
 
         with self.assertRaises(IntegrityError), transaction.atomic():
             TeamConfiguration.objects.filter(pk=configuration.pk).update(
@@ -420,6 +434,121 @@ class ResponseModelTests(ResponseFixturesMixin, TestCase):
 
         self.assertFalse(configuration.definitions.exists())
         self.assertFalse(TeamSnapshot.objects.filter(occurrence=occurrence).exists())
+
+    def test_team_snapshot_items_are_built_atomically_before_freeze(self):
+        occurrence = self.make_occurrence(audience="team")
+        configuration = self.make_team_configuration(course=occurrence.course)
+
+        with transaction.atomic():
+            snapshot = TeamSnapshot.objects.create(
+                occurrence=occurrence,
+                source_configuration=configuration,
+                course=occurrence.course,
+                frozen_at=None,
+            )
+            item = TeamSnapshotItem.objects.create(
+                snapshot=snapshot,
+                occurrence=occurrence,
+                item_number=1,
+                stable_key="atomic-team",
+                label="Atomic Team",
+            )
+            snapshot.frozen_at = timezone.now()
+            snapshot.save(update_fields=["frozen_at"])
+
+        self.assertEqual(snapshot.items.get(), item)
+        self.assertIsNotNone(snapshot.frozen_at)
+
+    def test_direct_orm_rejects_late_item_insert_into_frozen_snapshot(self):
+        item = self.make_team_item()
+
+        self.assert_integrity_code(
+            lambda: TeamSnapshotItem.objects.create(
+                snapshot=item.snapshot,
+                occurrence=item.occurrence,
+                item_number=2,
+                stable_key="late-team",
+                label="Late Team",
+            ),
+        )
+
+    def test_raw_sql_rejects_late_item_insert_into_frozen_snapshot(self):
+        item = self.make_team_item()
+
+        def insert_late_item():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO leai_teamsnapshotitem
+                        (snapshot_id, occurrence_id, item_number, stable_key, label)
+                    VALUES (%s, %s, 2, 'raw-late-team', 'Raw Late Team')
+                    """,
+                    [item.snapshot_id, item.occurrence_id],
+                )
+
+        self.assert_integrity_code(insert_late_item)
+
+    def test_parent_delete_reinsert_cannot_change_a_snapshot_course(self):
+        item = self.make_team_item()
+        snapshot = item.snapshot
+        other_occurrence = self.make_occurrence(
+            course=self.other_course,
+            audience="team",
+        )
+
+        def replace_configuration():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM leai_teamconfiguration WHERE id = %s",
+                    [snapshot.source_configuration_id],
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO leai_teamconfiguration
+                        (id, course_id, name, settings_version, created_by_id,
+                         created_at, updated_at)
+                    VALUES (%s, %s, 'Replacement Teams', 1, %s,
+                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    [
+                        snapshot.source_configuration_id,
+                        self.other_course.pk,
+                        self.account.pk,
+                    ],
+                )
+            self.force_constraints("ALL")
+
+        def replace_occurrence():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM leai_surveyoccurrence WHERE id = %s",
+                    [snapshot.occurrence_id],
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO leai_surveyoccurrence
+                        (id, public_id, revision_id, course_id, created_by_id,
+                         label, provenance, management_mode, opens_at, closes_at,
+                         manually_closed_at, settings_version,
+                         completion_certificate_enabled,
+                         completed_response_download_enabled, created_at, updated_at)
+                    VALUES (%s, gen_random_uuid(), %s, %s, %s,
+                            'Replacement Occurrence', 'native', 'managed',
+                            NULL, NULL, NULL, 1, FALSE, FALSE,
+                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    [
+                        snapshot.occurrence_id,
+                        other_occurrence.revision_id,
+                        self.other_course.pk,
+                        self.account.pk,
+                    ],
+                )
+            self.force_constraints("ALL")
+
+        for replacement in (replace_configuration, replace_occurrence):
+            with self.subTest(replacement=replacement.__name__):
+                self.assert_integrity_code(replacement, expected_code="23503")
 
     def test_response_team_and_pdf_assignments_must_share_occurrence(self):
         first_occurrence = self.make_occurrence(audience="team")
@@ -444,19 +573,8 @@ class ResponseModelTests(ResponseFixturesMixin, TestCase):
     def test_occurrence_ownership_and_team_snapshots_are_immutable_via_model_save(self):
         first_occurrence = self.make_occurrence(audience="team")
         second_occurrence = self.make_occurrence(audience="team")
-        configuration = self.make_team_configuration(course=first_occurrence.course)
-        snapshot = TeamSnapshot.objects.create(
-            occurrence=first_occurrence,
-            source_configuration=configuration,
-            frozen_at=timezone.now(),
-        )
-        item = TeamSnapshotItem.objects.create(
-            snapshot=snapshot,
-            occurrence=first_occurrence,
-            item_number=1,
-            stable_key="immutable-team",
-            label="Immutable Team",
-        )
+        item = self.make_team_item(occurrence=first_occurrence)
+        snapshot = item.snapshot
         session = self.make_student_session(occurrence=first_occurrence)
         batch = self.make_pdf_batch(occurrence=first_occurrence)
 
@@ -489,6 +607,7 @@ class ResponseModelTests(ResponseFixturesMixin, TestCase):
         empty_snapshot = TeamSnapshot.objects.create(
             occurrence=self.make_occurrence(audience="team"),
             source_configuration=self.make_team_configuration(course=self.course),
+            course=self.course,
             frozen_at=timezone.now(),
         )
 
@@ -602,17 +721,36 @@ class ResponseModelTests(ResponseFixturesMixin, TestCase):
         second_occurrence = self.make_occurrence(audience="team")
         team_item = self.make_team_item(occurrence=first_occurrence)
         batch = self.make_pdf_batch(occurrence=first_occurrence)
+        construction_occurrence = self.make_occurrence(audience="team")
+        construction_configuration = self.make_team_configuration(
+            course=construction_occurrence.course,
+        )
+
+        def insert_mismatched_snapshot_item():
+            snapshot = TeamSnapshot.objects.create(
+                occurrence=construction_occurrence,
+                source_configuration=construction_configuration,
+                course=construction_occurrence.course,
+                frozen_at=None,
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO leai_teamsnapshotitem
+                        (snapshot_id, occurrence_id, item_number, stable_key, label)
+                    VALUES (%s, %s, 1, 'raw-cross-occurrence',
+                            'Raw Cross Occurrence')
+                    """,
+                    [snapshot.pk, second_occurrence.pk],
+                )
+            self.force_constraints(SNAPSHOT_ITEM_OCCURRENCE_FK)
+
+        self.assert_integrity_code(
+            insert_mismatched_snapshot_item,
+            expected_code="23503",
+        )
 
         invalid_inserts = [
-            (
-                """
-                INSERT INTO leai_teamsnapshotitem
-                    (snapshot_id, occurrence_id, item_number, stable_key, label)
-                VALUES (%s, %s, 2, 'raw-cross-occurrence', 'Raw Cross Occurrence')
-                """,
-                [team_item.snapshot_id, second_occurrence.pk],
-                SNAPSHOT_ITEM_OCCURRENCE_FK,
-            ),
             (
                 """
                 INSERT INTO leai_responsesession
@@ -765,6 +903,22 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
             cursor.execute("SELECT pg_blocking_pids(%s)", [database_pid])
             return cursor.fetchone()[0]
 
+    def test_team_snapshot_construction_cannot_commit_unfrozen(self):
+        occurrence = self.make_occurrence(audience="team")
+        configuration = self.make_team_configuration(course=occurrence.course)
+
+        with self.assertRaises(IntegrityError) as caught:
+            with transaction.atomic():
+                TeamSnapshot.objects.create(
+                    occurrence=occurrence,
+                    source_configuration=configuration,
+                    course=occurrence.course,
+                    frozen_at=None,
+                )
+
+        self.assertEqual(caught.exception.__cause__.pgcode, "23514")
+        self.assertFalse(TeamSnapshot.objects.filter(occurrence=occurrence).exists())
+
     def run_immutable_parent_child_race(
         self,
         *,
@@ -862,29 +1016,6 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
         self.assertEqual(results.get("parent", ())[:2], ("integrity", "23514"), results)
         self.assertEqual(results.get("child"), ("committed",), results)
 
-    def make_snapshot_item_race(self):
-        original_occurrence = self.make_occurrence(audience="team")
-        other_occurrence = self.make_occurrence(audience="team")
-        configuration = self.make_team_configuration(course=self.course)
-        snapshot = TeamSnapshot.objects.create(
-            occurrence=original_occurrence,
-            source_configuration=configuration,
-            frozen_at=timezone.now(),
-        )
-        suffix = self.next_suffix()
-        return (
-            lambda: TeamSnapshot.objects.filter(pk=snapshot.pk).update(
-                occurrence=other_occurrence,
-            ),
-            lambda: TeamSnapshotItem.objects.create(
-                snapshot=snapshot,
-                occurrence=original_occurrence,
-                item_number=1,
-                stable_key=f"race-team-{suffix}",
-                label=f"Race Team {suffix}",
-            ),
-        )
-
     def make_item_session_race(self):
         original_occurrence = self.make_occurrence(audience="team")
         other_occurrence = self.make_occurrence(audience="team")
@@ -932,7 +1063,6 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
 
     def test_occurrence_parent_child_races_reject_parent_first_and_child_first_moves(self):
         case_factories = (
-            self.make_snapshot_item_race,
             self.make_item_session_race,
             self.make_batch_session_race,
             self.make_session_message_race,
@@ -949,6 +1079,155 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
                         child_write=child_write,
                         parent_first=parent_first,
                     )
+
+    def test_concurrent_late_item_inserts_cannot_extend_frozen_snapshot(self):
+        item = self.make_team_item()
+        start = threading.Barrier(3)
+        outcomes = queue.Queue()
+
+        def insert_late_item(item_number):
+            try:
+                close_old_connections()
+                start.wait(self.thread_timeout_seconds)
+                with transaction.atomic():
+                    TeamSnapshotItem.objects.create(
+                        snapshot_id=item.snapshot_id,
+                        occurrence_id=item.occurrence_id,
+                        item_number=item_number,
+                        stable_key=f"concurrent-late-{item_number}",
+                        label=f"Concurrent Late {item_number}",
+                    )
+                outcomes.put(("committed", item_number))
+            except IntegrityError as error:
+                outcomes.put(("integrity", item_number, *self.error_details(error)))
+            except Exception as error:
+                outcomes.put(("error", item_number, repr(error)))
+            finally:
+                close_old_connections()
+
+        threads = [
+            threading.Thread(target=insert_late_item, args=(item_number,))
+            for item_number in (2, 3)
+        ]
+        for thread in threads:
+            thread.start()
+        start.wait(self.thread_timeout_seconds)
+        for thread in threads:
+            thread.join(self.thread_timeout_seconds)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        results = sorted(outcomes.get_nowait() for _ in threads)
+        self.assertEqual(
+            [result[0:2] + result[2:3] for result in results],
+            [
+                ("integrity", 2, "23514"),
+                ("integrity", 3, "23514"),
+            ],
+            results,
+        )
+        self.assertEqual(
+            TeamSnapshotItem.objects.filter(snapshot_id=item.snapshot_id).count(),
+            1,
+        )
+
+    def test_concurrent_parent_replacement_cannot_commit_stale_course_snapshot(self):
+        occurrence = self.make_occurrence(audience="team")
+        configuration = self.make_team_configuration(course=occurrence.course)
+        replacement_ready = threading.Event()
+        insert_started = threading.Event()
+        insert_finished = threading.Event()
+        release_replacement = threading.Event()
+        release_snapshot_commit = threading.Event()
+        outcomes = queue.Queue()
+
+        def replace_configuration():
+            try:
+                close_old_connections()
+                with transaction.atomic():
+                    with connections["default"].cursor() as cursor:
+                        cursor.execute(
+                            "DELETE FROM leai_teamconfiguration WHERE id = %s",
+                            [configuration.pk],
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO leai_teamconfiguration
+                                (id, course_id, name, settings_version,
+                                 created_by_id, created_at, updated_at)
+                            VALUES (%s, %s, 'Concurrent Replacement', 1, %s,
+                                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """,
+                            [
+                                configuration.pk,
+                                self.other_course.pk,
+                                self.account.pk,
+                            ],
+                        )
+                    replacement_ready.set()
+                    if not release_replacement.wait(self.thread_timeout_seconds):
+                        raise RuntimeError("replacement was not released")
+                outcomes.put(("replacement", "committed"))
+            except IntegrityError as error:
+                outcomes.put(
+                    ("replacement", "integrity", *self.error_details(error)),
+                )
+            except Exception as error:
+                outcomes.put(("replacement", "error", repr(error)))
+            finally:
+                close_old_connections()
+
+        def create_snapshot():
+            try:
+                close_old_connections()
+                if not replacement_ready.wait(self.thread_timeout_seconds):
+                    raise RuntimeError("replacement did not begin")
+                with transaction.atomic():
+                    insert_started.set()
+                    TeamSnapshot.objects.create(
+                        occurrence_id=occurrence.pk,
+                        source_configuration_id=configuration.pk,
+                        course_id=occurrence.course_id,
+                        frozen_at=timezone.now(),
+                    )
+                    insert_finished.set()
+                    if not release_snapshot_commit.wait(
+                        self.thread_timeout_seconds,
+                    ):
+                        raise RuntimeError("snapshot commit was not released")
+                outcomes.put(("snapshot", "committed"))
+            except IntegrityError as error:
+                outcomes.put(("snapshot", "integrity", *self.error_details(error)))
+            except DatabaseError as error:
+                outcomes.put(
+                    ("snapshot", "database_error", *self.error_details(error)),
+                )
+            except Exception as error:
+                outcomes.put(("snapshot", "error", repr(error)))
+            finally:
+                close_old_connections()
+
+        replacement_thread = threading.Thread(target=replace_configuration)
+        snapshot_thread = threading.Thread(target=create_snapshot)
+        replacement_thread.start()
+        snapshot_thread.start()
+        self.assertTrue(insert_started.wait(self.thread_timeout_seconds))
+        inserted_before_replacement_commit = insert_finished.wait(1)
+
+        release_replacement.set()
+        replacement_thread.join(self.thread_timeout_seconds)
+        release_snapshot_commit.set()
+        snapshot_thread.join(self.thread_timeout_seconds)
+
+        self.assertTrue(inserted_before_replacement_commit)
+        self.assertFalse(replacement_thread.is_alive())
+        self.assertFalse(snapshot_thread.is_alive())
+        results = {}
+        while not outcomes.empty():
+            result = outcomes.get_nowait()
+            results[result[0]] = result[1:]
+        self.assertEqual(results.get("replacement"), ("committed",), results)
+        self.assertEqual(results.get("snapshot", ())[:2], ("integrity", "23503"), results)
+        self.assertFalse(TeamSnapshot.objects.filter(occurrence=occurrence).exists())
 
     def test_team_snapshot_insert_does_not_block_on_inverse_parent_lock_order(self):
         occurrence = self.make_occurrence(audience="team")
@@ -994,6 +1273,7 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
                     TeamSnapshot.objects.create(
                         occurrence=occurrence,
                         source_configuration=configuration,
+                        course=occurrence.course,
                         frozen_at=timezone.now(),
                     )
                     insert_completed.set()
@@ -1039,7 +1319,7 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
         self.assertEqual(results.get("locker"), ("committed",), results)
         self.assertEqual(results.get("inserter"), ("committed",), results)
 
-    def test_occurrence_foreign_keys_are_explicitly_deferred(self):
+    def test_composite_foreign_keys_are_explicitly_deferred(self):
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1051,6 +1331,8 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
                     TEAM_OCCURRENCE_FK,
                     PDF_OCCURRENCE_FK,
                     SNAPSHOT_ITEM_OCCURRENCE_FK,
+                    SNAPSHOT_OCCURRENCE_COURSE_FK,
+                    SNAPSHOT_CONFIGURATION_COURSE_FK,
                 ]],
             )
             constraints = {name: (deferrable, deferred) for name, deferrable, deferred in cursor}
@@ -1061,5 +1343,7 @@ class ResponseOccurrenceConcurrencyTests(ResponseFixturesMixin, TransactionTestC
                 TEAM_OCCURRENCE_FK: (True, True),
                 PDF_OCCURRENCE_FK: (True, True),
                 SNAPSHOT_ITEM_OCCURRENCE_FK: (True, True),
+                SNAPSHOT_OCCURRENCE_COURSE_FK: (True, True),
+                SNAPSHOT_CONFIGURATION_COURSE_FK: (True, True),
             },
         )
