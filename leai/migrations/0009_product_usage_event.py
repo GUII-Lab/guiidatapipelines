@@ -71,6 +71,11 @@ class Migration(migrations.Migration):
                 CREATE FUNCTION leai_reject_usage_event_mutation()
                 RETURNS trigger AS $$
                 BEGIN
+                    IF TG_OP = 'TRUNCATE'
+                       AND current_setting('transaction_isolation') = 'read committed'
+                       AND NOT EXISTS (SELECT 1 FROM leai_productusageevent) THEN
+                        RETURN NULL;
+                    END IF;
                     RAISE EXCEPTION 'LEAI ProductUsageEvent is append-only'
                         USING ERRCODE = '23514';
                 END;
@@ -79,8 +84,13 @@ class Migration(migrations.Migration):
                 CREATE TRIGGER leai_usage_event_append_only
                     BEFORE UPDATE OR DELETE ON leai_productusageevent
                     FOR EACH ROW EXECUTE FUNCTION leai_reject_usage_event_mutation();
+
+                CREATE TRIGGER leai_usage_event_truncate_guard
+                    BEFORE TRUNCATE ON leai_productusageevent
+                    FOR EACH STATEMENT EXECUTE FUNCTION leai_reject_usage_event_mutation();
             """,
             reverse_sql="""
+                DROP TRIGGER leai_usage_event_truncate_guard ON leai_productusageevent;
                 DROP TRIGGER leai_usage_event_append_only ON leai_productusageevent;
                 DROP FUNCTION leai_reject_usage_event_mutation();
                 DROP TRIGGER leai_usage_event_parent_consent ON leai_productusageevent;

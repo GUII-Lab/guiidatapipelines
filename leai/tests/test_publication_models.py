@@ -226,7 +226,7 @@ class PublicationModelTests(TestCase):
             lambda: AuthoringConversation.objects.filter(pk=conversation.pk).update(
                 question_set=self.make_question_set(),
             ),
-            "Authoring Conversation question_set must match dependent Run base draft versions",
+            "Authoring Conversation creation provenance is immutable",
         )
         for values in (
             {"status": "invalid", "source_provenance_snapshot": {"source": "builder"}},
@@ -728,50 +728,6 @@ class PublicationConcurrencyTests(TransactionTestCase):
         results = {result[0]: result[1:] for result in (outcomes.get(), outcomes.get())}
         self.assertEqual(results["child"], ("committed",), results)
         self.assertEqual(results["parent"], ("integrity", "23514", parent_message), results)
-
-    def test_parent_first_conversation_move_rejects_later_run_with_old_question_set(self):
-        revision = self.make_revision()
-        conversation = AuthoringConversation.objects.create(
-            question_set=revision.question_set,
-            origin_surface="builder",
-            created_by=self.account,
-        )
-        other_question_set = self.make_question_set("Moved conversation questions")
-        self.assert_parent_first_child_write_stays_consistent(
-            parent_write=lambda: AuthoringConversation.objects.filter(pk=conversation.pk).update(
-                question_set=other_question_set,
-            ),
-            child_write=lambda: AuthoringRun.objects.create(
-                conversation=conversation,
-                base_draft_version=revision.source_draft_version,
-                requested_by=self.account,
-                status="pending",
-                source_provenance_snapshot={"source": "builder"},
-            ),
-            child_message="Authoring Run base draft version must belong to its Conversation Question Set",
-        )
-
-    def test_child_first_run_rejects_later_conversation_move(self):
-        revision = self.make_revision()
-        conversation = AuthoringConversation.objects.create(
-            question_set=revision.question_set,
-            origin_surface="builder",
-            created_by=self.account,
-        )
-        other_question_set = self.make_question_set("Moved conversation questions")
-        self.assert_child_first_parent_mutation_rejects(
-            child_write=lambda: AuthoringRun.objects.create(
-                conversation=conversation,
-                base_draft_version=revision.source_draft_version,
-                requested_by=self.account,
-                status="pending",
-                source_provenance_snapshot={"source": "builder"},
-            ),
-            parent_write=lambda: AuthoringConversation.objects.filter(pk=conversation.pk).update(
-                question_set=other_question_set,
-            ),
-            parent_message="Authoring Conversation question_set must match dependent Run base draft versions",
-        )
 
     def test_parent_first_course_move_rejects_later_institution_template_source(self):
         revision = self.make_revision()

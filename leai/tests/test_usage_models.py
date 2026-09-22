@@ -183,6 +183,16 @@ class ProductUsageEventModelTests(TestCase):
             self.event_model.objects.filter(pk=event.pk).delete()
         self.assertEqual(self.event_model.objects.get(pk=event.pk).response_phase, "first_load")
 
+    def test_direct_sql_truncate_is_rejected(self):
+        session = self.make_session()
+        event = self.make_load(session)
+        connection.check_constraints()
+        table = self.event_model._meta.db_table
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(f"TRUNCATE TABLE {table}")
+        self.assertTrue(self.event_model.objects.filter(pk=event.pk).exists())
+
     def test_model_has_only_bounded_schema_columns(self):
         self.assertEqual(
             {field.name for field in self.event_model._meta.local_fields},
