@@ -10,6 +10,7 @@ from django.db import (
     connections,
     transaction,
 )
+from django.db.models import F
 from django.test import TestCase, TransactionTestCase
 
 from leai.models import (
@@ -415,12 +416,60 @@ class IdentityConcurrencyTests(TransactionTestCase):
             role="researcher",
         )
 
-    def _assert_parent_update_rejects_racing_child_create(self, child_kind):
-        course = Course.objects.create(
+    def _assert_parent_update_rejects_racing_child_write(
+        self,
+        *,
+        parent_kind,
+        child_kind,
+        child_write_kind,
+    ):
+        parent_course = Course.objects.create(
             institution=self.institution_a,
-            course_code=f"race-{child_kind}",
-            name=f"Race {child_kind}",
+            course_code=f"race-parent-{parent_kind}-{child_kind}-{child_write_kind}",
+            name=f"Race Parent {parent_kind} {child_kind} {child_write_kind}",
         )
+        parent_membership = self.membership_a
+        relation = None
+        source_course = None
+        source_membership = None
+
+        if child_write_kind == "create":
+            target_course = parent_course
+            target_membership = parent_membership
+        elif parent_kind == "course":
+            source_course = Course.objects.create(
+                institution=self.institution_a,
+                course_code=f"race-source-{child_kind}",
+                name=f"Race Source {child_kind}",
+            )
+            target_course = parent_course
+            target_membership = self.membership_a
+            relation = self._create_child_relation(
+                child_kind,
+                course=source_course,
+                institution_membership=target_membership,
+            )
+        else:
+            source_membership = InstitutionMembership.objects.create(
+                account=InstructorAccount.objects.create(
+                    user=get_user_model().objects.create_user(
+                        username=f"source-{child_kind}",
+                        email=f"source-{child_kind}@ucsc.edu",
+                    ),
+                    email=f"source-{child_kind}@ucsc.edu",
+                    display_name=f"Source {child_kind}",
+                ),
+                institution=self.institution_a,
+                role="instructor",
+            )
+            target_course = parent_course
+            target_membership = parent_membership
+            relation = self._create_child_relation(
+                child_kind,
+                course=target_course,
+                institution_membership=source_membership,
+            )
+
         parent_updated = threading.Event()
         child_attempted = threading.Event()
         child_write_completed = threading.Event()
@@ -436,9 +485,14 @@ class IdentityConcurrencyTests(TransactionTestCase):
                 database.ensure_connection()
                 database_pid = database.connection.get_backend_pid()
                 with transaction.atomic():
-                    Course.objects.filter(pk=course.pk).update(
-                        institution=self.institution_b,
-                    )
+                    if parent_kind == "course":
+                        Course.objects.filter(pk=parent_course.pk).update(
+                            institution=self.institution_b,
+                        )
+                    else:
+                        InstitutionMembership.objects.filter(
+                            pk=parent_membership.pk,
+                        ).update(institution=self.institution_b)
                     parent_updated.set()
                     if not allow_parent_commit.wait(self.thread_timeout_seconds * 2):
                         raise RuntimeError("test did not release the parent transaction")
@@ -459,18 +513,21 @@ class IdentityConcurrencyTests(TransactionTestCase):
                     if not parent_updated.wait(self.thread_timeout_seconds):
                         raise RuntimeError("parent did not update its institution")
                     child_attempted.set()
-                    if child_kind == "membership":
-                        CourseMembership.objects.create(
-                            course=course,
-                            institution_membership=self.membership_a,
-                            role="owner",
+                    if child_write_kind == "create":
+                        self._create_child_relation(
+                            child_kind,
+                            course=target_course,
+                            institution_membership=target_membership,
                         )
                     else:
-                        CourseAccessRestriction.objects.create(
-                            course=course,
-                            institution_membership=self.membership_a,
-                            denied=True,
-                        )
+                        if parent_kind == "course":
+                            type(relation).objects.filter(pk=relation.pk).update(
+                                course=target_course,
+                            )
+                        else:
+                            type(relation).objects.filter(pk=relation.pk).update(
+                                institution_membership=target_membership,
+                            )
                     child_write_completed.set()
                     if not allow_child_commit.wait(self.thread_timeout_seconds):
                         raise RuntimeError("test did not release the child transaction")
@@ -509,25 +566,112 @@ class IdentityConcurrencyTests(TransactionTestCase):
         self.assertEqual(results["parent"][0], "committed", results)
         self.assertEqual(results["child"][0], "rejected", results)
         self.assertNotEqual(results["parent"][1], results["child"][1])
+        if parent_kind == "course":
+            parent_course.refresh_from_db()
+            self.assertEqual(parent_course.institution, self.institution_b)
+        else:
+            parent_membership.refresh_from_db()
+            self.assertEqual(parent_membership.institution, self.institution_b)
+
+        if relation is not None:
+            relation.refresh_from_db()
+            if source_course is not None:
+                self.assertEqual(relation.course, source_course)
+            if source_membership is not None:
+                self.assertEqual(relation.institution_membership, source_membership)
+
         self.assertFalse(
-            (
-                CourseMembership.objects.filter(
-                    course=course,
-                    institution_membership=self.membership_a,
-                ).exists()
-                if child_kind == "membership"
-                else CourseAccessRestriction.objects.filter(
-                    course=course,
-                    institution_membership=self.membership_a,
-                ).exists()
+            CourseMembership.objects.exclude(
+                course__institution_id=F("institution_membership__institution_id"),
+            ).exists(),
+        )
+        self.assertFalse(
+            CourseAccessRestriction.objects.exclude(
+                course__institution_id=F("institution_membership__institution_id"),
+            ).exists(),
+        )
+
+    @staticmethod
+    def _create_child_relation(child_kind, *, course, institution_membership):
+        if child_kind == "membership":
+            return CourseMembership.objects.create(
+                course=course,
+                institution_membership=institution_membership,
+                role="owner",
             )
+        return CourseAccessRestriction.objects.create(
+            course=course,
+            institution_membership=institution_membership,
+            denied=True,
         )
 
     def test_parent_update_racing_course_membership_create_cannot_commit_mismatch(self):
-        self._assert_parent_update_rejects_racing_child_create("membership")
+        self._assert_parent_update_rejects_racing_child_write(
+            parent_kind="course",
+            child_kind="membership",
+            child_write_kind="create",
+        )
 
     def test_parent_update_racing_restriction_create_cannot_commit_mismatch(self):
-        self._assert_parent_update_rejects_racing_child_create("restriction")
+        self._assert_parent_update_rejects_racing_child_write(
+            parent_kind="course",
+            child_kind="restriction",
+            child_write_kind="create",
+        )
+
+    def test_membership_parent_update_racing_course_membership_create_cannot_commit_mismatch(
+        self,
+    ):
+        self._assert_parent_update_rejects_racing_child_write(
+            parent_kind="institution_membership",
+            child_kind="membership",
+            child_write_kind="create",
+        )
+
+    def test_membership_parent_update_racing_restriction_create_cannot_commit_mismatch(
+        self,
+    ):
+        self._assert_parent_update_rejects_racing_child_write(
+            parent_kind="institution_membership",
+            child_kind="restriction",
+            child_write_kind="create",
+        )
+
+    def test_course_parent_update_racing_course_membership_reassignment_cannot_commit_mismatch(
+        self,
+    ):
+        self._assert_parent_update_rejects_racing_child_write(
+            parent_kind="course",
+            child_kind="membership",
+            child_write_kind="reassign",
+        )
+
+    def test_course_parent_update_racing_restriction_reassignment_cannot_commit_mismatch(
+        self,
+    ):
+        self._assert_parent_update_rejects_racing_child_write(
+            parent_kind="course",
+            child_kind="restriction",
+            child_write_kind="reassign",
+        )
+
+    def test_membership_parent_update_racing_course_membership_reassignment_cannot_commit_mismatch(
+        self,
+    ):
+        self._assert_parent_update_rejects_racing_child_write(
+            parent_kind="institution_membership",
+            child_kind="membership",
+            child_write_kind="reassign",
+        )
+
+    def test_membership_parent_update_racing_restriction_reassignment_cannot_commit_mismatch(
+        self,
+    ):
+        self._assert_parent_update_rejects_racing_child_write(
+            parent_kind="institution_membership",
+            child_kind="restriction",
+            child_write_kind="reassign",
+        )
 
     def test_nonconflicting_child_create_commits_while_parent_update_is_open(self):
         course_to_update = Course.objects.create(
