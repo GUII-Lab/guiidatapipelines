@@ -5,6 +5,7 @@ from django.conf.urls.static import static
 
 
 urlpatterns = [
+    path("datapipeline/api/v1/", include("leai.api.urls")),
     path("datapipeline/", include("datapipeline.urls")),
     path('admin/', admin.site.urls),
 ]

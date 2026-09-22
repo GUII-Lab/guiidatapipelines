@@ -145,3 +145,8 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ALLOW_ALL_ORIGINS = True  # For development only, specify domains in production
 django_heroku.settings(locals())
+
+# The canonical LEAI API is opt-in per deployment. The legacy Django runtime
+# stays local until QA and Production provide separately reviewed identities.
+LEAI_ENVIRONMENT = os.environ.get("LEAI_ENVIRONMENT", "local")
+LEAI_BUILD_ID = os.environ.get("LEAI_BUILD_ID", "local-backend")
