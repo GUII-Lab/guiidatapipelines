@@ -22,6 +22,16 @@ from .authoring import (
     QuestionSetTemplateRevision,
     SurveyOccurrence,
 )
+from .responses import (
+    PdfImportBatch,
+    PdfImportJob,
+    ResponseMessage,
+    ResponseSession,
+    TeamConfiguration,
+    TeamDefinition,
+    TeamSnapshot,
+    TeamSnapshotItem,
+)
 
 __all__ = [
     "Course",
@@ -44,4 +54,12 @@ __all__ = [
     "QuestionSetTemplate",
     "QuestionSetTemplateRevision",
     "SurveyOccurrence",
+    "PdfImportBatch",
+    "PdfImportJob",
+    "ResponseMessage",
+    "ResponseSession",
+    "TeamConfiguration",
+    "TeamDefinition",
+    "TeamSnapshot",
+    "TeamSnapshotItem",
 ]
