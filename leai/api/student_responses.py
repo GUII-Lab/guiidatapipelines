@@ -92,7 +92,8 @@ def _messages(session):
         "role": message.role,
         "content": message.content,
         "created_at": message.created_at.isoformat(),
-        "attribution": message.attribution,
+        "attribution": {key: value for key, value in message.attribution.items()
+                        if key != "orchestration_metrics"},
     } for message in session.messages.order_by("sequence")]
 
 
@@ -110,6 +111,10 @@ def _progress_label(protocol, state):
 def _session_payload(session):
     protocol = session.occurrence.revision.compiled_protocol
     state = session.flow_state
+    student_messages = {m.sequence: m.content for m in session.messages.filter(role="student")}
+    excerpts = {qid: [student_messages[r["sequence"]][r["start"]:r["end"]]
+                      for r in refs if r["sequence"] in student_messages]
+                for qid, refs in state.get("evidence", {}).items()}
     return {
         "session_id": str(session.public_id),
         "survey_id": str(session.occurrence.public_id),
@@ -117,9 +122,11 @@ def _session_payload(session):
         "status": session.status,
         "prompt": current_prompt(protocol, state),
         "progress_label": _progress_label(protocol, state),
-        "results": state["results"],
+        "results": {qid: {k: v for k, v in result.items() if k in ("rating", "status", "probes")}
+                    for qid, result in state["results"].items()},
         "answer_map": state.get("answer_map", {}),
         "messages": _messages(session),
+        **({"answer_excerpts": excerpts} if "evidence" in state else {}),
     }
 
 
@@ -263,6 +270,11 @@ def student_session_debug_view(request, survey_id, session_id):
             "answer_map": state.get("answer_map", {}),
             "evidence_seen": state.get("evidence_seen", {}),
             "coverage_seen": state.get("coverage_seen", {}),
+            **({"orchestration": {**{key: state.get(key) for key in (
+                "evidence", "superseded_evidence", "presented_main_ids", "last_dialogue_action", "last_turn_diagnostics")},
+                "turn_metrics": [{"assistant_sequence": message.sequence, **message.attribution["orchestration_metrics"]}
+                                 for message in messages if "orchestration_metrics" in message.attribution]}}
+               if "last_turn_diagnostics" in state else {}),
         },
         "responses": responses,
     })
@@ -390,6 +402,9 @@ def student_turns_view(request, survey_id, session_id):
     try:
         student = _json_body(request)
         expected_version = student.pop("expected_version")
+        request_id = student.pop("request_id", None)
+        if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", request_id)):
+            raise ValueError("invalid request ID")
         if type(expected_version) is not int or expected_version < 1:
             raise ValueError("invalid turn version")
         kind = student.get("kind")
@@ -403,6 +418,11 @@ def student_turns_view(request, survey_id, session_id):
             raise ValueError("invalid text length")
     except (ValueError, KeyError):
         return no_store_json({"error": "invalid_request"}, status=400)
+    from .orchestrated_turns import enabled, process
+    if enabled(occurrence.revision.compiled_protocol):
+        # Existing clients get deterministic idempotency for an identical version/body retry.
+        fallback_id = hashlib.sha256(json.dumps({"version": expected_version, "student": student}, sort_keys=True).encode()).hexdigest()
+        return process(request, occurrence, session, student, expected_version, request_id or fallback_id)
     if session.status != "active" or session.turn_version != expected_version:
         return no_store_json({"error": "stale_turn"}, status=409)
     if not _available(occurrence):
