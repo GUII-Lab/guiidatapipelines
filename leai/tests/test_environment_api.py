@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 import sys
@@ -19,12 +18,15 @@ class EnvironmentApiTests(TestCase):
         environment["SECRET_KEY"] = "test-only-" + "abcdef1234" * 6
         environment["DJANGO_ALLOWED_HOSTS"] = "leai-qa-example.herokuapp.com"
         environment["DJANGO_SETTINGS_MODULE"] = "guiidatapipelines.settings"
-        output = subprocess.check_output(
+        result = subprocess.run(
             [sys.executable, "-c", "import json; from django.conf import settings; print(json.dumps([settings.LEAI_ENVIRONMENT, settings.LEAI_BUILD_ID]))"],
             env=environment,
             text=True,
+            capture_output=True,
+            check=False,
         )
-        self.assertEqual(json.loads(output), ["", ""])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Hosted runtime requires LEAI_ENVIRONMENT", result.stderr)
 
     @override_settings(LEAI_ENVIRONMENT="local", LEAI_BUILD_ID="local-backend")
     def test_local_handshake_reports_verified_schema_and_no_store(self):

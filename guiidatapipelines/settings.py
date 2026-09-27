@@ -154,6 +154,21 @@ _LEAI_HOSTED_RUNTIME = any(os.environ.get(key) for key in (
 LEAI_ENVIRONMENT = os.environ.get("LEAI_ENVIRONMENT", "" if _LEAI_HOSTED_RUNTIME else "local")
 LEAI_BUILD_ID = os.environ.get("LEAI_BUILD_ID", "" if _LEAI_HOSTED_RUNTIME else "local-backend")
 
+# The existing QA and Production apps share a PostgreSQL database but own
+# different schemas. Pin the connection before any release-phase migration:
+# an unqualified Django table name must never fall back to public in QA.
+if _LEAI_HOSTED_RUNTIME:
+    if LEAI_ENVIRONMENT not in ("qa", "production"):
+        raise ImproperlyConfigured("Hosted runtime requires LEAI_ENVIRONMENT=qa or production")
+    expected_schema = "leai_qa" if LEAI_ENVIRONMENT == "qa" else "public"
+    if os.environ.get("LEAI_DB_SCHEMA") != expected_schema:
+        raise ImproperlyConfigured(
+            f"{LEAI_ENVIRONMENT} requires LEAI_DB_SCHEMA={expected_schema}"
+        )
+    DATABASES["default"].setdefault("OPTIONS", {})["options"] = (
+        f"-c search_path={expected_schema}"
+    )
+
 # django_on_heroku sets ALLOWED_HOSTS to ["*"] and uses SECRET_KEY only when
 # present. Apply the actual security boundary after that helper runs.
 if _LEAI_HOSTED_RUNTIME:
