@@ -16,7 +16,7 @@ import openai
 from openai import OpenAI
 
 
-FALLBACK_CHAT_MODEL: str = "gpt-5.6-luna"
+FALLBACK_CHAT_MODEL: str = "gpt-6-luna"
 DEFAULT_MODEL: str = os.environ.get("OPENAI_DEFAULT_MODEL", FALLBACK_CHAT_MODEL)
 DEFAULT_TTS_MODEL: str = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
 DEFAULT_TTS_VOICE: str = os.environ.get("OPENAI_TTS_VOICE", "nova")

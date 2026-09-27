@@ -28,7 +28,7 @@ class TestModuleSurface(unittest.TestCase):
         self.assertTrue(DEFAULT_MODEL)
 
     def test_fallback_chat_model_is_luna(self):
-        self.assertEqual(FALLBACK_CHAT_MODEL, "gpt-5.6-luna")
+        self.assertEqual(FALLBACK_CHAT_MODEL, "gpt-6-luna")
 
     def test_exception_hierarchy(self):
         self.assertTrue(issubclass(OpenAIRefusalError, OpenAIClientError))
