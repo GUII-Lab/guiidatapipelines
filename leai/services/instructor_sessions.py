@@ -1,16 +1,17 @@
-"""Opaque, revocable instructor bearer capabilities."""
+"""Revocable instructor records bound to Django's server-side sessions."""
 
 import hashlib
 import re
 import secrets
 from datetime import timedelta
 
+from django.contrib.auth import login
 from django.utils import timezone
 
 from leai.models import InstructorSession
 
 
-SESSION_LIFETIME = timedelta(hours=12)
+SESSION_LIFETIME = timedelta(hours=1)
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 
 
@@ -39,12 +40,15 @@ def bearer_token(request):
 
 
 def resolve_instructor_session(request, *, allow_revoked=False):
-    token = bearer_token(request)
-    if token is None:
+    # Student bearer capabilities must never grant instructor access.
+    if request.headers.get("Authorization") or not request.user.is_authenticated:
+        return None
+    session_id = request.session.get("leai_instructor_session_id")
+    if not isinstance(session_id, int):
         return None
     session = (
         InstructorSession.objects.select_related("account__user")
-        .filter(capability_digest=token_digest(token))
+        .filter(pk=session_id, account__user_id=request.user.pk)
         .first()
     )
     if session is None or session.expires_at <= timezone.now():
@@ -56,3 +60,12 @@ def resolve_instructor_session(request, *, allow_revoked=False):
     ):
         return None
     return session
+
+
+def bind_browser_session(request, session):
+    login(request, session.account.user, backend="django.contrib.auth.backends.ModelBackend")
+    # Django keeps the key when the same user logs in again. Rotate even then:
+    # successful reauthentication must not revive a copied browser credential.
+    request.session.cycle_key()
+    request.session["leai_instructor_session_id"] = session.pk
+    request.session.set_expiry(int(SESSION_LIFETIME.total_seconds()))

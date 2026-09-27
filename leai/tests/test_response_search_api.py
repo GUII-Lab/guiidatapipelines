@@ -9,6 +9,7 @@ from leai.models import (
     ResponseMessage,
 )
 from leai.tests.test_response_models import ResponseFixturesMixin
+from leai.tests.session_client import SessionClient
 
 
 ROOT = "/datapipeline/api/v1/"
@@ -17,7 +18,7 @@ ROOT = "/datapipeline/api/v1/"
 class ResponseSearchApiTests(ResponseFixturesMixin, TestCase):
     def setUp(self):
         super().setUp()
-        self.client = Client(enforce_csrf_checks=True)
+        self.client = SessionClient()
         self.account.must_change_password = False
         self.account.save(update_fields=["must_change_password"])
         self.account.user.set_password("Test-Password-Only-2026!")
@@ -40,14 +41,14 @@ class ResponseSearchApiTests(ResponseFixturesMixin, TestCase):
             }),
             content_type="application/json",
         )
-        self.token = login.json()["token"]
+        self.assertEqual(login.status_code, 201)
 
     def search(self, course=None, query="capstone", **extra):
         course = course or self.course
-        return self.client.get(
+        return self.client.post(
             ROOT + f"instructor_courses/{course.public_id}/responses/search/",
-            data={"q": query, **extra},
-            HTTP_AUTHORIZATION=f"Bearer {self.token}",
+            data=json.dumps({"query": query, **extra}),
+            content_type="application/json",
         )
 
     def add_message(self, *, course=None, status="completed", role="student", content="Capstone progress is clear"):
@@ -95,26 +96,32 @@ class ResponseSearchApiTests(ResponseFixturesMixin, TestCase):
     def test_other_course_and_unknown_course_are_both_not_found(self):
         self.add_message(course=self.other_course, content="capstone private")
         denied = self.search(course=self.other_course)
-        unknown = self.client.get(
+        unknown = self.client.post(
             ROOT + "instructor_courses/11111111-1111-4111-8111-111111111111/responses/search/",
-            data={"q": "capstone"},
-            HTTP_AUTHORIZATION=f"Bearer {self.token}",
+            data=json.dumps({"query": "capstone"}),
+            content_type="application/json",
         )
         self.assertEqual(denied.status_code, 404)
         self.assertEqual(denied.json(), unknown.json())
 
     def test_search_requires_auth_and_valid_bounded_query(self):
         url = ROOT + f"instructor_courses/{self.course.public_id}/responses/search/"
-        self.assertEqual(self.client.get(url, data={"q": "capstone"}).status_code, 401)
-        for params in ({}, {"q": "a"}, {"q": "x" * 101}, {"q": "good", "extra": "x"}):
+        self.assertEqual(SessionClient().post(url, data=json.dumps({"query": "capstone"}), content_type="application/json").status_code, 401)
+        for params in ({}, {"query": "a"}, {"query": "x" * 101}, {"query": "good", "extra": "x"}):
             with self.subTest(params=params):
-                response = self.client.get(
+                response = self.client.post(
                     url,
-                    data=params,
-                    HTTP_AUTHORIZATION=f"Bearer {self.token}",
+                    data=json.dumps(params),
+                    content_type="application/json",
                 )
                 self.assertEqual(response.status_code, 400)
                 self.assertEqual(response.json(), {"error": "invalid_request"})
+        self.assertEqual(self.client.get(url + "?q=capstone").status_code, 405)
+
+    def test_unicode_prefix_does_not_displace_match_excerpt(self):
+        self.add_message(content="ß" * 100 + " capstone marker")
+        result = self.search().json()["results"][0]
+        self.assertIn("capstone", result["excerpt"])
 
     def test_course_permission_is_rechecked_on_every_search(self):
         self.add_message(content="capstone visible while assigned")
@@ -127,7 +134,7 @@ class ResponseSearchApiTests(ResponseFixturesMixin, TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json(), {"error": "not_found"})
 
-    def test_ta_can_search_but_forced_password_change_cannot(self):
+    def test_ta_can_search_even_when_legacy_password_change_flag_is_set(self):
         self.add_message(content="capstone team feedback")
         CourseMembership.objects.filter(
             course=self.course,
@@ -137,8 +144,7 @@ class ResponseSearchApiTests(ResponseFixturesMixin, TestCase):
         self.account.must_change_password = True
         self.account.save(update_fields=["must_change_password"])
         response = self.search()
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json(), {"error": "password_change_required"})
+        self.assertEqual(response.status_code, 200)
 
     def test_result_limit_is_explicit_and_excerpts_are_bounded(self):
         occurrence = self.make_occurrence()

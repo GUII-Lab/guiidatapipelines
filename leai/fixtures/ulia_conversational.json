@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "title": "Structured Reflection — conversational",
+  "intro": "Hi, I’m Remi. I’m studying how students use AI in their academic work. Think back to the assignments you worked on in CMPM 80H during weeks 3 and 4. Your responses are anonymous and confidential. Ready to begin?",
+  "source_instrument": "Collaborative AI Metacognition — Ulia structured reflection adaptation",
+  "scales": {},
+  "sections": [
+    {
+      "id": "planning",
+      "title": "Planning",
+      "items": [
+        {"id":"P1","prompt":"Do you think about what is the most appropriate information to give to the AI?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether and how the student decides what information to provide to AI.","coverage_targets":[{"id":"decision_process","description":"If the student says yes, explain how they decide what information to give; a bare yes does not cover this."}],"example_probes":["If so, how do you decide what is the most appropriate information to give to the AI?","How do you decide what not to give it?"],"max_additional_probes":2},
+        {"id":"P2","prompt":"Do you consider what information the AI needs to perform the task?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether and how the student considers the information AI needs for a task.","max_additional_probes":2},
+        {"id":"P3","prompt":"Do you think about what the AI is good and not so good at for the task you’re working on?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether the student considers AI strengths and limitations, and how that affects their use.","example_probes":["If so, how does that influence the way you use AI in your academic work?","If not, why not?"],"max_additional_probes":2},
+        {"id":"P4","prompt":"Do you think about the best way to divide the work between yourself and the AI?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn how the student thinks about dividing work with AI.","example_probes":["How do you typically divide it?"],"max_additional_probes":2}
+      ]
+    },
+    {
+      "id": "monitoring",
+      "title": "Monitoring",
+      "items": [
+        {"id":"M1","prompt":"Do you review your thinking to ensure that you are not accepting or rejecting the AI’s recommendation too quickly?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether and how the student reviews their reactions to AI recommendations.","max_additional_probes":2},
+        {"id":"M2","prompt":"Do you check to make sure the AI is on the right track?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether and how the student checks AI progress against task goals.","example_probes":["If yes, how do you check?"],"max_additional_probes":2},
+        {"id":"M3","prompt":"Do you try to ensure that your own mental shortcuts or biases aren’t affecting your reactions to the AI’s output?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether and how the student checks their own biases when reacting to AI output.","example_probes":["If so, how do you check for this?"],"max_additional_probes":2},
+        {"id":"M4","prompt":"Do you remind yourself about your own limitations or weaknesses when working with AI on a task?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether the student considers their own limitations and whether that changes their approach.","example_probes":["If so, what limitations or weaknesses do you keep in mind?","How does keeping them in mind change how you approach the task?"],"max_additional_probes":2}
+      ]
+    },
+    {
+      "id": "evaluation",
+      "title": "Evaluation",
+      "items": [
+        {"id":"E1","prompt":"Do you think about how you can improve the way you work with AI?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether and how the student thinks about improving their work with AI.","max_additional_probes":2},
+        {"id":"E2","prompt":"Do you analyze your thinking before jumping to conclusions regarding the AI’s output?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether and how the student examines their thinking before drawing conclusions about AI output.","max_additional_probes":2},
+        {"id":"E3","prompt":"If something goes wrong, do you analyze the situation so you can avoid a similar error in the future?","wording":"exact","response":{"kind":"text"},"reflection_goal":"Learn whether and how the student examines mistakes to avoid repeating them.","max_additional_probes":2}
+      ]
+    }
+  ]
+}

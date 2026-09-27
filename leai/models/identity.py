@@ -26,7 +26,8 @@ class InstructorAccount(models.Model):
         default=PlatformRole.MEMBER,
     )
     is_active = models.BooleanField(default=True)
-    must_change_password = models.BooleanField(default=True)
+    # Kept as an inert compatibility field for older account rows and API clients.
+    must_change_password = models.BooleanField(default=False)
 
     class Meta:
         constraints = [
@@ -88,6 +89,7 @@ class Course(models.Model):
     referral_text = models.CharField(max_length=200, blank=True, default="")
     completion_certificate_enabled_by_default = models.BooleanField(default=False)
     completed_response_download_enabled_by_default = models.BooleanField(default=False)
+    student_debug_enabled = models.BooleanField(default=False)
 
     class Meta:
         constraints = [

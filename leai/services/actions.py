@@ -31,7 +31,6 @@ def allowed_course_actions(account, course):
     if (
         not account.is_active
         or not account.user.is_active
-        or account.must_change_password
         or course.lifecycle_state != "active"
     ):
         return ()
@@ -68,12 +67,41 @@ def has_course_action(account, course, action):
     return action in ACTIONS and action in allowed_course_actions(account, course)
 
 
+def has_researcher_course_access(account, course):
+    """Require an active institution Researcher grant, including explicit course grants."""
+    if (
+        not account.is_active
+        or not account.user.is_active
+        or course.lifecycle_state != "active"
+    ):
+        return False
+    researcher_ids = list(
+        InstitutionMembership.objects.filter(
+            account=account,
+            institution_id=course.institution_id,
+            role="researcher",
+            is_active=True,
+        ).values_list("id", flat=True)
+    )
+    if not researcher_ids:
+        return False
+    explicit = CourseMembership.objects.filter(
+        course=course,
+        institution_membership_id__in=researcher_ids,
+    ).exists()
+    inherited = not CourseAccessRestriction.objects.filter(
+        course=course,
+        institution_membership_id__in=researcher_ids,
+        denied=True,
+    ).exists()
+    return explicit or inherited
+
+
 def accessible_course_rows(account, *, course_id=None):
     """Resolve list DTO grants in batches, without a query per Course."""
     if (
         not account.is_active
         or not account.user.is_active
-        or account.must_change_password
     ):
         return []
     courses = Course.objects.filter(lifecycle_state="active").select_related("institution")

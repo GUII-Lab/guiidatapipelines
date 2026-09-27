@@ -4,6 +4,7 @@ from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import Client, TestCase
 from django.test.utils import CaptureQueriesContext
+from leai.tests.session_client import SessionClient
 
 from leai.models import (
     Course,
@@ -20,7 +21,7 @@ ROOT = "/datapipeline/api/v1/"
 
 class InstructorCourseApiTests(TestCase):
     def setUp(self):
-        self.client = Client(enforce_csrf_checks=True)
+        self.client = SessionClient()
         self.ucsc = Institution.objects.create(slug="ucsc", name="UC Santa Cruz")
         self.ucd = Institution.objects.create(slug="ucd", name="UC Davis")
         user = get_user_model().objects.create_user(
@@ -53,10 +54,10 @@ class InstructorCourseApiTests(TestCase):
             data=json.dumps({"email": user.email, "password": "Test-Password-Only-2026!"}),
             content_type="application/json",
         )
-        self.token = login.json()["token"]
+        self.assertEqual(login.status_code, 201)
 
     def get(self, path):
-        return self.client.get(ROOT + path, HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        return self.client.get(ROOT + path)
 
     def test_course_list_returns_only_accessible_active_courses_with_actions(self):
         response = self.get("instructor_courses/")
@@ -100,12 +101,12 @@ class InstructorCourseApiTests(TestCase):
         self.assertEqual(rows["Winter"]["role"], "owner")
         self.assertEqual(rows["Spring"]["role"], "platform_admin")
 
-    def test_forced_password_change_blocks_course_list_but_not_me(self):
+    def test_legacy_password_change_flag_does_not_block_course_list(self):
         self.account.must_change_password = True
         self.account.save(update_fields=["must_change_password"])
         response = self.get("instructor_courses/")
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json(), {"error": "password_change_required"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["courses"]), 1)
         self.assertEqual(self.get("instructor_me/").status_code, 200)
 
     def test_researcher_inherits_course_unless_restricted(self):

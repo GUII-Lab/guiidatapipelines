@@ -113,7 +113,7 @@ class CourseActionTests(TestCase):
         self.course.save(update_fields=["lifecycle_state"])
         self.assertEqual(allowed_course_actions(account, self.course), ())
 
-    def test_inactive_and_forced_change_accounts_are_denied(self):
+    def test_password_change_flag_is_ignored_but_inactive_accounts_are_denied(self):
         account, membership = self.make_account("inactive")
         CourseMembership.objects.create(
             course=self.course,
@@ -122,10 +122,9 @@ class CourseActionTests(TestCase):
         )
         account.must_change_password = True
         account.save(update_fields=["must_change_password"])
-        self.assertEqual(allowed_course_actions(account, self.course), ())
-        account.must_change_password = False
+        self.assertEqual(allowed_course_actions(account, self.course), ACTIONS)
         account.is_active = False
-        account.save(update_fields=["must_change_password", "is_active"])
+        account.save(update_fields=["is_active"])
         self.assertEqual(allowed_course_actions(account, self.course), ())
 
     def test_inactive_institution_membership_and_django_user_are_denied(self):

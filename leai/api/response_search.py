@@ -1,7 +1,10 @@
 """Small, course-scoped search of completed student feedback."""
 
+import json
+import re
+
 from django.http import HttpResponseNotAllowed
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import csrf_protect
 
 from leai.models import Course, ResponseMessage
 from leai.services.actions import has_course_action
@@ -15,7 +18,8 @@ EXCERPT_LIMIT = 240
 
 
 def _excerpt(content, query):
-    hit = content.casefold().find(query.casefold())
+    match = re.search(re.escape(query), content, flags=re.IGNORECASE)
+    hit = match.start() if match else -1
     start = max(0, hit - 40) if hit >= 0 else 0
     allowance = EXCERPT_LIMIT - int(start > 0)
     end = min(len(content), start + allowance)
@@ -27,10 +31,10 @@ def _excerpt(content, query):
     return excerpt
 
 
-@csrf_exempt
+@csrf_protect
 def response_search_view(request, course_id):
-    if request.method != "GET":
-        response = HttpResponseNotAllowed(["GET"])
+    if request.method != "POST":
+        response = HttpResponseNotAllowed(["POST"])
         response["Cache-Control"] = "no-store"
         return response
 
@@ -38,16 +42,20 @@ def response_search_view(request, course_id):
     if session is None:
         return no_store_json({"error": "authentication_required"}, status=401)
     account = session.account
-    if account.must_change_password:
-        return no_store_json({"error": "password_change_required"}, status=403)
 
     course = Course.objects.filter(public_id=course_id, lifecycle_state="active").first()
     if course is None or not has_course_action(account, course, "responses.view"):
         return no_store_json({"error": "not_found"}, status=404)
 
-    if set(request.GET) != {"q"} or len(request.GET.getlist("q")) != 1:
+    if request.content_type != "application/json" or len(request.body) > 512:
         return no_store_json({"error": "invalid_request"}, status=400)
-    query = request.GET["q"].strip()
+    try:
+        payload = json.loads(request.body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return no_store_json({"error": "invalid_request"}, status=400)
+    if not isinstance(payload, dict) or set(payload) != {"query"} or not isinstance(payload["query"], str):
+        return no_store_json({"error": "invalid_request"}, status=400)
+    query = payload["query"].strip()
     if not 2 <= len(query) <= 100:
         return no_store_json({"error": "invalid_request"}, status=400)
 

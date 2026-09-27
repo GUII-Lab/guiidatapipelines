@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "title": "Structured Reflection — rate and reflect",
+  "intro": "Hi, I’m Remi. I’m studying how students use AI in their academic work. For each statement, rate it from Strongly disagree to Strongly agree, then reflect on your rating. Think back to the assignments you worked on in CMPM 80H during weeks 3 and 4. Your responses are anonymous and confidential. Ready to begin?",
+  "source_instrument": "Collaborative AI Metacognition — Ulia structured reflection adaptation",
+  "scales": {
+    "agreement_5": [
+      {"value":1,"label":"Strongly disagree"},
+      {"value":2,"label":"Disagree"},
+      {"value":3,"label":"Neither agree nor disagree"},
+      {"value":4,"label":"Agree"},
+      {"value":5,"label":"Strongly agree"}
+    ]
+  },
+  "sections": [
+    {
+      "id": "planning",
+      "title": "Planning",
+      "items": [
+        {"id":"P1","prompt":"I think about how to give the most appropriate information to the AI.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","example_probes":["How do you decide what information to give or not give to AI?"],"max_additional_probes":2},
+        {"id":"P2","prompt":"I consider what information the AI needs to perform the task.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","max_additional_probes":2},
+        {"id":"P3","prompt":"I think about how well I understand what the AI is good and not so good at for the task we’re doing.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","example_probes":["How does that influence the way you use AI in your academic work?","If not, why not?"],"max_additional_probes":2},
+        {"id":"P4","prompt":"I think about the best way to divide the work between me and the AI.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","example_probes":["How do you typically divide the work?"],"max_additional_probes":2}
+      ]
+    },
+    {
+      "id": "monitoring",
+      "title": "Monitoring",
+      "items": [
+        {"id":"M1","prompt":"I review my thinking to ensure that I’m not accepting or rejecting the AI’s recommendation too quickly.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","max_additional_probes":2},
+        {"id":"M2","prompt":"When working with the AI, I check task goals every now and then to make sure we’re on track.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","example_probes":["If yes, how do you check?"],"max_additional_probes":2},
+        {"id":"M3","prompt":"I try to ensure that my own mental shortcuts or biases aren’t affecting my reactions to the AI’s output.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","example_probes":["If so, how do you check for this?"],"max_additional_probes":2},
+        {"id":"M4","prompt":"I remind myself about my own limitations or weaknesses so as to minimize their impact on the task.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","example_probes":["What limitations or weaknesses do you keep in mind?","How does that change how you approach the task?"],"max_additional_probes":2}
+      ]
+    },
+    {
+      "id": "evaluation",
+      "title": "Evaluation",
+      "items": [
+        {"id":"E1","prompt":"I think about how I can improve the way I work with the AI.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","max_additional_probes":2},
+        {"id":"E2","prompt":"I analyze my thinking before jumping to conclusions regarding the AI’s output.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","max_additional_probes":2},
+        {"id":"E3","prompt":"If something goes wrong, I will analyze the situation so I can avoid a similar error in the future.","wording":"exact","response":{"kind":"likert","scale_id":"agreement_5"},"reflection_goal":"Invite the student to explain the rating with a reason or example.","max_additional_probes":2}
+      ]
+    }
+  ]
+}

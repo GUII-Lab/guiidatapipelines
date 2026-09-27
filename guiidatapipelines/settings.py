@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import dj_database_url
 import django_on_heroku as django_heroku
+from django.core.exceptions import ImproperlyConfigured
 
 try:
     from dotenv import load_dotenv
@@ -147,17 +148,77 @@ django_heroku.settings(locals())
 
 # The canonical LEAI API is opt-in per deployment. The legacy Django runtime
 # stays local until QA and Production provide separately reviewed identities.
-LEAI_ENVIRONMENT = os.environ.get("LEAI_ENVIRONMENT", "local")
-LEAI_BUILD_ID = os.environ.get("LEAI_BUILD_ID", "local-backend")
+_LEAI_HOSTED_RUNTIME = any(os.environ.get(key) for key in (
+    "DYNO", "HEROKU_APP_NAME", "K_SERVICE", "RENDER", "FLY_APP_NAME",
+))
+LEAI_ENVIRONMENT = os.environ.get("LEAI_ENVIRONMENT", "" if _LEAI_HOSTED_RUNTIME else "local")
+LEAI_BUILD_ID = os.environ.get("LEAI_BUILD_ID", "" if _LEAI_HOSTED_RUNTIME else "local-backend")
+
+# django_on_heroku sets ALLOWED_HOSTS to ["*"] and uses SECRET_KEY only when
+# present. Apply the actual security boundary after that helper runs.
+if _LEAI_HOSTED_RUNTIME:
+    SECRET_KEY = os.environ.get("SECRET_KEY", "")
+    if len(SECRET_KEY) < 50 or SECRET_KEY.startswith("django-insecure-"):
+        raise ImproperlyConfigured("Hosted runtime requires a strong SECRET_KEY")
+    hosts = os.environ.get("DJANGO_ALLOWED_HOSTS", "")
+    if not hosts:
+        hosts = os.environ.get("HEROKU_APP_DEFAULT_DOMAIN_NAME", "")
+    ALLOWED_HOSTS = [host.strip() for host in hosts.split(",") if host.strip()]
+    if not ALLOWED_HOSTS or any("*" in host or "/" in host or ":" in host for host in ALLOWED_HOSTS):
+        raise ImproperlyConfigured("Hosted runtime requires explicit DJANGO_ALLOWED_HOSTS")
+    DEBUG = False
+    SECURE_SSL_REDIRECT = True
+    if os.environ.get("DYNO") or os.environ.get("HEROKU_APP_NAME"):
+        SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_HSTS_SECONDS = 31536000
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = "Lax"
+    CSRF_COOKIE_SECURE = True
+    CSRF_COOKIE_HTTPONLY = True
+    CSRF_COOKIE_SAMESITE = "Lax"
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+else:
+    ALLOWED_HOSTS = ["localhost", "127.0.0.1", "[::1]", "testserver"]
+
+# Django owns the browser credential. The frontend receives only session metadata
+# and a masked CSRF token; no instructor bearer token is exposed to JavaScript.
+SESSION_ENGINE = "django.contrib.sessions.backends.db"
+SESSION_COOKIE_NAME = "__Host-leai-session" if _LEAI_HOSTED_RUNTIME else "leai-session"
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_PATH = "/"
+SESSION_COOKIE_DOMAIN = None
+SESSION_COOKIE_AGE = 3600
+CSRF_COOKIE_NAME = "__Host-leai-csrf" if _LEAI_HOSTED_RUNTIME else "leai-csrf"
+CSRF_COOKIE_HTTPONLY = True
+CSRF_FAILURE_VIEW = "leai.api.instructor_auth.csrf_failure"
+
+# Opt in only for the new combined LEAI release. The old backend deployment is
+# not silently repurposed. The build directory contains public Vite output only.
+LEAI_SERVE_FRONTEND = os.environ.get("LEAI_SERVE_FRONTEND") == "1"
+if LEAI_SERVE_FRONTEND:
+    from leai.hosting import frontend_headers, validate_frontend_bundle
+    LEAI_FRONTEND_ROOT = os.environ.get("LEAI_FRONTEND_ROOT", os.path.join(BASE_DIR, "frontend_dist"))
+    validate_frontend_bundle(LEAI_FRONTEND_ROOT, LEAI_ENVIRONMENT, LEAI_BUILD_ID)
+    ROOT_URLCONF = "leai.web_urls"
+    WHITENOISE_ROOT = LEAI_FRONTEND_ROOT
+    WHITENOISE_INDEX_FILE = True
+    WHITENOISE_ADD_HEADERS_FUNCTION = frontend_headers
+    WHITENOISE_ALLOW_ALL_ORIGINS = False
 
 # CORS is an origin boundary, not a URL-path boundary. Both Pages deployments
 # share the same approved origin; local Vite is allowed only in local mode.
 CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOWED_ORIGINS = ["https://guii-lab.github.io"]
-if LEAI_ENVIRONMENT == "local":
+if LEAI_SERVE_FRONTEND:
+    CORS_ALLOWED_ORIGINS = []  # Browser API calls are same-origin.
+if LEAI_ENVIRONMENT == "local" and not LEAI_SERVE_FRONTEND:
     CORS_ALLOWED_ORIGINS += [
         "http://127.0.0.1:5173",
         "http://localhost:5173",
+        "http://127.0.0.1:4173",
+        "http://localhost:4173",
         "http://127.0.0.1:8080",
         "http://localhost:8080",
     ]

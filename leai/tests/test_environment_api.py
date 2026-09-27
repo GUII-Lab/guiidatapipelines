@@ -1,3 +1,8 @@
+import json
+import os
+import subprocess
+import sys
+
 from django.core import checks
 from django.db import connection
 from django.test import Client, TestCase, override_settings
@@ -5,6 +10,21 @@ from django.test import Client, TestCase, override_settings
 
 class EnvironmentApiTests(TestCase):
     endpoint = "/datapipeline/api/v1/environment/"
+
+    def test_hosted_runtime_without_identity_cannot_claim_local(self):
+        environment = os.environ.copy()
+        environment.pop("LEAI_ENVIRONMENT", None)
+        environment.pop("LEAI_BUILD_ID", None)
+        environment["DYNO"] = "web.1"
+        environment["SECRET_KEY"] = "test-only-" + "abcdef1234" * 6
+        environment["DJANGO_ALLOWED_HOSTS"] = "leai-qa-example.herokuapp.com"
+        environment["DJANGO_SETTINGS_MODULE"] = "guiidatapipelines.settings"
+        output = subprocess.check_output(
+            [sys.executable, "-c", "import json; from django.conf import settings; print(json.dumps([settings.LEAI_ENVIRONMENT, settings.LEAI_BUILD_ID]))"],
+            env=environment,
+            text=True,
+        )
+        self.assertEqual(json.loads(output), ["", ""])
 
     @override_settings(LEAI_ENVIRONMENT="local", LEAI_BUILD_ID="local-backend")
     def test_local_handshake_reports_verified_schema_and_no_store(self):

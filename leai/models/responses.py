@@ -232,6 +232,7 @@ class ResponseSession(models.Model):
     research_consent = models.BooleanField(default=False)
     next_message_sequence = models.PositiveIntegerField(default=1)
     turn_version = models.PositiveIntegerField(default=1)
+    flow_state = models.JSONField(default=dict)
     completed_at = models.DateTimeField(null=True, blank=True)
     completion_snapshot = models.JSONField(null=True, blank=True)
     certificate_code = models.CharField(

@@ -51,7 +51,7 @@ def verified_environment_identity():
         "backend_build_sha": build_id,
         "schema_identity": schema_identity,
         "contract_version": CONTRACT_VERSION,
-        "allowed_app_bases": ENVIRONMENT_APP_BASES[environment],
+        "allowed_app_bases": ["/"] if settings.LEAI_SERVE_FRONTEND else ENVIRONMENT_APP_BASES[environment],
         "server_time": timezone.now().isoformat(),
     }
 

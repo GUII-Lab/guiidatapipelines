@@ -75,7 +75,7 @@ class ResponseFixturesMixin:
             name=f"Response {suffix}",
         )
 
-    def make_occurrence(self, *, course=None, audience="individual"):
+    def make_occurrence(self, *, course=None, audience="individual", compiled_protocol=None):
         course = course or self.course
         suffix = self.next_suffix()
         question_set = QuestionSet.objects.create(
@@ -103,7 +103,7 @@ class ResponseFixturesMixin:
             revision_number=1,
             source_draft_version=draft_version,
             content_hash=f"{int(suffix):064x}",
-            compiled_protocol={},
+            compiled_protocol=compiled_protocol if compiled_protocol is not None else {},
             compiler_version="1.0.0",
             engine_version="1.0.0",
             created_by=self.account,
