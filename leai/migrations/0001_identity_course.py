@@ -130,8 +130,6 @@ class Migration(migrations.Migration):
         ),
         migrations.RunSQL(
             sql="""
-                CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
                 ALTER TABLE leai_instructoraccount
                     ALTER COLUMN public_id SET DEFAULT gen_random_uuid();
                 ALTER TABLE leai_course
