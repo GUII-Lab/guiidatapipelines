@@ -53,3 +53,11 @@ form_data.json
 
 # Local dev / seed / verification tooling — not part of the app
 /scripts
+
+# Generated browser and verification evidence stays local
+docs/verification/
+.web-verify/
+playwright-report/
+test-results/
+verification-screenshots/
+verification-report-*.html
