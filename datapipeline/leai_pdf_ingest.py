@@ -73,6 +73,14 @@ FULLTEXT_PROMPT_ID = "__pdf_fulltext__"
 # (likely we matched the wrong heading and swept multiple sections).
 ANSWER_BLOCK_SOFT_MAX_CHARS = 8000
 
+# These headings unambiguously introduce material that is not a student's
+# structured-reflection answer. They remain active even when an older schema
+# has not yet received an explicit pdf_ingest profile.
+GLOBAL_PDF_STOP_HEADINGS = (
+    "Submission Guidelines",
+    "Raw Conversation Transcript",
+)
+
 # Regex helpers ------------------------------------------------------------
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -526,6 +534,130 @@ def map_text_to_prompts(
     return mapping, low_conf, preamble
 
 
+# Schema-driven answer cleanup --------------------------------------------
+
+def pdf_ingest_profile(schema_body: dict | None) -> dict:
+    """Return a defensive, normalized PDF-ingest profile from schema JSON.
+
+    Invalid optional fields are ignored rather than crashing a batch. The two
+    global stop headings are always active because they are clear non-answer
+    boundaries across the supported reflection exports.
+    """
+    raw = schema_body.get("pdf_ingest") if isinstance(schema_body, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+
+    prefixes: dict[str, list[str]] = {}
+    raw_prefixes = raw.get("section_instruction_prefixes")
+    if isinstance(raw_prefixes, dict):
+        for prompt_id, values in raw_prefixes.items():
+            if not isinstance(values, list):
+                continue
+            cleaned_values = [str(value).strip() for value in values if isinstance(value, str) and value.strip()]
+            if cleaned_values:
+                prefixes[str(prompt_id)] = cleaned_values
+
+    def _string_list(key: str) -> list[str]:
+        value = raw.get(key)
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if isinstance(item, str) and item.strip()]
+
+    stop_headings = list(dict.fromkeys([*GLOBAL_PDF_STOP_HEADINGS, *_string_list("stop_headings")]))
+    suspicious_markers = list(dict.fromkeys([*GLOBAL_PDF_STOP_HEADINGS, *_string_list("suspicious_markers")]))
+    soft_max = raw.get("answer_soft_max_chars", ANSWER_BLOCK_SOFT_MAX_CHARS)
+    if not isinstance(soft_max, int) or isinstance(soft_max, bool) or soft_max <= 0:
+        soft_max = ANSWER_BLOCK_SOFT_MAX_CHARS
+
+    return {
+        "section_instruction_prefixes": prefixes,
+        "stop_headings": stop_headings,
+        "suspicious_markers": suspicious_markers,
+        "answer_soft_max_chars": soft_max,
+    }
+
+
+def _configured_prefix_pattern(prefix: str) -> re.Pattern[str] | None:
+    """Build a start-anchored pattern tolerant of PDF line/bullet wrapping."""
+    normalized = _normalise_text(prefix)
+    tokens = re.findall(r"\S+", normalized)
+    if not tokens:
+        return None
+    separator = r"(?:\s|[•●▪◦])+"
+    return re.compile(r"^\s*" + separator.join(re.escape(token) for token in tokens), re.IGNORECASE)
+
+
+def _standalone_heading_pattern(heading: str) -> re.Pattern[str]:
+    words = [re.escape(word) for word in heading.split() if word]
+    body = r"\s+".join(words)
+    return re.compile(
+        r"^[\t >#*\-–—]*" + body + r"\s*[:.\-–—]?\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+
+def clean_mapping(
+    mapping: dict[str, str],
+    prompts: list[dict],
+    profile: dict | None,
+) -> tuple[dict[str, str], list[str], dict[str, list[str]], dict[str, list[str]]]:
+    """Remove configured template material and classify remaining risks.
+
+    Returns ``(cleaned, low_conf_prompt_ids, cleanup_notes,
+    attention_reasons)``. Reason codes are stable API values consumed by the
+    instructor review UI: ``empty``, ``suspicious_marker``, and ``oversized``.
+    """
+    normalized_profile = pdf_ingest_profile({"pdf_ingest": profile or {}})
+    prefixes = normalized_profile["section_instruction_prefixes"]
+    stop_headings = normalized_profile["stop_headings"]
+    suspicious_markers = normalized_profile["suspicious_markers"]
+    soft_max = normalized_profile["answer_soft_max_chars"]
+
+    cleaned: dict[str, str] = {}
+    low_conf: list[str] = []
+    cleanup_notes: dict[str, list[str]] = {}
+    attention_reasons: dict[str, list[str]] = {}
+
+    prompt_ids = [str(prompt.get("prompt_id") or "") for prompt in prompts]
+    for prompt_id in prompt_ids:
+        block = _normalise_text(str((mapping or {}).get(prompt_id) or ""))
+        notes: list[str] = []
+
+        for configured_prefix in prefixes.get(prompt_id, []):
+            pattern = _configured_prefix_pattern(configured_prefix)
+            match = pattern.match(block) if pattern else None
+            if match:
+                block = block[match.end():].strip()
+                notes.append("instruction_removed")
+                break
+
+        first_stop: re.Match[str] | None = None
+        for heading in stop_headings:
+            match = _standalone_heading_pattern(heading).search(block)
+            if match and (first_stop is None or match.start() < first_stop.start()):
+                first_stop = match
+        if first_stop:
+            block = block[:first_stop.start()].strip()
+            notes.append("trailing_section_removed")
+
+        reasons: list[str] = []
+        if not block:
+            reasons.append("empty")
+        else:
+            if any(_standalone_heading_pattern(marker).search(block) for marker in suspicious_markers):
+                reasons.append("suspicious_marker")
+            if len(block) > soft_max:
+                reasons.append("oversized")
+
+        cleaned[prompt_id] = block
+        if notes:
+            cleanup_notes[prompt_id] = notes
+        if reasons:
+            low_conf.append(prompt_id)
+            attention_reasons[prompt_id] = reasons
+
+    return cleaned, low_conf, cleanup_notes, attention_reasons
+
+
 # AI-assisted mapping fallback --------------------------------------------
 
 def _ai_assist_mapping(
@@ -714,6 +846,7 @@ def start_pdf_ingest_job(
                 job_started_at=timezone.now(),
             )
             prompts = flatten_prompts_from_schema(schema_body)
+            profile = pdf_ingest_profile(schema_body)
             items: list[dict] = []
             for idx, (filename, blob) in enumerate(files_in_memory):
                 student_id = attribution_map.get(filename, "")
@@ -724,6 +857,8 @@ def start_pdf_ingest_job(
                     "extracted_text": "",
                     "mapping": {},
                     "low_conf_prompts": [],
+                    "cleanup_notes": {},
+                    "attention_reasons": {},
                     "preamble": "",
                     "error": "",
                 }
@@ -736,6 +871,8 @@ def start_pdf_ingest_job(
                         item["extracted_text"] = text
                         item["mapping"] = {FULLTEXT_PROMPT_ID: text}
                         item["low_conf_prompts"] = []
+                        item["cleanup_notes"] = {}
+                        item["attention_reasons"] = {}
                         item["ai_assisted_prompts"] = []
                         item["preamble"] = ""
                         item["status"] = "ok"
@@ -762,9 +899,20 @@ def start_pdf_ingest_job(
                         # Remove from low_conf the prompts AI was able to fill;
                         # keep the ones AI also missed flagged for the human.
                         low_conf = [pid for pid in low_conf if pid not in ai_filled]
+                    mapping, cleanup_low, cleanup_notes, attention_reasons = clean_mapping(
+                        mapping, prompts, profile,
+                    )
+                    low_conf = list(dict.fromkeys([*low_conf, *cleanup_low]))
+                    for pid in low_conf:
+                        if pid not in attention_reasons:
+                            attention_reasons[pid] = [
+                                "empty" if not mapping.get(pid) else "uncertain_mapping"
+                            ]
                     item["extracted_text"] = text
                     item["mapping"] = mapping
                     item["low_conf_prompts"] = low_conf
+                    item["cleanup_notes"] = cleanup_notes
+                    item["attention_reasons"] = attention_reasons
                     item["ai_assisted_prompts"] = list(ai_filled.keys())
                     item["preamble"] = preamble
                     item["status"] = "low_conf" if low_conf else "ok"
@@ -824,8 +972,8 @@ def commit_pdf_ingest_job(
         Items with ``skip=True`` are recorded in ``items_summary`` but
         produce no FeedbackMessage rows.
     dedup_decisions:
-        ``{student_id: 'replace'|'skip'|'add'}``. Default 'add' if a
-        student isn't listed but already has PDF rows for this survey.
+        ``{student_id: 'replace'|'skip'|'add'}``. If an existing student's
+        decision is omitted, the safe default is ``skip`` (keep existing).
 
     Returns
     -------
@@ -838,6 +986,97 @@ def commit_pdf_ingest_job(
     prompts = flatten_prompts_from_schema(schema_body)
     prompt_titles = {p["prompt_id"]: p.get("title") or p["prompt_id"] for p in prompts}
 
+    # Validate and clean the browser-confirmed payload before any delete or
+    # insert. The job preview is a convenience, not a trust boundary.
+    preview_filenames = {
+        str(item.get("filename") or "") for item in (job.items or [])
+        if isinstance(item, dict)
+    }
+    allowed_prompt_ids = set(prompt_titles)
+    if not prompts:
+        allowed_prompt_ids = {FULLTEXT_PROMPT_ID}
+    profile = pdf_ingest_profile(schema_body)
+    seen_students: dict[str, str] = {}
+    seen_filenames: set[str] = set()
+    validated_items: list[dict] = []
+
+    for raw_item in confirmed_items:
+        if not isinstance(raw_item, dict):
+            raise ValueError("Each confirmed PDF item must be an object.")
+        filename = str(raw_item.get("filename") or "")
+        sid = str(raw_item.get("student_id") or "").strip()
+        skip = bool(raw_item.get("skip"))
+        if filename not in preview_filenames:
+            raise ValueError(f"Unknown PDF in commit: {filename or 'unnamed file'}.")
+        if filename in seen_filenames:
+            raise ValueError(f"PDF appears more than once in commit: {filename}.")
+        seen_filenames.add(filename)
+        if sid and not skip:
+            if sid in seen_students:
+                raise ValueError(
+                    f"Student {sid} is attributed to more than one PDF "
+                    f"({seen_students[sid]} and {filename})."
+                )
+            seen_students[sid] = filename
+
+        mapping = raw_item.get("mapping")
+        if not isinstance(mapping, dict):
+            raise ValueError(f"Invalid answer mapping for {filename}.")
+        unknown_prompts = sorted(set(str(pid) for pid in mapping) - allowed_prompt_ids)
+        if unknown_prompts:
+            raise ValueError(f"Unknown section for {filename}: {unknown_prompts[0]}.")
+
+        accepted_long = {
+            str(pid) for pid in (raw_item.get("accepted_long_prompts") or [])
+            if isinstance(pid, (str, int, float))
+        }
+        if prompts and not skip:
+            cleaned_mapping, _low, _notes, reasons = clean_mapping(mapping, prompts, profile)
+            for prompt_id, prompt_reasons in reasons.items():
+                if "suspicious_marker" in prompt_reasons:
+                    raise ValueError(
+                        f"{filename} section {prompt_id} still contains other PDF content. "
+                        "Edit or skip this PDF before committing."
+                    )
+                if "oversized" in prompt_reasons and prompt_id not in accepted_long:
+                    raise ValueError(
+                        f"{filename} section {prompt_id} is unusually long. "
+                        "Inspect and explicitly accept it, edit it, or skip the PDF."
+                    )
+            mapping = cleaned_mapping
+        else:
+            mapping = {str(pid): str(answer or "").strip() for pid, answer in mapping.items()}
+
+        validated = dict(raw_item)
+        validated["filename"] = filename
+        validated["student_id"] = sid
+        validated["mapping"] = mapping
+        validated["skip"] = skip
+        validated["accepted_long_prompts"] = sorted(accepted_long)
+        validated_items.append(validated)
+
+    confirmed_items = validated_items
+
+    candidate_students = {
+        item["student_id"] for item in confirmed_items
+        if item["student_id"] and not item["skip"]
+    }
+    existing_pdf_students = set(
+        FeedbackMessage.objects.filter(
+            gpt_id=survey.id,
+            student_id__in=candidate_students,
+            source=FeedbackMessage.SOURCE_PDF,
+        ).values_list("student_id", flat=True)
+    )
+
+    def _dedup_decision(student_id: str) -> str:
+        decision = dedup_decisions.get(student_id)
+        if decision is None:
+            return "skip" if student_id in existing_pdf_students else "add"
+        if decision not in {"add", "skip", "replace"}:
+            raise ValueError(f"Invalid duplicate decision for {student_id}.")
+        return decision
+
     items_summary: list[dict] = []
     student_ids_committed: set[str] = set()
     messages_to_create: list[FeedbackMessage] = []
@@ -848,7 +1087,7 @@ def commit_pdf_ingest_job(
         sid = (item.get("student_id") or "").strip()
         if not sid or item.get("skip"):
             continue
-        decision = dedup_decisions.get(sid, "add")
+        decision = _dedup_decision(sid)
         if decision == "replace":
             student_replace_targets.add(sid)
 
@@ -871,7 +1110,7 @@ def commit_pdf_ingest_job(
             sid = (item.get("student_id") or "").strip()
             mapping = item.get("mapping") or {}
             skip = bool(item.get("skip"))
-            decision = dedup_decisions.get(sid, "add") if sid else "add"
+            decision = _dedup_decision(sid) if sid else "add"
 
             if not sid:
                 items_summary.append({

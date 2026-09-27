@@ -9,6 +9,7 @@ request thread (mirrors the chat-turn test pattern).
 from __future__ import annotations
 
 import io
+import importlib
 import json
 from unittest.mock import patch
 
@@ -33,6 +34,35 @@ DEFAULT_SECTIONS = [
     {"id": "1.2", "title": "Methods in Practice", "opening_prompt": "What method?"},
     {"id": "1.3", "title": "Open Question Reflection", "opening_prompt": "What's open?"},
 ]
+
+CMPM80K_SECTIONS = [
+    {"id": "1.1", "title": "Key Concepts & Takeaways", "opening_prompt": "What concept?"},
+    {"id": "1.2", "title": "In Practice", "opening_prompt": "What did you make or play?"},
+    {"id": "1.3", "title": "Knowledge Shift: Before vs. After", "opening_prompt": "What changed?"},
+]
+
+CMPM80K_PDF_PROFILE = {
+    "section_instruction_prefixes": {
+        "1.1": [
+            "What was the single most important concept, framework, or skill introduced or reinforced this week? "
+            "Describe it in your own words rather than restating the dispatch. Explain why it stood out to you and "
+            "how you currently understand it."
+        ],
+        "1.2": [
+            "Describe the main thing you made or played this week. Address the following:\n"
+            "How did you go about it?\n"
+            "What did the process feel like in practice versus how it was described?\n"
+            "What were the results, and what did you learn from actually doing it?"
+        ],
+        "1.3": [
+            "Reflect on the gap between your prior understanding and your current one. Surfacing what you assumed, "
+            "what changed, and what still feels uncertain is one of the most valuable exercises in any learning process."
+        ],
+    },
+    "stop_headings": ["Submission Guidelines", "Raw Conversation Transcript"],
+    "suspicious_markers": ["Submission Guidelines", "Raw Conversation Transcript"],
+    "answer_soft_max_chars": 2000,
+}
 
 
 def make_pdf(lines: list[str]) -> bytes:
@@ -226,6 +256,137 @@ class ParserTests(TestCase):
         self.assertIn(r"x \| y", md)
 
 
+class Cmpm80kCleanupTests(TestCase):
+    def setUp(self):
+        self.prompts = leai_pdf_ingest.flatten_prompts_from_schema({"sections": CMPM80K_SECTIONS})
+
+    def _map_and_clean(self, text):
+        mapping, mapped_low, _ = leai_pdf_ingest.map_text_to_prompts(text, self.prompts)
+        cleaned, cleanup_low, notes, reasons = leai_pdf_ingest.clean_mapping(
+            mapping, self.prompts, CMPM80K_PDF_PROFILE,
+        )
+        return cleaned, sorted(set(mapped_low + cleanup_low)), notes, reasons
+
+    def test_filled_course_template_removes_instructions_and_submission_section(self):
+        text = """1.1 Key Concepts & Takeaways
+What was the single most important concept, framework, or skill introduced or reinforced this week?
+Describe it in your own words rather than restating the dispatch. Explain why it stood out to you and
+how you currently understand it.
+Accessibility belongs in the design process.
+
+1.2 In Practice
+Describe the main thing you made or played this week. Address the following:
+How did you go about it?
+What did the process feel like in practice versus how it was described?
+What were the results, and what did you learn from actually doing it?
+I built a short Twine game and revised its decision screens.
+
+1.3 Knowledge Shift: Before vs. After
+Reflect on the gap between your prior understanding and your current one. Surfacing what you
+assumed, what changed, and what still feels uncertain is one of the most valuable exercises in any learning process.
+What I thought I knew: accessibility was a final checklist.
+What I was surprised by: presentation changed the emotional stakes.
+What I am still uncertain about: how to test color choices.
+
+Submission Guidelines
+Submit via Canvas.
+"""
+        cleaned, low, notes, reasons = self._map_and_clean(text)
+
+        self.assertEqual(low, [])
+        self.assertEqual(reasons, {})
+        self.assertEqual(cleaned["1.1"], "Accessibility belongs in the design process.")
+        self.assertEqual(cleaned["1.2"], "I built a short Twine game and revised its decision screens.")
+        self.assertIn("What I thought I knew: accessibility was a final checklist.", cleaned["1.3"])
+        self.assertNotIn("Submission Guidelines", cleaned["1.3"])
+        self.assertEqual(notes["1.1"], ["instruction_removed"])
+        self.assertEqual(notes["1.3"], ["instruction_removed", "trailing_section_removed"])
+
+    def test_ai_exports_keep_answer_table_and_remove_raw_transcript(self):
+        fixtures = [
+            ("playtesting", "I'm curious about how playtesting will be once I have projects to present to players."),
+            ("accessibility", "Whether color or specific design choices change players emotions"),
+            ("mechanics", "I feel like I understand them."),
+        ]
+        for concept, uncertainty in fixtures:
+            with self.subTest(concept=concept):
+                text = f"""1.1. Key Concepts & Takeaways
+The student identified {concept} as the most important idea.
+
+1.2. In Practice
+The student described what they made or played.
+
+1.3. Knowledge Shift: Before vs. After
+| Prompt | Student response |
+| --- | --- |
+| What I thought I knew | A prior assumption. |
+| What I was surprised by | A specific surprise. |
+| What I am still uncertain about | {uncertainty} |
+
+Raw Conversation Transcript
+Remi: Area 1 of 3.
+Student: This dialogue must never be stored.
+"""
+                cleaned, low, notes, reasons = self._map_and_clean(text)
+                self.assertEqual(low, [])
+                self.assertEqual(reasons, {})
+                self.assertIn("| Prompt | Student response |", cleaned["1.3"])
+                self.assertIn(uncertainty, cleaned["1.3"])
+                self.assertNotIn("Raw Conversation Transcript", cleaned["1.3"])
+                self.assertNotIn("This dialogue must never be stored", cleaned["1.3"])
+                self.assertEqual(notes["1.3"], ["trailing_section_removed"])
+
+    def test_marker_inside_ordinary_prose_does_not_truncate(self):
+        mapping = {
+            "1.1": "I reviewed the Submission Guidelines phrase with my TA, and kept writing.",
+            "1.2": "A short answer.",
+            "1.3": "Another short answer.",
+        }
+        cleaned, low, notes, reasons = leai_pdf_ingest.clean_mapping(
+            mapping, self.prompts, CMPM80K_PDF_PROFILE,
+        )
+        self.assertEqual(cleaned["1.1"], mapping["1.1"])
+        self.assertEqual(low, [])
+        self.assertEqual(notes, {})
+        self.assertEqual(reasons, {})
+
+    def test_empty_and_oversized_answers_have_distinct_reasons(self):
+        mapping = {"1.1": "", "1.2": "x" * 2001, "1.3": "Safe answer."}
+        _cleaned, low, _notes, reasons = leai_pdf_ingest.clean_mapping(
+            mapping, self.prompts, CMPM80K_PDF_PROFILE,
+        )
+        self.assertEqual(set(low), {"1.1", "1.2"})
+        self.assertEqual(reasons["1.1"], ["empty"])
+        self.assertEqual(reasons["1.2"], ["oversized"])
+
+
+class Cmpm80kProfileMigrationTests(TestCase):
+    def test_forward_and_reverse_touch_only_individual_pdf_profile(self):
+        individual = FormSchema.objects.create(
+            schema_id="cmpm80k-reflection", title="Individual",
+            body={"version": "1.0.0", "sections": CMPM80K_SECTIONS},
+        )
+        team = FormSchema.objects.create(
+            schema_id="cmpm80k-team-reflection", title="Team",
+            body={"version": "1.0.0", "sections": [{"id": "2.1", "title": "Planning"}]},
+        )
+        migration = importlib.import_module(
+            "datapipeline.migrations.0041_add_cmpm80k_pdf_ingest_profile"
+        )
+        from django.apps import apps
+
+        migration.add_profile(apps, None)
+        individual.refresh_from_db()
+        team.refresh_from_db()
+        self.assertEqual(individual.body["sections"], CMPM80K_SECTIONS)
+        self.assertEqual(individual.body["pdf_ingest"]["answer_soft_max_chars"], 2000)
+        self.assertNotIn("pdf_ingest", team.body)
+
+        migration.remove_profile(apps, None)
+        individual.refresh_from_db()
+        self.assertEqual(individual.body, {"version": "1.0.0", "sections": CMPM80K_SECTIONS})
+
+
 # ─── Worker ──────────────────────────────────────────────────────────────
 
 class WorkerTests(TestCase):
@@ -272,6 +433,39 @@ class WorkerTests(TestCase):
         statuses = {it["filename"]: it["status"] for it in job.items}
         self.assertEqual(statuses["good.pdf"], "ok")
         self.assertEqual(statuses["bad.pdf"], "failed")
+
+    def test_worker_applies_schema_cleanup_and_returns_review_metadata(self):
+        self.schema.body = {
+            "sections": CMPM80K_SECTIONS,
+            "pdf_ingest": CMPM80K_PDF_PROFILE,
+        }
+        self.schema.save(update_fields=["body"])
+        blob = make_pdf([
+            "1.1 Key Concepts & Takeaways",
+            "What was the single most important concept, framework, or skill introduced or reinforced this week?",
+            "Describe it in your own words rather than restating the dispatch. Explain why it stood out to you and",
+            "how you currently understand it.",
+            "Accessibility belongs in the design process.",
+            "1.2 In Practice",
+            "I built a short Twine game.",
+            "1.3 Knowledge Shift: Before vs. After",
+            "A compact answer table.",
+            "Raw Conversation Transcript",
+            "Student: this transcript must be removed.",
+        ])
+        with patch("datapipeline.leai_pdf_ingest._ai_assist_mapping", return_value={}), inline_thread_patch():
+            job = leai_pdf_ingest.start_pdf_ingest_job(
+                self.survey, [("alice.pdf", blob)], {"alice.pdf": "alice"},
+            )
+        job.refresh_from_db()
+        item = job.items[0]
+        self.assertEqual(item["status"], "ok")
+        self.assertEqual(item["low_conf_prompts"], [])
+        self.assertEqual(item["attention_reasons"], {})
+        self.assertEqual(item["mapping"]["1.1"], "Accessibility belongs in the design process.")
+        self.assertNotIn("Raw Conversation Transcript", item["mapping"]["1.3"])
+        self.assertEqual(item["cleanup_notes"]["1.1"], ["instruction_removed"])
+        self.assertEqual(item["cleanup_notes"]["1.3"], ["trailing_section_removed"])
 
     def test_missing_attribution_is_caller_error(self):
         with self.assertRaisesRegex(ValueError, "Missing student"):
@@ -485,6 +679,86 @@ class CommitRevertTests(TestCase):
         # Job is consumed.
         self.assertFalse(LEAIPdfIngestJob.objects.filter(pk=job.pk).exists())
 
+    def test_commit_recleans_browser_mapping_before_writing(self):
+        job = self._ready_job()
+        job.refresh_from_db()
+        item = job.items[0]
+        contaminated = dict(item["mapping"])
+        contaminated["1.3"] = "The answer to keep.\n\nRaw Conversation Transcript\nStudent: remove me."
+        batch = leai_pdf_ingest.commit_pdf_ingest_job(
+            job, [{
+                "filename": item["filename"], "student_id": "alice",
+                "mapping": contaminated, "skip": False,
+            }], dedup_decisions={},
+        )
+        stored = "\n".join(
+            FeedbackMessage.objects.filter(pdf_batch=batch).values_list("content", flat=True)
+        )
+        self.assertIn("The answer to keep.", stored)
+        self.assertNotIn("Raw Conversation Transcript", stored)
+        self.assertNotIn("remove me", stored)
+
+    def test_commit_rejects_duplicate_student_attribution_before_any_write(self):
+        with inline_thread_patch():
+            job = leai_pdf_ingest.start_pdf_ingest_job(
+                self.survey,
+                [("alice-one.pdf", make_clean_pdf()), ("alice-two.pdf", make_clean_pdf())],
+                {"alice-one.pdf": "alice", "alice-two.pdf": "alice"},
+            )
+        job.refresh_from_db()
+        mapping = job.items[0]["mapping"]
+        with self.assertRaisesRegex(ValueError, "more than one PDF"):
+            leai_pdf_ingest.commit_pdf_ingest_job(
+                job,
+                [
+                    {"filename": "alice-one.pdf", "student_id": "alice", "mapping": mapping, "skip": False},
+                    {"filename": "alice-two.pdf", "student_id": "alice", "mapping": mapping, "skip": False},
+                ],
+                dedup_decisions={},
+            )
+        self.assertEqual(FeedbackMessage.objects.count(), 0)
+        self.assertEqual(LEAIPdfIngestBatch.objects.count(), 0)
+        self.assertTrue(LEAIPdfIngestJob.objects.filter(pk=job.pk).exists())
+
+    def test_commit_requires_explicit_acceptance_for_oversized_answer(self):
+        job = self._ready_job()
+        job.refresh_from_db()
+        item = job.items[0]
+        mapping = dict(item["mapping"])
+        mapping["1.1"] = "x" * (leai_pdf_ingest.ANSWER_BLOCK_SOFT_MAX_CHARS + 1)
+        payload = {
+            "filename": item["filename"], "student_id": "alice",
+            "mapping": mapping, "skip": False,
+        }
+        with self.assertRaisesRegex(ValueError, "unusually long"):
+            leai_pdf_ingest.commit_pdf_ingest_job(job, [payload], dedup_decisions={})
+        self.assertEqual(FeedbackMessage.objects.count(), 0)
+        self.assertEqual(LEAIPdfIngestBatch.objects.count(), 0)
+
+        payload["accepted_long_prompts"] = ["1.1"]
+        batch = leai_pdf_ingest.commit_pdf_ingest_job(job, [payload], dedup_decisions={})
+        self.assertEqual(batch.message_count, 3)
+
+    def test_commit_rejects_residual_profile_marker_atomically(self):
+        body = dict(self.schema.body)
+        body["pdf_ingest"] = {"suspicious_markers": ["Professor Notes"]}
+        self.schema.body = body
+        self.schema.save(update_fields=["body"])
+        job = self._ready_job()
+        job.refresh_from_db()
+        item = job.items[0]
+        mapping = dict(item["mapping"])
+        mapping["1.2"] = "Student answer.\n\nProfessor Notes\nDo not store this."
+        with self.assertRaisesRegex(ValueError, r"alice\.pdf.*1\.2"):
+            leai_pdf_ingest.commit_pdf_ingest_job(
+                job, [{
+                    "filename": item["filename"], "student_id": "alice",
+                    "mapping": mapping, "skip": False,
+                }], dedup_decisions={},
+            )
+        self.assertEqual(FeedbackMessage.objects.count(), 0)
+        self.assertEqual(LEAIPdfIngestBatch.objects.count(), 0)
+
     def test_dedup_replace_overwrites_existing(self):
         # Pre-existing PDF row for this student/survey
         FeedbackMessage.objects.create(
@@ -521,6 +795,26 @@ class CommitRevertTests(TestCase):
         contents = list(FeedbackMessage.objects.filter(student_id="alice").values_list("content", flat=True))
         self.assertEqual(contents, ["OLD"])
         # Batch row exists but with zero committed messages.
+        self.assertEqual(batch.message_count, 0)
+
+    def test_missing_dedup_decision_keeps_existing_by_default(self):
+        FeedbackMessage.objects.create(
+            session_id="seed", student_id="alice", sent_by="student",
+            content="OLD", gpt_used=self.survey.name, gpt_id=self.survey.id,
+            source="pdf",
+        )
+        job = self._ready_job()
+        job.refresh_from_db()
+        item = job.items[0]
+        batch = leai_pdf_ingest.commit_pdf_ingest_job(
+            job, [{"filename": item["filename"], "student_id": "alice",
+                   "mapping": item["mapping"], "skip": False}],
+            dedup_decisions={},
+        )
+        self.assertEqual(
+            list(FeedbackMessage.objects.filter(student_id="alice").values_list("content", flat=True)),
+            ["OLD"],
+        )
         self.assertEqual(batch.message_count, 0)
 
     def test_revert_deletes_only_batch_messages(self):
