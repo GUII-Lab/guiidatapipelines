@@ -3,6 +3,7 @@ from django.urls import path
 from .environment import environment_required, environment_view
 from .instructor_auth import instructor_csrf_view, instructor_me_view, instructor_password_view, instructor_sessions_view
 from .instructor_courses import instructor_course_view, instructor_courses_view
+from .course_settings import course_banner_settings_view
 from .research_debug import research_debug_settings_view, student_debug_access_view
 from .response_search import response_search_view
 from .feedback_analyzer import (
@@ -43,6 +44,7 @@ urlpatterns = [
     path("instructor_password/", environment_required(instructor_password_view), name="leai-instructor-password"),
     path("instructor_courses/", environment_required(instructor_courses_view), name="leai-instructor-courses"),
     path("instructor_courses/<uuid:course_id>/", environment_required(instructor_course_view), name="leai-instructor-course"),
+    path("instructor_courses/<uuid:course_id>/banner-settings/", environment_required(course_banner_settings_view), name="leai-course-banner-settings"),
     path("instructor_courses/<uuid:course_id>/question-set-templates/", environment_required(templates_view), name="leai-question-set-templates"),
     path("instructor_courses/<uuid:course_id>/question-sets/", environment_required(question_sets_view), name="leai-question-sets"),
     path("instructor_courses/<uuid:course_id>/question-sets/<uuid:question_set_id>/", environment_required(question_set_view), name="leai-question-set"),
