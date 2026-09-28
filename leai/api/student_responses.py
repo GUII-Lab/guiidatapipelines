@@ -463,7 +463,12 @@ def student_turns_view(request, survey_id, session_id):
     assessment = None
     if kind == "text" and phase in ("answer", "reflection", "probe"):
         try:
-            assessment = assess_text(protocol, session.flow_state, student["text"])
+            if (occurrence.revision.question_set.collection_style == "open"
+                    and session.flow_state["item_index"] == 0
+                    and session.flow_state["phase"] == "answer"):
+                assessment = assess_text(protocol, session.flow_state, student["text"], force_followup=True)
+            else:
+                assessment = assess_text(protocol, session.flow_state, student["text"])
         except (AssessmentError, OpenAIClientError):
             return no_store_json({"error": "assessment_unavailable", "retryable": True}, status=503)
     clarification_only = bool(assessment and assessment.get("intent") == "clarification")

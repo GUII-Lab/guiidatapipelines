@@ -114,6 +114,8 @@ def initial_body(*, title, audience, collection_style, template_id=None):
             _item("q1", "How is your learning experience going right now?", "Listen for learning supports, blockers, expectations, workload, and suggestions."),
             _item("q2", "Is there anything else you want your instructor to know?", "Make room for anything the student has not yet shared."),
         ]}]
+        sections[0]["items"][0]["max_additional_probes"] = 3
+        sections[0]["items"][1]["max_additional_probes"] = 0
     else:
         intro = "Share your experience with this course."
         sections = [{"id": "s1", "title": "Your experience", "items": [_item("q1", "What stood out in your learning experience?", "Understand the learner's experience.")]}]

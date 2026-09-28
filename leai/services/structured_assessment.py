@@ -9,7 +9,7 @@ class AssessmentError(ValueError):
     pass
 
 
-def assess_text(protocol, state, student_text, *, provider=None):
+def assess_text(protocol, state, student_text, *, provider=None, force_followup=False):
     if provider is None:
         from datapipeline.openai_client import run_structured
         provider = run_structured
@@ -55,6 +55,12 @@ def assess_text(protocol, state, student_text, *, provider=None):
         "addressed them. Return only the specified structured fields. Context: "
         + json.dumps(context, ensure_ascii=False)
     )
+    if force_followup:
+        instructions += (
+            " This is the first substantive answer in an Open conversation. Before moving to the closing "
+            "question, ask one concise follow-up grounded in a topic the student actually raised. "
+            "Set sufficient to false and put that follow-up in followup. Do not ask the closing question."
+        )
     schema = {
         "type": "object",
         "properties": {
@@ -95,9 +101,11 @@ def assess_text(protocol, state, student_text, *, provider=None):
             or any(target_id not in target_ids for target_id in covered)
             or len(covered) != len(set(covered))):
         raise AssessmentError("invalid model assessment fields")
-    sufficient = parsed["sufficient"] and set(target_ids) <= set(covered)
-    if parsed["sufficient"] and followup.strip():
+    sufficient = parsed["sufficient"] and set(target_ids) <= set(covered) and not force_followup
+    if parsed["sufficient"] and followup.strip() and not force_followup:
         raise AssessmentError("sufficient assessment must not ask another question")
+    if force_followup and not followup.strip():
+        followup = "Could you tell me more about that experience and what would help?"
     if not sufficient and not followup.strip() and not targets:
         raise AssessmentError("insufficient assessment needs a follow-up")
     if not sufficient and not followup.strip():

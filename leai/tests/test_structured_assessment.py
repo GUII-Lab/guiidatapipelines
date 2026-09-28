@@ -83,6 +83,20 @@ class AssessmentTests(SimpleTestCase):
         self.assertIn("whether and how", calls[0][0][0]["content"])
         self.assertNotIn("I remove private details", calls[0][0][0]["content"])
 
+    def test_open_first_answer_gets_a_topic_followup_before_closing(self):
+        protocol = deepcopy(PROTOCOL)
+        protocol["sections"][0]["items"][0]["response"] = {"kind": "text"}
+        protocol["sections"][0]["items"][0]["max_additional_probes"] = 3
+        def provider(history, student_text, json_schema, **kwargs):
+            self.assertIn("Open conversation", history[0]["content"])
+            return {"parsed": {"intent": "answer", "clarification_response": "",
+                               "sufficient": True, "followup": "Which part of that workload felt hardest?",
+                               "evidence_for": ["P1"], "covered_targets": []}}
+        result = assess_text(protocol, begin_flow(protocol), "The workload felt heavy.",
+                             provider=provider, force_followup=True)
+        self.assertFalse(result["sufficient"])
+        self.assertEqual(result["followup"], "Which part of that workload felt hardest?")
+
     def test_model_cannot_attribute_nonexistent_item_or_probe_with_next_stem(self):
         def unknown_item(*args, **kwargs):
             return {"parsed": {"intent": "answer", "clarification_response": "",
