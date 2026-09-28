@@ -5,6 +5,7 @@ import re
 
 from django.http import HttpResponse, HttpResponseNotAllowed
 from django.db import transaction
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_protect
 
 from leai.models.analysis import AnalysisChatMessage, AnalysisChatSession, AnalysisCitation, AnalysisScopeOccurrence

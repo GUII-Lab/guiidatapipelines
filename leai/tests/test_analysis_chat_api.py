@@ -48,6 +48,20 @@ class FeedbackChatApiTests(ResponseFixturesMixin, TestCase):
         self.assertEqual(response.json()["occurrences"][0]["id"], str(occurrence.public_id))
         self.assertEqual(self.client.get(self.route("occurrences/", self.other_course)).status_code, 404)
 
+    def test_running_job_status_is_available_while_web_thread_is_active(self):
+        job = enqueue_domain_job(
+            job_type="feedback_chat_turn",
+            course=self.course,
+            actor=self.account,
+            payload={"user_message_id": "1", "occurrence_ids": []},
+        )
+        self.assertIsNotNone(claim_domain_job(job.public_id))
+
+        response = self.client.get(self.job_route(job.public_id))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "running")
+
     def test_add_source_and_idempotent_turn_snapshot_only_ids(self):
         first = self.make_occurrence()
         second = self.make_occurrence()
