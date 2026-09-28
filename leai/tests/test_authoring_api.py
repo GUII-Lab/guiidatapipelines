@@ -107,6 +107,14 @@ class AuthoringApiTests(TestCase):
         self.assertEqual(team_open.status_code, 400)
         self.assertEqual(QuestionSet.objects.count(), 0)
 
+    def test_legacy_empty_draft_does_not_break_wizard_list(self):
+        legacy = QuestionSet.objects.create(course=self.course, owner=self.actor, title="Older draft")
+        QuestionSetDraft.objects.create(question_set=legacy, canonical_body={}, updated_by=self.actor)
+        response = self.client.get(self.url("question-sets/"))
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["question_sets"], [])
+        self.assertEqual(self.client.get(self.url(f"question-sets/{legacy.public_id}/draft/")).status_code, 404)
+
     def test_ai_run_queues_only_ids_and_rejects_stale_base(self):
         question_set_id = self.create().json()["id"]
         path = f"question-sets/{question_set_id}/ai-runs/"

@@ -79,7 +79,8 @@ def _once(request, actor, operation, target, payload, callback):
 
 
 def _set(course, question_set_id):
-    return QuestionSet.objects.filter(course=course, public_id=question_set_id, draft__isnull=False).select_related("draft").first()
+    return QuestionSet.objects.filter(course=course, public_id=question_set_id,
+                                      draft__canonical_body__version=1).select_related("draft").first()
 
 
 def _draft_dto(question_set):
@@ -152,7 +153,7 @@ def question_sets_view(request, course_id):
     if error:
         return error
     if request.method == "GET":
-        rows = QuestionSet.objects.filter(course=course, draft__isnull=False).select_related("draft").order_by("-updated_at", "-pk")[:200]
+        rows = QuestionSet.objects.filter(course=course, draft__canonical_body__version=1).select_related("draft").order_by("-updated_at", "-pk")[:200]
         return no_store_json({"question_sets": [_draft_dto(row) for row in rows]})
     try:
         data = _payload(request, ("title", "audience", "collection_style"), ("template_id",))
