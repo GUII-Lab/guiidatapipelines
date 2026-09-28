@@ -169,8 +169,9 @@ class FeedbackChatApiTests(ResponseFixturesMixin, TestCase):
         with patch("datapipeline.openai_client.run_structured", return_value={"parsed": {
             "answer": "Students need clearer directions.",
             "citations": [{"source_message_id": evidence.pk, "claim_key": "clarity", "evidence_quote": "hard to follow"}],
-        }}):
+        }}) as provider:
             self.assertTrue(process_feedback_chat_job(job))
+        self.assertNotIn("temperature", provider.call_args.kwargs)
         job.refresh_from_db()
         self.assertEqual(job.status, "completed")
         assistant = AnalysisChatMessage.objects.get(analysis_chat_session=chat, role="assistant")

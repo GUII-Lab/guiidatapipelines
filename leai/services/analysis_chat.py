@@ -88,7 +88,6 @@ def process_feedback_chat_job(job):
             user_text=question,
             json_schema=TURN_SCHEMA,
             schema_name="feedback_chat_turn",
-            temperature=0,
         )
         parsed = result.get("parsed")
         if not isinstance(parsed, dict) or set(parsed) != {"answer", "citations"}:
