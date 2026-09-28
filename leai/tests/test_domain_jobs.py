@@ -1,4 +1,5 @@
 from datetime import timedelta
+from threading import Thread as NativeThread
 
 from unittest.mock import patch
 
@@ -65,8 +66,10 @@ class DomainJobTests(ResponseFixturesMixin, TestCase):
         self.assertNotIn("lease_token", result)
         self.assertNotIn("user_message_id", str(result))
 
+    @patch("leai.services.jobs._active_job_slots", create=True)
     @patch("leai.services.jobs.threading.Thread")
-    def test_job_runs_on_a_daemon_thread_after_claiming_its_database_lease(self, thread_class):
+    def test_job_runs_on_a_daemon_thread_after_claiming_its_database_lease(self, thread_class, active_slots):
+        active_slots.acquire.return_value = True
         job = enqueue_domain_job(
             job_type="feedback_chat_turn",
             course=self.course,
@@ -79,5 +82,33 @@ class DomainJobTests(ResponseFixturesMixin, TestCase):
         self.assertTrue(kwargs["daemon"])
         self.assertEqual(kwargs["args"][0].pk, job.pk)
         thread_class.return_value.start.assert_called_once_with()
+        active_slots.acquire.assert_called_once_with(blocking=False)
+        with patch("leai.services.analysis_chat.process_feedback_chat_job") as process_job:
+            target_thread = NativeThread(target=kwargs["target"], args=kwargs["args"])
+            target_thread.start()
+            target_thread.join(timeout=2)
+        self.assertFalse(target_thread.is_alive())
+        process_job.assert_called_once_with(kwargs["args"][0])
+        active_slots.release.assert_called_once_with()
         job.refresh_from_db()
         self.assertEqual(job.status, "running")
+
+    @patch("leai.services.jobs._active_job_slots", create=True)
+    @patch("leai.services.jobs.threading.Thread")
+    def test_full_thread_budget_leaves_job_pending_for_a_later_poll(self, thread_class, active_slots):
+        active_slots.acquire.return_value = False
+        job = enqueue_domain_job(
+            job_type="feedback_chat_turn",
+            course=self.course,
+            actor=self.account,
+            payload={"user_message_id": "18", "occurrence_ids": []},
+        )
+
+        self.assertFalse(start_domain_job_thread(str(job.public_id)))
+
+        active_slots.acquire.assert_called_once_with(blocking=False)
+        active_slots.release.assert_not_called()
+        thread_class.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, "pending")
+        self.assertEqual(job.attempts, 0)

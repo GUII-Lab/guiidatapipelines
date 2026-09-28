@@ -11,6 +11,8 @@ from leai.models.jobs import DomainJob
 
 LEASE_DURATION = timedelta(minutes=5)
 MAX_ATTEMPTS = 5
+MAX_ACTIVE_JOB_THREADS = 4
+_active_job_slots = threading.BoundedSemaphore(MAX_ACTIVE_JOB_THREADS)
 
 
 def _validate_payload(job_type, payload):
@@ -75,29 +77,40 @@ def claim_domain_job(job_id):
 
 
 def _run_domain_job(job):
-    close_old_connections()
     try:
+        close_old_connections()
         if job.job_type == "feedback_chat_turn":
             from leai.services.analysis_chat import process_feedback_chat_job
             process_feedback_chat_job(job)
     finally:
-        connection.close()
+        try:
+            connection.close()
+        finally:
+            _active_job_slots.release()
 
 
 def start_domain_job_thread(job_id):
     """Run a persisted job in a daemon thread owned by the existing web dyno."""
-    job = claim_domain_job(job_id)
-    if job is None:
+    if not _active_job_slots.acquire(blocking=False):
         return False
-    thread = threading.Thread(
-        target=_run_domain_job,
-        args=(job,),
-        name=f"leai-job-{job.public_id}",
-        daemon=True,
-    )
     try:
+        job = claim_domain_job(job_id)
+    except Exception:
+        _active_job_slots.release()
+        raise
+    if job is None:
+        _active_job_slots.release()
+        return False
+    try:
+        thread = threading.Thread(
+            target=_run_domain_job,
+            args=(job,),
+            name=f"leai-job-{job.public_id}",
+            daemon=True,
+        )
         thread.start()
     except RuntimeError:
+        _active_job_slots.release()
         fail_domain_job(job_id=job.pk, lease_token=job.lease_token, error_code="thread_start_failed")
         return False
     return True
