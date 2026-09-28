@@ -148,6 +148,7 @@ def student_survey_view(request, survey_id):
         "label": occurrence.label,
         "intro": protocol["intro"],
         "available": _available(occurrence),
+        "anonymous_matching_enabled": occurrence.course.anonymous_matching_enabled,
         "completion_certificate_enabled": occurrence.completion_certificate_enabled,
         "completed_response_download_enabled": occurrence.completed_response_download_enabled,
     })

@@ -178,7 +178,7 @@ class AnalysisGovernanceTests(TestCase):
                 survey_occurrence=other_message.response_session.occurrence,
             )
 
-    def test_scope_occurrences_freeze_after_first_analysis_message(self):
+    def test_scope_occurrences_are_append_only_after_first_analysis_message(self):
         chat = AnalysisChatSession.objects.create(
             course=self.course, actor_account=self.actor, origin_surface="analyzer"
         )
@@ -196,13 +196,17 @@ class AnalysisGovernanceTests(TestCase):
                 survey_occurrence=second_occurrence
             )),
             ("delete", lambda: AnalysisScopeOccurrence.objects.filter(pk=scope.pk).delete()),
-            ("insert", lambda: AnalysisScopeOccurrence.objects.create(
-                analysis_chat_session=chat, survey_occurrence=second_occurrence
-            )),
         ):
             with self.subTest(action=action), self.assertRaises(IntegrityError), transaction.atomic():
                 write()
-        self.assertEqual(AnalysisScopeOccurrence.objects.filter(analysis_chat_session=chat).count(), 1)
+        appended = AnalysisScopeOccurrence.objects.create(
+            analysis_chat_session=chat, survey_occurrence=second_occurrence
+        )
+        self.assertIsNotNone(appended.pk)
+        self.assertEqual(
+            set(AnalysisScopeOccurrence.objects.filter(analysis_chat_session=chat).values_list("survey_occurrence_id", flat=True)),
+            {first_occurrence.pk, second_occurrence.pk},
+        )
 
     def test_scope_update_and_delete_are_allowed_before_first_message(self):
         chat = AnalysisChatSession.objects.create(
@@ -632,124 +636,6 @@ class AnalysisGovernanceTests(TestCase):
         ):
             with self.subTest(model=model.__name__), self.assertRaises(IntegrityError), transaction.atomic():
                 model.objects.filter(pk=pk).update(**{column: "00000000-0000-4000-8000-000000000001"})
-
-
-class AnalysisScopeConcurrencyTests(TransactionTestCase):
-    def test_scope_insert_waits_for_uncommitted_first_message(self):
-        if connection.vendor != "postgresql":
-            self.skipTest("PostgreSQL row-lock behavior")
-        institution = Institution.objects.create(slug="scope-race", name="Scope Race")
-        course = Course.objects.create(
-            institution=institution, course_code="scope-race", name="Scope Race"
-        )
-        user = get_user_model().objects.create_user(username="scope-race")
-        actor = InstructorAccount.objects.create(
-            user=user, email="scope-race@example.edu", display_name="Scope Race"
-        )
-        question_set = QuestionSet.objects.create(
-            course=course, owner=actor, title="Reflection",
-            audience="individual", collection_style="guided",
-        )
-        draft = QuestionSetDraft.objects.create(
-            question_set=question_set, updated_by=actor, canonical_body={}
-        )
-        version = QuestionSetDraftVersion.objects.create(
-            draft=draft, version_number=1, content_hash="a" * 64,
-            canonical_body={}, change_kind="manual", created_by=actor,
-        )
-        revision = QuestionSetRevision.objects.create(
-            question_set=question_set, revision_number=1,
-            source_draft_version=version, content_hash="a" * 64,
-            compiled_protocol={}, compiler_version="v1", engine_version="v1",
-            created_by=actor,
-        )
-        occurrence = SurveyOccurrence.objects.create(
-            revision=revision, course=course, created_by=actor, label="Week 1"
-        )
-        chat = AnalysisChatSession.objects.create(
-            course=course, actor_account=actor, origin_surface="analyzer"
-        )
-
-        message_inserted = threading.Event()
-        release_message = threading.Event()
-        scope_started = threading.Event()
-        scope_done = threading.Event()
-        scope_backend_pid = {}
-        scope_result = {}
-        worker_errors = []
-
-        def insert_message():
-            try:
-                with transaction.atomic():
-                    AnalysisChatMessage.objects.create(
-                        analysis_chat_session=chat, sequence=1, role="user",
-                        input_method="typed", content="First message",
-                    )
-                    message_inserted.set()
-                    if not release_message.wait(10):
-                        raise TimeoutError("message transaction was not released")
-            except Exception as exc:
-                worker_errors.append(exc)
-            finally:
-                message_inserted.set()
-                connections["default"].close()
-
-        def insert_scope():
-            try:
-                if not message_inserted.wait(10):
-                    raise TimeoutError("message was not inserted")
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT pg_backend_pid()")
-                    scope_backend_pid["value"] = cursor.fetchone()[0]
-                scope_started.set()
-                try:
-                    with transaction.atomic():
-                        AnalysisScopeOccurrence.objects.create(
-                            analysis_chat_session=chat, survey_occurrence=occurrence
-                        )
-                except IntegrityError:
-                    scope_result["value"] = "rejected"
-                else:
-                    scope_result["value"] = "inserted"
-            except Exception as exc:
-                worker_errors.append(exc)
-            finally:
-                scope_started.set()
-                scope_done.set()
-                connections["default"].close()
-
-        message_thread = threading.Thread(target=insert_message)
-        scope_thread = threading.Thread(target=insert_scope)
-        message_thread.start()
-        saw_lock_wait = False
-        try:
-            if message_inserted.wait(5):
-                scope_thread.start()
-                if scope_started.wait(5) and "value" in scope_backend_pid:
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline and not scope_done.is_set():
-                        with connection.cursor() as cursor:
-                            cursor.execute(
-                                "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
-                                [scope_backend_pid["value"]],
-                            )
-                            row = cursor.fetchone()
-                        if row and row[0] == "Lock":
-                            saw_lock_wait = True
-                            break
-                        time.sleep(0.02)
-        finally:
-            release_message.set()
-            message_thread.join(10)
-            if scope_thread.ident is not None:
-                scope_thread.join(10)
-
-        self.assertFalse(message_thread.is_alive())
-        self.assertFalse(scope_thread.is_alive())
-        self.assertEqual(worker_errors, [])
-        self.assertTrue(saw_lock_wait, "scope insert did not wait on the chat parent lock")
-        self.assertEqual(scope_result.get("value"), "rejected")
-        self.assertFalse(AnalysisScopeOccurrence.objects.filter(analysis_chat_session=chat).exists())
 
 
 class ImportRunConcurrencyTests(TransactionTestCase):

@@ -1,5 +1,7 @@
 from django.db import models
 
+import uuid
+
 from .authoring import SurveyOccurrence
 from .identity import Course, InstructorAccount
 from .responses import ResponseMessage, ResponseSession
@@ -36,13 +38,19 @@ class AnalysisSnapshot(models.Model):
 
 class AnalysisChatSession(models.Model):
     id = models.BigAutoField(primary_key=True)
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    title = models.CharField(max_length=120, default="New chat")
+    prompt_override = models.TextField(null=True, blank=True)
+    archived = models.BooleanField(default=False)
     course = models.ForeignKey(Course, on_delete=models.PROTECT, related_name="analysis_chat_sessions")
     actor_account = models.ForeignKey(InstructorAccount, on_delete=models.PROTECT, related_name="analysis_chat_sessions")
     origin_surface = models.CharField(max_length=32, choices=ANALYSIS_ORIGIN)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         constraints = [
+            models.CheckConstraint(check=~models.Q(title=""), name="leai_analysis_chat_title_nonempty"),
             models.CheckConstraint(
                 check=models.Q(origin_surface__in=["feedback_chat", "instructor_insights", "analyzer"]),
                 name="leai_analysis_chat_origin_valid",
@@ -96,6 +104,7 @@ class AnalysisCitation(models.Model):
     response_session = models.ForeignKey(ResponseSession, null=True, blank=True, on_delete=models.PROTECT, related_name="analysis_citations")
     response_message = models.ForeignKey(ResponseMessage, null=True, blank=True, on_delete=models.PROTECT, related_name="analysis_citations")
     claim_key = models.CharField(max_length=128)
+    evidence_quote = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -112,3 +121,7 @@ class AnalysisCitation(models.Model):
             ),
             models.CheckConstraint(check=~models.Q(claim_key=""), name="leai_analysis_citation_claim_nonempty"),
         ]
+
+
+# Import ensures Django discovers the shared leased job model with this app.
+from .jobs import DomainJob  # noqa: E402,F401

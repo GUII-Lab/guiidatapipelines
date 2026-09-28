@@ -13,7 +13,7 @@ import importlib
 import json
 from unittest.mock import patch
 
-from django.test import TestCase, Client
+from django.test import SimpleTestCase, TestCase, Client
 from django.urls import reverse
 
 from datapipeline import leai_pdf_ingest
@@ -150,7 +150,31 @@ def inline_thread_patch():
 
 # ─── Parser / mapper ─────────────────────────────────────────────────────
 
+class PdfUploadMetadataValidationTests(SimpleTestCase):
+    def test_upload_metadata_limits_reject_before_reading_files(self):
+        class MetadataOnlyUpload:
+            def __init__(self, name, size):
+                self.name = name
+                self.size = size
+
+            def read(self):
+                raise AssertionError("upload bytes must not be read during preflight")
+
+        files = [MetadataOnlyUpload("a.pdf", leai_pdf_ingest.MAX_BYTES_PER_FILE + 1)]
+        with self.assertRaisesRegex(ValueError, "10 MB"):
+            leai_pdf_ingest.validate_pdf_upload_metadata(files)
+
+        files = [MetadataOnlyUpload(f"{index}.pdf", 1) for index in range(leai_pdf_ingest.MAX_FILES_PER_BATCH + 1)]
+        with self.assertRaisesRegex(ValueError, "50 files"):
+            leai_pdf_ingest.validate_pdf_upload_metadata(files)
+
+        files = [MetadataOnlyUpload(f"{index}.pdf", 9 * 1024 * 1024) for index in range(6)]
+        with self.assertRaisesRegex(ValueError, "50 MB total"):
+            leai_pdf_ingest.validate_pdf_upload_metadata(files)
+
+
 class ParserTests(TestCase):
+
     def test_extract_text_from_real_pdf(self):
         text = leai_pdf_ingest._extract_pdf_text(make_clean_pdf())
         self.assertIn("Key Concepts", text)

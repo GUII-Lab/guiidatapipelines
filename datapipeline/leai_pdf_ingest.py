@@ -59,9 +59,30 @@ PDF_INGEST_JOB_STALE_SECONDS = 1800
 # Hard limit per ingest call. Enforced server-side too even though the
 # frontend caps at the same number, since the worker holds files in
 # memory the whole run.
-MAX_FILES_PER_BATCH = 60
+MAX_FILES_PER_BATCH = 50
 MAX_BYTES_PER_FILE = 10 * 1024 * 1024  # 10 MB
 MAX_BYTES_PER_BATCH = 50 * 1024 * 1024  # 50 MB
+
+
+def validate_pdf_upload_metadata(uploaded_files) -> None:
+    """Enforce upload limits from metadata before copying any PDF bytes."""
+    if len(uploaded_files) > MAX_FILES_PER_BATCH:
+        raise ValueError(f"Too many files (max {MAX_FILES_PER_BATCH} files per batch).")
+
+    sizes = []
+    for uploaded_file in uploaded_files:
+        try:
+            size = int(uploaded_file.size)
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("Could not determine an uploaded PDF's size.") from None
+        if size < 0:
+            raise ValueError("Could not determine an uploaded PDF's size.")
+        if size > MAX_BYTES_PER_FILE:
+            raise ValueError(f"{uploaded_file.name} exceeds 10 MB.")
+        sizes.append(size)
+
+    if sum(sizes) > MAX_BYTES_PER_BATCH:
+        raise ValueError("Batch exceeds 50 MB total.")
 
 # Sentinel mapping key for schemaless (general-mode) surveys: the whole PDF
 # is stored as a single response under this id instead of being split into

@@ -304,9 +304,9 @@ class IdentityModelTests(TestCase):
                      assistant_display_name, referral_enabled, referral_text,
                      completion_certificate_enabled_by_default,
                      completed_response_download_enabled_by_default,
-                     student_debug_enabled)
+                     anonymous_matching_enabled, student_debug_enabled)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s)
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING public_id
                 """,
                 [
@@ -327,6 +327,7 @@ class IdentityModelTests(TestCase):
                     "",
                     False,
                     "",
+                    False,
                     False,
                     False,
                     False,

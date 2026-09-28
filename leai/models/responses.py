@@ -313,6 +313,45 @@ class ResponseSession(models.Model):
         ]
 
 
+class ResponseSessionMatchSignal(models.Model):
+    """Environment-keyed anonymous matching digests; raw browser signals are never stored."""
+
+    id = models.BigAutoField(primary_key=True)
+    response_session = models.OneToOneField(
+        ResponseSession,
+        on_delete=models.PROTECT,
+        related_name="matching_signal",
+    )
+    device_key_digest = models.CharField(max_length=64, null=True, blank=True)
+    fingerprint_digest = models.CharField(max_length=64, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(device_key_digest__isnull=False)
+                    | models.Q(fingerprint_digest__isnull=False)
+                ),
+                name="leai_matching_signal_has_digest",
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(device_key_digest__isnull=True)
+                    | models.Q(device_key_digest__regex=r"^[0-9a-f]{64}$")
+                ),
+                name="leai_matching_signal_device_digest_valid",
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(fingerprint_digest__isnull=True)
+                    | models.Q(fingerprint_digest__regex=r"^[0-9a-f]{64}$")
+                ),
+                name="leai_matching_signal_fingerprint_digest_valid",
+            ),
+        ]
+
+
 class ResponseMessage(models.Model):
     ROLES = (
         ("student", "Student"),

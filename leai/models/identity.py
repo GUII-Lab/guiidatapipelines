@@ -68,6 +68,7 @@ class Course(models.Model):
     )
     settings_version = models.PositiveIntegerField(default=1)
     analysis_data_version = models.PositiveBigIntegerField(default=0)
+    anonymous_matching_enabled = models.BooleanField(default=False)
     banner_enabled = models.BooleanField(default=False)
     banner_text = models.TextField(blank=True, default="")
     banner_dismissible = models.BooleanField(default=False)

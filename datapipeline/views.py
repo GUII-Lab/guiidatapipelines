@@ -2770,11 +2770,16 @@ def leai_pdf_ingest_start(request):
     if not uploaded:
         return JsonResponse({'error': 'No files uploaded.'}, status=400)
 
+    from . import leai_pdf_ingest
+    try:
+        leai_pdf_ingest.validate_pdf_upload_metadata(uploaded)
+    except ValueError as e:
+        return JsonResponse({'error': str(e)}, status=400)
+
     files: list[tuple[str, bytes]] = []
     for f in uploaded:
         files.append((f.name, f.read()))
 
-    from . import leai_pdf_ingest
     try:
         job = leai_pdf_ingest.start_pdf_ingest_job(
             survey=survey,

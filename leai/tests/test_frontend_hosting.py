@@ -17,9 +17,11 @@ class FrontendHostingTests(SimpleTestCase):
         (root / "assets/app-Abcd1234.js").write_text("export const ready = true;")
         for name in ("index.html", "feedback.html", "InstructorLogin.html"):
             (root / name).write_text("<!doctype html><title>LEAI</title><div id='root'></div>")
+        (root / "NotFound.html").write_text("<!doctype html><title>LEAI</title><h1>Page Not Found</h1>")
         self.settings_override = override_settings(
             LEAI_SERVE_FRONTEND=True, ROOT_URLCONF="leai.web_urls",
-            WHITENOISE_ROOT=str(root), WHITENOISE_INDEX_FILE=True,
+            DEBUG=False,
+            LEAI_FRONTEND_ROOT=str(root), WHITENOISE_ROOT=str(root), WHITENOISE_INDEX_FILE=True,
             WHITENOISE_AUTOREFRESH=True,
             WHITENOISE_ADD_HEADERS_FUNCTION=frontend_headers,
         )
@@ -37,8 +39,13 @@ class FrontendHostingTests(SimpleTestCase):
         self.assertEqual(script.status_code, 200)
 
     def test_unknown_api_and_retired_routes_do_not_fall_back_to_html(self):
-        for url in ("/datapipeline/api/v1/unknown/", "/datapipeline/api/getOAI/", "/.env", "/missing.html"):
+        for url in ("/datapipeline/api/v1/unknown/", "/datapipeline/api/getOAI/", "/.env"):
             self.assertEqual(self.client.get(url).status_code, 404, url)
+
+        response = self.client.get("/missing.html")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response["Content-Type"], "text/html; charset=utf-8")
+        self.assertIn(b"Page Not Found", response.content)
 
     def test_bundle_must_match_backend_and_be_a_clean_release(self):
         root = Path(self.directory.name)
