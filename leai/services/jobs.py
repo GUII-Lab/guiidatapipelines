@@ -1,13 +1,15 @@
+import threading
 import uuid
 from datetime import timedelta
 
-from django.db import transaction
+from django.db import close_old_connections, connection, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from leai.models.jobs import DomainJob
 
 
-LEASE_DURATION = timedelta(minutes=2)
+LEASE_DURATION = timedelta(minutes=5)
 MAX_ATTEMPTS = 5
 
 
@@ -40,33 +42,65 @@ def enqueue_domain_job(*, job_type, course, actor, payload):
     )
 
 
-def claim_next_domain_job():
-    """Claim one pending job or recover one whose worker lease expired."""
+def claim_domain_job(job_id):
+    """Claim one specific pending job or recover its expired web-thread lease."""
     with transaction.atomic():
         now = timezone.now()
         job = (
             DomainJob.objects.select_for_update(skip_locked=True)
+            .filter(public_id=job_id)
             .filter(attempts__lt=MAX_ATTEMPTS)
-            .filter(models_q_claimable(now))
-            .order_by("created_at", "pk")
+            .filter(Q(status="pending") | Q(status="running", lease_expires_at__lte=now))
             .first()
         )
         if job is None:
             DomainJob.objects.filter(
-                status="running", lease_expires_at__lte=now, attempts__gte=MAX_ATTEMPTS
-            ).update(status="failed", error_code="worker_unavailable", lease_token=None, lease_expires_at=None, completed_at=now)
+                public_id=job_id,
+                attempts__gte=MAX_ATTEMPTS,
+            ).filter(Q(status="pending") | Q(status="running", lease_expires_at__lte=now)).update(
+                status="failed",
+                error_code="worker_unavailable",
+                lease_token=None,
+                lease_expires_at=None,
+                completed_at=now,
+                updated_at=now,
+            )
             return None
         job.status = "running"
         job.attempts += 1
         job.lease_token = uuid.uuid4()
         job.lease_expires_at = now + LEASE_DURATION
         job.save(update_fields=("status", "attempts", "lease_token", "lease_expires_at", "updated_at"))
-        return job
+    return job
 
 
-def models_q_claimable(now):
-    from django.db.models import Q
-    return Q(status="pending") | Q(status="running", lease_expires_at__lte=now)
+def _run_domain_job(job):
+    close_old_connections()
+    try:
+        if job.job_type == "feedback_chat_turn":
+            from leai.services.analysis_chat import process_feedback_chat_job
+            process_feedback_chat_job(job)
+    finally:
+        connection.close()
+
+
+def start_domain_job_thread(job_id):
+    """Run a persisted job in a daemon thread owned by the existing web dyno."""
+    job = claim_domain_job(job_id)
+    if job is None:
+        return False
+    thread = threading.Thread(
+        target=_run_domain_job,
+        args=(job,),
+        name=f"leai-job-{job.public_id}",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except RuntimeError:
+        fail_domain_job(job_id=job.pk, lease_token=job.lease_token, error_code="thread_start_failed")
+        return False
+    return True
 
 
 def _valid_result(result):

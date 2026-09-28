@@ -7,7 +7,7 @@ from django.utils import timezone
 from leai.models import AnalysisChatMessage, AnalysisChatSession, AnalysisCitation, AnalysisScopeOccurrence, CourseMembership, InstitutionMembership, ResponseMessage
 from leai.models.jobs import DomainJob
 from leai.services.analysis_chat import process_feedback_chat_job
-from leai.services.jobs import claim_next_domain_job, enqueue_domain_job
+from leai.services.jobs import claim_domain_job, enqueue_domain_job
 from leai.tests.session_client import SessionClient
 from leai.tests.test_response_models import ResponseFixturesMixin
 
@@ -130,13 +130,34 @@ class FeedbackChatApiTests(ResponseFixturesMixin, TestCase):
         conflict = self.client.post(turns_url, data=json.dumps({"content": "Different question"}), content_type="application/json", **key)
         self.assertEqual(conflict.status_code, 409)
 
+    def test_chat_turn_starts_background_execution_after_the_request_commits(self):
+        occurrence = self.make_occurrence()
+        chat_id = self.create_chat().json()["id"]
+        self.client.post(
+            self.route(f"chats/{chat_id}/scope/"),
+            data=json.dumps({"occurrence_ids": [str(occurrence.public_id)]}),
+            content_type="application/json",
+        )
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            response = self.client.post(
+                self.route(f"chats/{chat_id}/turns/"),
+                data=json.dumps({"content": "Summarize the feedback."}),
+                content_type="application/json",
+                HTTP_IDEMPOTENCY_KEY="thread-backed-turn",
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(len(callbacks), 1)
+        with patch("leai.api.feedback_chat.start_domain_job_thread") as start_job:
+            callbacks[0]()
+        start_job.assert_called_once_with(response.json()["job_id"])
+
     def test_chat_access_is_rechecked_after_membership_revocation(self):
         chat_id = self.create_chat().json()["id"]
         CourseMembership.objects.filter(pk=self.course_membership.pk).delete()
         response = self.client.get(self.route(f"chats/{chat_id}/"))
         self.assertEqual(response.status_code, 404)
 
-    def test_worker_persists_only_exact_canonical_response_citations(self):
+    def test_background_turn_persists_only_exact_canonical_response_citations(self):
         occurrence = self.make_occurrence()
         response_session = self.make_student_session(occurrence=occurrence, status="completed", completed_at=timezone.now(), completion_snapshot={"completed_at": timezone.now().isoformat()})
         evidence = ResponseMessage.objects.create(response_session=response_session, sequence=1, role="student", input_method="typed", content="The directions were hard to follow.")
@@ -144,7 +165,7 @@ class FeedbackChatApiTests(ResponseFixturesMixin, TestCase):
         AnalysisScopeOccurrence.objects.create(analysis_chat_session=chat, survey_occurrence=occurrence)
         user_message = AnalysisChatMessage.objects.create(analysis_chat_session=chat, sequence=1, role="user", input_method="typed", content="What should I clarify?")
         enqueue_domain_job(job_type="feedback_chat_turn", course=self.course, actor=self.account, payload={"user_message_id": str(user_message.pk), "occurrence_ids": [str(occurrence.public_id)]})
-        job = claim_next_domain_job()
+        job = claim_domain_job(DomainJob.objects.get(payload__user_message_id=str(user_message.pk)).public_id)
         with patch("datapipeline.openai_client.run_structured", return_value={"parsed": {
             "answer": "Students need clearer directions.",
             "citations": [{"source_message_id": evidence.pk, "claim_key": "clarity", "evidence_quote": "hard to follow"}],
@@ -158,7 +179,7 @@ class FeedbackChatApiTests(ResponseFixturesMixin, TestCase):
         self.assertEqual(citation.evidence_quote, "hard to follow")
         self.assertIsNone(citation.response_session_id)
 
-    def test_worker_rejects_quote_not_present_in_the_canonical_source(self):
+    def test_background_turn_rejects_quote_not_present_in_the_canonical_source(self):
         occurrence = self.make_occurrence()
         response_session = self.make_student_session(occurrence=occurrence, status="completed", completed_at=timezone.now(), completion_snapshot={"completed_at": timezone.now().isoformat()})
         evidence = ResponseMessage.objects.create(response_session=response_session, sequence=1, role="student", input_method="typed", content="The directions were hard to follow.")
@@ -166,7 +187,7 @@ class FeedbackChatApiTests(ResponseFixturesMixin, TestCase):
         AnalysisScopeOccurrence.objects.create(analysis_chat_session=chat, survey_occurrence=occurrence)
         user_message = AnalysisChatMessage.objects.create(analysis_chat_session=chat, sequence=1, role="user", input_method="typed", content="What should I clarify?")
         enqueue_domain_job(job_type="feedback_chat_turn", course=self.course, actor=self.account, payload={"user_message_id": str(user_message.pk), "occurrence_ids": [str(occurrence.public_id)]})
-        job = claim_next_domain_job()
+        job = claim_domain_job(DomainJob.objects.get(payload__user_message_id=str(user_message.pk)).public_id)
         with patch("datapipeline.openai_client.run_structured", return_value={"parsed": {
             "answer": "Students need clearer directions.",
             "citations": [{"source_message_id": evidence.pk, "claim_key": "clarity", "evidence_quote": "The directions were perfectly clear."}],

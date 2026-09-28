@@ -13,7 +13,7 @@ from leai.models.identity import Course
 from leai.models.jobs import DomainJob
 from leai.services.actions import has_course_action
 from leai.services.instructor_sessions import resolve_instructor_session
-from leai.services.jobs import enqueue_domain_job, public_job_status
+from leai.services.jobs import enqueue_domain_job, public_job_status, start_domain_job_thread
 from leai.services.mutation_receipts import IdempotencyConflict, execute_once
 from .environment import no_store_json
 
@@ -296,6 +296,7 @@ def feedback_chat_turn_view(request, course_id, chat_id):
         return no_store_json({"error": "turn_in_progress"}, status=409)
     except ValueError:
         return no_store_json({"error": "invalid_request"}, status=400)
+    transaction.on_commit(lambda: start_domain_job_thread(result["job_id"]))
     return no_store_json(result, status=202)
 
 
@@ -309,4 +310,10 @@ def feedback_chat_job_view(request, course_id, job_id):
     job = DomainJob.objects.filter(public_id=job_id, course=course, actor_account=actor, job_type="feedback_chat_turn").first()
     if job is None:
         return _not_found()
+    if job.status == "pending" or (
+        job.status == "running"
+        and job.lease_expires_at is not None
+        and job.lease_expires_at <= timezone.now()
+    ):
+        transaction.on_commit(lambda: start_domain_job_thread(str(job.public_id)))
     return no_store_json(public_job_status(job))
