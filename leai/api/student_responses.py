@@ -44,7 +44,7 @@ def _occurrence(public_id):
 
 def _available(occurrence):
     now = timezone.now()
-    return (occurrence.revision.question_set.audience == "individual"
+    return ((occurrence.revision.question_set.audience == "individual" or occurrence.team_snapshot_items.exists())
             and occurrence.course.lifecycle_state == "active"
             and occurrence.manually_closed_at is None
             and (occurrence.opens_at is None or occurrence.opens_at <= now)
@@ -151,6 +151,9 @@ def student_survey_view(request, survey_id):
         "anonymous_matching_enabled": occurrence.course.anonymous_matching_enabled,
         "completion_certificate_enabled": occurrence.completion_certificate_enabled,
         "completed_response_download_enabled": occurrence.completed_response_download_enabled,
+        "team_setup_required": occurrence.revision.question_set.audience == "team" and not occurrence.team_snapshot_items.exists(),
+        "team_choices": [{"id": str(item.pk), "label": item.label}
+                         for item in occurrence.team_snapshot_items.order_by("item_number")],
     })
 
 
@@ -167,10 +170,21 @@ def student_sessions_view(request, survey_id):
         return no_store_json({"error": "survey_closed"}, status=403)
     try:
         payload = _json_body(request, max_bytes=128)
-        if (set(payload) != {"terms_consent", "research_consent"}
+        allowed_keys = {"terms_consent", "research_consent"}
+        if occurrence.revision.question_set.audience == "team":
+            allowed_keys.add("team_snapshot_item_id")
+        if (set(payload) != allowed_keys
                 or payload["terms_consent"] is not True
                 or type(payload["research_consent"]) is not bool):
             raise ValueError("explicit terms and research consent choices are required")
+        team_item = None
+        if occurrence.revision.question_set.audience == "team":
+            team_id = payload["team_snapshot_item_id"]
+            if not isinstance(team_id, str) or not team_id.isdigit():
+                raise ValueError("invalid team selection")
+            team_item = occurrence.team_snapshot_items.filter(pk=int(team_id)).first()
+            if team_item is None:
+                raise ValueError("invalid team selection")
         protocol = validate_protocol(occurrence.revision.compiled_protocol)
     except ValueError:
         return no_store_json({"error": "invalid_request"}, status=400)
@@ -184,6 +198,7 @@ def student_sessions_view(request, survey_id):
             capability_digest=digest,
             capability_key_version=1,
             research_consent=payload["research_consent"],
+            team_snapshot_item=team_item,
             flow_state=state,
         )
         first = current_prompt(protocol, state)

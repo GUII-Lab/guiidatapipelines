@@ -305,11 +305,17 @@ def feedback_chat_turn_view(request, course_id, chat_id):
 def feedback_chat_job_view(request, course_id, job_id):
     if request.method != "GET":
         return _method_not_allowed(["GET"])
-    actor, course, error = _context(request, course_id)
-    if error:
-        return error
-    job = DomainJob.objects.filter(public_id=job_id, course=course, actor_account=actor, job_type="feedback_chat_turn").first()
+    session = resolve_instructor_session(request)
+    if session is None:
+        return no_store_json({"error": "authentication_required"}, status=401)
+    course = Course.objects.filter(public_id=course_id, lifecycle_state="active").first()
+    if course is None:
+        return _not_found()
+    job = DomainJob.objects.filter(public_id=job_id, course=course, actor_account=session.account).first()
     if job is None:
+        return _not_found()
+    action = "feedback.author" if job.job_type == "authoring_ai_run" else "analysis.use"
+    if not has_course_action(session.account, course, action):
         return _not_found()
     if job.status == "pending" or (
         job.status == "running"

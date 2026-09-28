@@ -9,7 +9,7 @@ class DomainJob(models.Model):
     """Small restart-safe job record; payloads contain canonical IDs only."""
 
     STATUSES = (("pending", "Pending"), ("running", "Running"), ("completed", "Completed"), ("failed", "Failed"))
-    TYPES = (("feedback_chat_turn", "Feedback Chat turn"),)
+    TYPES = (("feedback_chat_turn", "Feedback Chat turn"), ("authoring_ai_run", "Authoring AI run"))
 
     id = models.BigAutoField(primary_key=True)
     public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
@@ -29,7 +29,7 @@ class DomainJob(models.Model):
 
     class Meta:
         constraints = [
-            models.CheckConstraint(check=models.Q(job_type="feedback_chat_turn"), name="leai_domain_job_type_valid"),
+            models.CheckConstraint(check=models.Q(job_type__in=["feedback_chat_turn", "authoring_ai_run"]), name="leai_domain_job_type_valid"),
             models.CheckConstraint(check=models.Q(status__in=["pending", "running", "completed", "failed"]), name="leai_domain_job_status_valid"),
             models.CheckConstraint(check=models.Q(attempts__lte=5), name="leai_domain_job_attempts_bounded"),
             models.CheckConstraint(

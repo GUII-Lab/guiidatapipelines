@@ -16,6 +16,13 @@ _active_job_slots = threading.BoundedSemaphore(MAX_ACTIVE_JOB_THREADS)
 
 
 def _validate_payload(job_type, payload):
+    if job_type == "authoring_ai_run":
+        if not isinstance(payload, dict) or set(payload) != {"authoring_run_id"}:
+            raise ValueError("authoring jobs accept only the canonical run ID")
+        run_id = payload["authoring_run_id"]
+        if not isinstance(run_id, str) or not run_id.isdigit() or int(run_id) < 1 or len(run_id) > 20:
+            raise ValueError("authoring_run_id must be a positive canonical ID")
+        return {"authoring_run_id": str(int(run_id))}
     if job_type != "feedback_chat_turn" or not isinstance(payload, dict):
         raise ValueError("unsupported job payload")
     if set(payload) != {"user_message_id", "occurrence_ids"}:
@@ -82,6 +89,9 @@ def _run_domain_job(job):
         if job.job_type == "feedback_chat_turn":
             from leai.services.analysis_chat import process_feedback_chat_job
             process_feedback_chat_job(job)
+        elif job.job_type == "authoring_ai_run":
+            from leai.services.authoring_orchestrator import process_authoring_ai_job
+            process_authoring_ai_job(job)
     finally:
         try:
             connection.close()
